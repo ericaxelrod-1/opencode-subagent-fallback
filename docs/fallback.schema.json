@@ -1,0 +1,48 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Fallback Configuration",
+  "type": "object",
+  "properties": {
+    "enabled": { "type": "boolean" },
+    "cooldownMs": { "type": "number" },
+    "maxRetries": { "type": "number" },
+    "defaultFallback": { "type": "array", "items": { "type": "string" } },
+    "defaultLargeContextModel": { "type": "string" },
+    "defaultMinContextRatio": { "type": "number" },
+    "agents": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "largeContextModel": { "type": "string" },
+          "minContextRatio": { "type": "number" },
+          "fallback": {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                { "type": "string" },
+                {
+                  "type": "object",
+                  "properties": {
+                    "model": { "type": "string" },
+                    "temperature": { "type": "number" },
+                    "reasoningEffort": { "type": "string" },
+                    "thinking": {
+                      "type": "object",
+                      "properties": {
+                        "type": { "type": "string" },
+                        "budgetTokens": { "type": "number" }
+                      }
+                    }
+                  },
+                  "required": ["model"]
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "logging": { "type": "boolean" }
+  }
+}
