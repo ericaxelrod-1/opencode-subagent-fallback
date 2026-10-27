@@ -523,12 +523,12 @@ export async function walkChain(input: WalkInput): Promise<WalkOutcome> {
     ? [...input.chain]
     : input.chain.filter((m) => {
         const limit = modelLimits.get(m)
-        const fits = limit === undefined || est <= limit
-        if (!fits) log(`${m}: context ${limit} < ~${est} est — pre-filtered`)
+        const fits = limit === undefined || est <= Math.round(limit * ROOT.compactionRatio)
+        if (!fits) log(`${m}: context ${limit} * ${ROOT.compactionRatio} < ~${est} est — pre-filtered`)
         return fits
       })
   if (candidates.length === 0) {
-    return { ok: false, trail: [], reason: `no candidate model fits ~${est} tokens` }
+    return { ok: false, trail: [], reason: `no candidate model fits ~${est} tokens at ${ROOT.compactionRatio} ratio` }
   }
 
   const deadline = now() + ROOT.budgetMs
