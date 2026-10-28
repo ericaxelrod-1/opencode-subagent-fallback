@@ -64,6 +64,7 @@ interface FallbackEntry {
 interface AgentFallback {
   largeContextModel?: string
   minContextRatio?: number
+  largeContextFallback?: (FallbackEntry | string)[]
   fallback: (FallbackEntry | string)[]
 }
 
@@ -523,12 +524,12 @@ export async function walkChain(input: WalkInput): Promise<WalkOutcome> {
     ? [...input.chain]
     : input.chain.filter((m) => {
         const limit = modelLimits.get(m)
-        const fits = limit === undefined || est <= Math.round(limit * ROOT.compactionRatio)
-        if (!fits) log(`${m}: context ${limit} * ${ROOT.compactionRatio} < ~${est} est — pre-filtered`)
+        const fits = limit === undefined || est <= limit
+        if (!fits) log(`${m}: context ${limit} < ~${est} est — pre-filtered`)
         return fits
       })
   if (candidates.length === 0) {
-    return { ok: false, trail: [], reason: `no candidate model fits ~${est} tokens at ${ROOT.compactionRatio} ratio` }
+    return { ok: false, trail: [], reason: `no candidate model fits ~${est} tokens` }
   }
 
   const deadline = now() + ROOT.budgetMs
@@ -834,16 +835,20 @@ function setupParentWatchdog(client: any, directory: string): {
       })()
       return
     }
-    if (type === "session.error") {
-      const sid: string | undefined = ev?.properties?.sessionID
-      if (!sid || !turns.has(sid)) return
-      const c = classifyError(ev?.properties?.error)
-      logLine(`parent ${sid}: ${c.cls}${c.detail ? ` (${c.detail})` : ""}`)
-      const failed = anchorFor(sid)
-      if (failed && (c.cls === "quota" || c.cls === "transient" || c.cls === "provider_level") && !c.ours) {
-        breakerFor(failed).recordFailure()
-      }
+  if (type === "session.error") {
+    const sid: string | undefined = ev?.properties?.sessionID
+    if (!sid || !turns.has(sid)) return
+    const c = classifyError(ev?.properties?.error)
+    logLine(`parent ${sid}: ${c.cls}${c.detail ? ` (${c.detail})` : ""}`)
+    const failed = anchorFor(sid)
+    if (failed && (c.cls === "quota" || c.cls === "transient" || c.cls === "provider_level") && !c.ours) {
+      breakerFor(failed).recordFailure()
+      // Re-prompt on the next healthy model in the chain, same as onStall.
+      // Without this, a rapid rate-limit error (not a stall) never triggers
+      // fallback and the session retries the broken model until cancelled.
+      void reprompt(sid)
     }
+  }
   }
 
   const onChatMessage = async (input: any, output: any) => {
@@ -956,12 +961,38 @@ const plugin: Plugin = async (input: PluginInput) => {
       }
 
       const onOverflow = async (model: string) => {
-        // Catch-all only: compaction model for oversized context.
-        const compactModel = agentFb?.largeContextModel ?? model
+        // Catch-all: use the large-context fallback chain (with sticky retry,
+        // breaker, budget) so compaction survives rate limits or unavailable
+        // large models, just like the main chain does.
+        const largeChainRaw: string[] = []
+        const compactAnchor = agentFb?.largeContextModel ?? model
+        if (compactAnchor) largeChainRaw.push(compactAnchor)
+        for (const e of agentFb?.largeContextFallback ?? agentFb?.fallback ?? fb.defaultFallback ?? []) largeChainRaw.push(typeof e === "string" ? e : e.model)
+        const largeChain = [...new Set(largeChainRaw)]
         try {
-          const [providerID, modelID] = splitModel(compactModel)
-          await client.session.summarize({ path: { id: sessionId }, body: { providerID, modelID } })
-        } catch {}
+          const result = await walkChain({
+            chain: largeChain,
+            sessionKey: sessionId,
+            estimateTokens: estimateTokens(prompt),
+            log: logLine,
+            attempt: async (m) => {
+              const [providerID, modelID] = splitModel(m)
+              try {
+                await client.session.summarize({ path: { id: sessionId }, body: { providerID, modelID } })
+                return { ok: true, completion: { finish: "length", text: "" } }
+              } catch (e: any) {
+                return { ok: false, error: e }
+              }
+            },
+          })
+          if (!result.ok) {
+            logLine(`parent ${sessionId}: catch-all compaction failed: ${result.reason} (trail: ${formatTrail(result.trail)})`)
+          } else {
+            logLine(`parent ${sessionId}: catch-all compaction completed on ${result.model} (trail: ${formatTrail(result.trail)})`)
+          }
+        } catch (e: any) {
+          logLine(`parent ${sessionId}: catch-all compaction exception: ${e?.message ?? e}`)
+        }
       }
 
       const outcome = await walkChain({
