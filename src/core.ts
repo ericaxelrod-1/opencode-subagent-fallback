@@ -1,4 +1,5 @@
 import type { Plugin, PluginInput, Hooks } from "@opencode-ai/plugin"
+import type { OpencodeClient } from "@opencode-ai/sdk"
 import { tool } from "@opencode-ai/plugin"
 import { z } from "zod"
 import { readFileSync, statSync } from "fs"
@@ -383,6 +384,16 @@ export function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4)
 }
 
+async function getSessionTokens(client: OpencodeClient, sessionId: string): Promise<number> {
+  try {
+    const msgs: any = await client.session.messages({ path: { id: sessionId }, throwOnError: true }).catch(() => null)
+    if (!msgs?.data) return 0
+    return msgs.data.reduce((sum: number, m: any) => sum + (m.info?.tokens?.input || 0), 0)
+  } catch {
+    return 0
+  }
+}
+
 // ── Error classification ────────────────────────────────────────────────────
 
 function headerRetryAfter(headers: Record<string, string> | undefined): number | undefined {
@@ -745,7 +756,17 @@ function setupParentWatchdog(client: any, directory: string): {
   // Re-prompt bookkeeping. After an abort we re-issue the captured user parts
   // on the next healthy model. A re-prompt duplicates the user turn in the
   // transcript — accepted; a frozen user turn is worse.
-  const turns = new Map<string, { chain: string[]; parts: any[]; agent: string; rePrompts: number; usedTokens: number }>()
+const turns = new Map<string, { 
+    chain: string[]; 
+    parts: any[]; 
+    agent: string; 
+    rePrompts: number; 
+    usedTokens: number;
+    partialResponse: string;
+    responseStarted: boolean;
+    responseStartTime: number;
+    lastTokenAt: number;
+  }>()
 
   // First healthy model in the chain that isn't the one that just stalled.
   const nextHealthy = (chain: string[], exclude: string, est?: number): string | undefined => {
@@ -876,7 +897,7 @@ function setupParentWatchdog(client: any, directory: string): {
       const used: number | undefined = info?.tokens?.input
       if (sid && used !== undefined) {
         const st = turns.get(sid)
-        if (st) st.usedTokens = used
+        if (st) st.usedTokens = (st.usedTokens || 0) + used
       }
 
       // Error detection: if the assistant message has an error, trigger
@@ -924,7 +945,7 @@ function setupParentWatchdog(client: any, directory: string): {
               const agentFb = fb.agents?.[agent]
               const chain: string[] = [currentModel]
               for (const e of agentFb?.fallback ?? fb.defaultFallback ?? []) chain.push(typeof e === "string" ? e : e.model)
-              turns.set(sid!, { chain: [...new Set(chain)], parts, agent, rePrompts: 0, usedTokens })
+              turns.set(sid!, { chain: [...new Set(chain)], parts, agent, rePrompts: 0, usedTokens, partialResponse: "", responseStarted: false, responseStartTime: 0, lastTokenAt: 0 })
               logLine(`parent ${sid}: built chain on-the-fly from message.updated (agent=${agent}, model=${currentModel}, parts=${parts.length}, usedTokens=${usedTokens})`)
             }
           }
@@ -1004,7 +1025,7 @@ function setupParentWatchdog(client: any, directory: string): {
         const agentFb = fb.agents?.[agent]
         const chain: string[] = [currentModel]
         for (const e of agentFb?.fallback ?? fb.defaultFallback ?? []) chain.push(typeof e === "string" ? e : e.model)
-        turns.set(sid, { chain: [...new Set(chain)], parts, agent, rePrompts: 0, usedTokens })
+        turns.set(sid, { chain: [...new Set(chain)], parts, agent, rePrompts: 0, usedTokens, partialResponse: "", responseStarted: false, responseStartTime: 0, lastTokenAt: 0 })
         logLine(`parent ${sid}: built chain on-the-fly (agent=${agent}, model=${currentModel}, parts=${parts.length}, usedTokens=${usedTokens})`)
       }
       logLine(`parent ${sid}: ${c.cls}${c.detail ? ` (${c.detail})` : ""}`)
@@ -1017,19 +1038,45 @@ function setupParentWatchdog(client: any, directory: string): {
     }
   }
 
-  const onChatMessage = async (input: any, output: any) => {
+const onChatMessage = async (input: any, output: any) => {
     const sid: string | undefined = input?.sessionID
-    const agent: string = input?.agent ?? output?.message?.agent ?? ""
+    // Only explicit user choice (input.agent) updates the agent; inferred agent from model is ignored
+    const explicitAgent = input?.agent
     const current = output?.message?.model
     if (!sid || !current?.providerID || !current?.modelID) return
-    logLine(`parent ${sid}: chat.message (agent=${agent}, model=${current.providerID}/${current.modelID}, parts=${output?.parts?.length ?? 0})`)
     const currentModel = `${current.providerID}/${current.modelID}`
 
+    // Get or create turn state, tracking the effective agent for fallback
+    let st = turns.get(sid)
+    if (!st) {
+      // First message: initialize with explicit agent or default
+      const fb = loadFallback(directory)
+      const initialAgent = input?.agent ?? "developer"
+      const agentFb = fb.agents?.[initialAgent]
+      const chain: string[] = [currentModel]
+      for (const e of agentFb?.fallback ?? fb.defaultFallback ?? []) chain.push(typeof e === "string" ? e : e.model)
+      turns.set(sid, { chain: [...new Set(chain)], parts: output?.parts ?? [], agent: input?.agent ?? "developer", rePrompts: 0, usedTokens: 0, partialResponse: "", responseStarted: false, responseStartTime: 0, lastTokenAt: 0 })
+      st = turns.get(sid)!
+    } else {
+      // Update chain with current model, but KEEP the agent for fallback (only explicitAgent updates it)
+      const fb = loadFallback(directory)
+      const effectiveAgent = input?.agent ?? st.agent ?? "developer"
+      const agentFb = fb.agents?.[input?.agent ?? st.agent ?? "developer"]
+      const chain: string[] = [currentModel]
+      for (const e of agentFb?.fallback ?? fb.defaultFallback ?? []) chain.push(typeof e === "string" ? e : e.model)
+      st.chain = [...new Set(chain)]
+      st.parts = output?.parts ?? []
+// Only update agent if user explicitly changed it
+      if (input?.agent) st.agent = input.agent
+    }
+
     const fb = loadFallback(directory)
-    const agentFb = fb.agents?.[agent]
+    const effectiveAgent = input?.agent ?? st.agent ?? "developer"
+    const agentFb = fb.agents?.[effectiveAgent]
     const chain: string[] = [currentModel]
     for (const e of agentFb?.fallback ?? fb.defaultFallback ?? []) chain.push(typeof e === "string" ? e : e.model)
-    turns.set(sid, { chain: [...new Set(chain)], parts: output?.parts ?? [], agent, rePrompts: 0, usedTokens: 0 })
+    st.chain = [...new Set(chain)]
+    st.parts = output?.parts ?? []
 
     const pcfg = providerCfg(currentModel)
     registerLiveness(sid, {
@@ -1039,21 +1086,6 @@ function setupParentWatchdog(client: any, directory: string): {
       stallTimeoutMs: ROOT.parentWatchdog.stallTimeoutMs ?? pcfg.stallTimeoutMs,
       onStall: (s) => void reprompt(s),
     })
-
-    // Steering: keep the anchor unless it is blocked or its breaker is open.
-    const anchor = anchorFor(sid)
-    const pick = chain.includes(anchor ?? "") ? (anchor as string) : currentModel
-    const b = breakerFor(pick)
-    const bt = blockedUntil.get(pick)
-    const healthy = !b.isOpen && (bt === undefined || bt <= now())
-    if (!healthy) {
-      const next = nextHealthy(chain, pick)
-      if (next && next !== currentModel) {
-        const [providerID, modelID] = splitModel(next)
-        output.message.model = { providerID, modelID }
-        logLine(`parent ${sid}: steering ${currentModel} → ${next} (anchor unhealthy)`)
-      }
-    }
   }
 
   return { onEvent, onChatMessage }
@@ -1165,7 +1197,7 @@ const plugin: Plugin = async (input: PluginInput) => {
       const outcome = await walkChain({
         chain,
         sessionKey: sessionId,
-        estimateTokens: estimateTokens(prompt),
+        estimateTokens: estimateTokens(prompt) + (await getSessionTokens(client, sessionId)),
         log: logLine,
         onOverflow,
         attempt: async (model) => {
