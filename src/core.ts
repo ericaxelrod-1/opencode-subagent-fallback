@@ -223,7 +223,7 @@ function DEFAULTS(): RootConfig {
   return {
     budgetMs: 600000,
     maxIterations: 10,
-    compactionRatio: 0.5,
+    compactionRatio: 0.4,
     parentWatchdog: { enabled: false },
     providers: {},
   }
@@ -745,16 +745,22 @@ function setupParentWatchdog(client: any, directory: string): {
   // Re-prompt bookkeeping. After an abort we re-issue the captured user parts
   // on the next healthy model. A re-prompt duplicates the user turn in the
   // transcript — accepted; a frozen user turn is worse.
-  const turns = new Map<string, { chain: string[]; parts: any[]; agent: string; rePrompts: number }>()
+  const turns = new Map<string, { chain: string[]; parts: any[]; agent: string; rePrompts: number; usedTokens: number }>()
 
   // First healthy model in the chain that isn't the one that just stalled.
-  const nextHealthy = (chain: string[], exclude: string): string | undefined => {
+  const nextHealthy = (chain: string[], exclude: string, est?: number): string | undefined => {
     const t = now()
     return chain.find((m) => {
       if (m === exclude) return false
       const b = breakerFor(m)
       const bt = blockedUntil.get(m)
-      return !b.isOpen && (bt === undefined || bt <= t)
+      if (b.isOpen || (bt !== undefined && bt > t)) return false
+      // Context-size filter: skip models that can't hold the conversation.
+      if (est !== undefined) {
+        const limit = modelLimits.get(m)
+        if (limit !== undefined && est > limit) return false
+      }
+      return true
     })
   }
 
@@ -767,7 +773,46 @@ function setupParentWatchdog(client: any, directory: string): {
       return
     }
     const stalled = anchorFor(sid) ?? st.chain[0]
-    const next = nextHealthy(st.chain, stalled)
+    const next = nextHealthy(st.chain, stalled, st.usedTokens || undefined)
+    // If no model can hold the conversation (all too small), compact first
+    // using the large-context models, then retry.
+    if (!next && st.usedTokens > 0) {
+      const fb = loadFallback(directory)
+      const agentFb = fb.agents?.[st.agent]
+      const largeChainRaw: string[] = []
+      const compactAnchor = agentFb?.largeContextModel ?? stalled
+      if (compactAnchor) largeChainRaw.push(compactAnchor)
+      for (const e of agentFb?.largeContextFallback ?? fb.defaultFallback ?? []) largeChainRaw.push(typeof e === "string" ? e : e.model)
+      const largeChain = [...new Set(largeChainRaw)]
+      logLine(`parent ${sid}: no model holds ~${st.usedTokens} tokens — compacting via large chain`)
+      try {
+        const result = await walkChain({
+          chain: largeChain,
+          sessionKey: sid,
+          estimateTokens: st.usedTokens,
+          log: logLine,
+          attempt: async (m) => {
+            const [providerID, modelID] = splitModel(m)
+            try {
+              await client.session.summarize({ path: { id: sid }, body: { providerID, modelID } })
+              return { ok: true, completion: { finish: "length", text: "" } }
+            } catch (e: any) {
+              return { ok: false, error: e }
+            }
+          },
+        })
+        if (result.ok) {
+          logLine(`parent ${sid}: compaction completed on ${result.model} — retrying`)
+          st.usedTokens = Math.round(st.usedTokens * ROOT.compactionRatio)
+          // Re-check nextHealthy after compaction
+        } else {
+          logLine(`parent ${sid}: compaction failed: ${result.reason}`)
+        }
+      } catch (e: any) {
+        logLine(`parent ${sid}: compaction exception: ${e?.message ?? e}`)
+      }
+    }
+    const nextAfterCompact = next ?? nextHealthy(st.chain, stalled, st.usedTokens || undefined)
     // If parts are empty (chat.message didn't capture them), try fetching
     // from the session before giving up.
     if (st.parts.length === 0) {
@@ -781,15 +826,15 @@ function setupParentWatchdog(client: any, directory: string): {
         }
       } catch {}
     }
-    if (!next || st.parts.length === 0) {
-      logLine(`parent ${sid}: no healthy model to re-prompt on (next=${next ?? "none"}, parts=${st.parts.length})`)
+    if (!nextAfterCompact || st.parts.length === 0) {
+      logLine(`parent ${sid}: no healthy model to re-prompt on (next=${nextAfterCompact ?? "none"}, parts=${st.parts.length})`)
       turns.delete(sid)
       return
     }
     st.rePrompts += 1
-    logLine(`parent ${sid}: re-prompting on ${next} (attempt ${st.rePrompts})`)
-    const [providerID, modelID] = splitModel(next)
-    const pcfg = providerCfg(next)
+    logLine(`parent ${sid}: re-prompting on ${nextAfterCompact} (attempt ${st.rePrompts})`)
+    const [providerID, modelID] = splitModel(nextAfterCompact)
+    const pcfg = providerCfg(nextAfterCompact)
     const entry = liveness.get(sid)
     if (entry) {
       entry.startedAt = now()
@@ -826,6 +871,13 @@ function setupParentWatchdog(client: any, directory: string): {
       const info = ev?.properties?.info
       const sid: string | undefined = info?.sessionID
       if (sid) stampAlive(sid)
+
+      // Update used tokens for context-size filtering in nextHealthy.
+      const used: number | undefined = info?.tokens?.input
+      if (sid && used !== undefined) {
+        const st = turns.get(sid)
+        if (st) st.usedTokens = used
+      }
 
       // Error detection: if the assistant message has an error, trigger
       // parent-level fallback (same as session.error). This catches cases
@@ -868,7 +920,7 @@ function setupParentWatchdog(client: any, directory: string): {
               const agentFb = fb.agents?.[agent]
               const chain: string[] = [currentModel]
               for (const e of agentFb?.fallback ?? fb.defaultFallback ?? []) chain.push(typeof e === "string" ? e : e.model)
-              turns.set(sid!, { chain: [...new Set(chain)], parts, agent, rePrompts: 0 })
+              turns.set(sid!, { chain: [...new Set(chain)], parts, agent, rePrompts: 0, usedTokens: 0 })
               logLine(`parent ${sid}: built chain on-the-fly from message.updated (agent=${agent}, model=${currentModel}, parts=${parts.length})`)
             }
           }
@@ -884,14 +936,14 @@ function setupParentWatchdog(client: any, directory: string): {
       // model — that is the "primary forgets" failure we refuse.
       const model = `${info?.providerID}/${info?.modelID}`
       const limit = modelLimits.get(model)
-      const used: number | undefined = info?.tokens?.input
-      if (!sid || limit === undefined || used === undefined) return
-      if (used < limit * ROOT.compactionRatio) return
+      const usedTokens: number | undefined = info?.tokens?.input
+      if (!sid || limit === undefined || usedTokens === undefined) return
+      if (usedTokens < limit * ROOT.compactionRatio) return
       const last = lastCompactAt.get(sid) ?? 0
       if (now() - last < 120000) return // debounce: 2 min
       lastCompactAt.set(sid, now())
       const [providerID, modelID] = splitModel(model)
-      logLine(`parent ${sid}: ${Math.round((used / limit) * 100)}% of ${model} — self-compacting at ${ROOT.compactionRatio * 100}%`)
+      logLine(`parent ${sid}: ${Math.round((usedTokens / limit) * 100)}% of ${model} — self-compacting at ${ROOT.compactionRatio * 100}%`)
       void (async () => {
         try {
           await client.session.summarize({ path: { id: sid }, body: { providerID, modelID } })
@@ -947,7 +999,7 @@ function setupParentWatchdog(client: any, directory: string): {
         const agentFb = fb.agents?.[agent]
         const chain: string[] = [currentModel]
         for (const e of agentFb?.fallback ?? fb.defaultFallback ?? []) chain.push(typeof e === "string" ? e : e.model)
-        turns.set(sid, { chain: [...new Set(chain)], parts, agent, rePrompts: 0 })
+        turns.set(sid, { chain: [...new Set(chain)], parts, agent, rePrompts: 0, usedTokens: 0 })
         logLine(`parent ${sid}: built chain on-the-fly (agent=${agent}, model=${currentModel}, parts=${parts.length})`)
       }
       logLine(`parent ${sid}: ${c.cls}${c.detail ? ` (${c.detail})` : ""}`)
@@ -972,7 +1024,7 @@ function setupParentWatchdog(client: any, directory: string): {
     const agentFb = fb.agents?.[agent]
     const chain: string[] = [currentModel]
     for (const e of agentFb?.fallback ?? fb.defaultFallback ?? []) chain.push(typeof e === "string" ? e : e.model)
-    turns.set(sid, { chain: [...new Set(chain)], parts: output?.parts ?? [], agent, rePrompts: 0 })
+    turns.set(sid, { chain: [...new Set(chain)], parts: output?.parts ?? [], agent, rePrompts: 0, usedTokens: 0 })
 
     const pcfg = providerCfg(currentModel)
     registerLiveness(sid, {
