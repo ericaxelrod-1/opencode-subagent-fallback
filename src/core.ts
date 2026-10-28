@@ -810,6 +810,7 @@ function setupParentWatchdog(client: any, directory: string): {
   // Compaction bookkeeping: never self-compact the same session twice inside
   // the debounce window (each summarize costs a full turn).
   const lastCompactAt = new Map<string, number>()
+  const lastParentErrorAt = new Map<string, number>()
 
   const onEvent = async (ev: any) => {
     const type = ev?.type
@@ -825,6 +826,58 @@ function setupParentWatchdog(client: any, directory: string): {
       const info = ev?.properties?.info
       const sid: string | undefined = info?.sessionID
       if (sid) stampAlive(sid)
+
+      // Error detection: if the assistant message has an error, trigger
+      // parent-level fallback (same as session.error). This catches cases
+      // where session.error event doesn't fire but message.updated does.
+      if (info?.role === "assistant" && info?.error) {
+        const c = classifyError(info.error)
+        logLine(`parent ${sid}: message.updated error ${c.cls}${c.detail ? ` (${c.detail})` : ""}`)
+        // Debounce: don't re-prompt more than once every 5s
+        const lastErr = lastParentErrorAt.get(sid!) ?? 0
+        if (now() - lastErr >= 5000 && (c.cls === "quota" || c.cls === "transient" || c.cls === "provider_level") && !c.ours) {
+          lastParentErrorAt.set(sid!, now())
+          // Build turns on-the-fly if missing (same as session.error handler)
+          if (!turns.has(sid!)) {
+            let currentModel: string | undefined
+            let agent = ""
+            let parts: any[] = []
+            try {
+              const msgs: any = await client.session.messages({ path: { id: sid }, throwOnError: true }).catch(() => null)
+              const allMsgs = msgs?.data ?? []
+              for (let i = allMsgs.length - 1; i >= 0; i--) {
+                const m = allMsgs[i]
+                if (!currentModel && m?.info?.model?.providerID && m?.info?.model?.modelID) {
+                  currentModel = `${m.info.model.providerID}/${m.info.model.modelID}`
+                }
+                if (!agent && m?.info?.agent) agent = m.info.agent
+              }
+              const userMsgs = allMsgs.filter((m: any) => m?.info?.role === "user")
+              const lastUserMsg = userMsgs[userMsgs.length - 1]
+              if (lastUserMsg?.parts?.length) parts = lastUserMsg.parts
+            } catch {}
+            if (!currentModel) {
+              try {
+                const cfg: any = (await client.config.get({ throwOnError: true }))?.data
+                if (agent && cfg?.agent?.[agent]?.model) currentModel = cfg.agent[agent].model
+              } catch {}
+            }
+            if (currentModel) {
+              if (!agent) agent = "developer"
+              const fb = loadFallback(directory)
+              const agentFb = fb.agents?.[agent]
+              const chain: string[] = [currentModel]
+              for (const e of agentFb?.fallback ?? fb.defaultFallback ?? []) chain.push(typeof e === "string" ? e : e.model)
+              turns.set(sid!, { chain: [...new Set(chain)], parts, agent, rePrompts: 0 })
+              logLine(`parent ${sid}: built chain on-the-fly from message.updated (agent=${agent}, model=${currentModel}, parts=${parts.length})`)
+            }
+          }
+          const failed = anchorFor(sid!) ?? turns.get(sid!)?.chain?.[0]
+          if (failed) breakerFor(failed).recordFailure()
+          void reprompt(sid!)
+        }
+        return
+      }
 
       // Proactive self-compaction: the model in the seat summarizes its OWN
       // session at compactionRatio. Never delegates compaction to another
