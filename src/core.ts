@@ -768,8 +768,21 @@ function setupParentWatchdog(client: any, directory: string): {
     }
     const stalled = anchorFor(sid) ?? st.chain[0]
     const next = nextHealthy(st.chain, stalled)
+    // If parts are empty (chat.message didn't capture them), try fetching
+    // from the session before giving up.
+    if (st.parts.length === 0) {
+      try {
+        const msgs: any = await client.session.messages({ path: { id: sid }, throwOnError: true }).catch(() => null)
+        const userMsgs = (msgs?.data ?? []).filter((m: any) => m?.info?.role === "user")
+        const lastUserMsg = userMsgs[userMsgs.length - 1]
+        if (lastUserMsg?.parts?.length) {
+          st.parts = lastUserMsg.parts
+          logLine(`parent ${sid}: recovered ${st.parts.length} parts from session messages`)
+        }
+      } catch {}
+    }
     if (!next || st.parts.length === 0) {
-      logLine(`parent ${sid}: no healthy model to re-prompt on`)
+      logLine(`parent ${sid}: no healthy model to re-prompt on (next=${next ?? "none"}, parts=${st.parts.length})`)
       turns.delete(sid)
       return
     }
@@ -798,7 +811,7 @@ function setupParentWatchdog(client: any, directory: string): {
   // the debounce window (each summarize costs a full turn).
   const lastCompactAt = new Map<string, number>()
 
-  const onEvent = (ev: any) => {
+  const onEvent = async (ev: any) => {
     const type = ev?.type
     // Liveness stamping is unconditional: child attempts register for the sweep
     // even when the parent watchdog is off, and they need these events.
@@ -835,20 +848,44 @@ function setupParentWatchdog(client: any, directory: string): {
       })()
       return
     }
-  if (type === "session.error") {
-    const sid: string | undefined = ev?.properties?.sessionID
-    if (!sid || !turns.has(sid)) return
-    const c = classifyError(ev?.properties?.error)
-    logLine(`parent ${sid}: ${c.cls}${c.detail ? ` (${c.detail})` : ""}`)
-    const failed = anchorFor(sid)
-    if (failed && (c.cls === "quota" || c.cls === "transient" || c.cls === "provider_level") && !c.ours) {
-      breakerFor(failed).recordFailure()
-      // Re-prompt on the next healthy model in the chain, same as onStall.
-      // Without this, a rapid rate-limit error (not a stall) never triggers
-      // fallback and the session retries the broken model until cancelled.
-      void reprompt(sid)
+    if (type === "session.error") {
+      const sid: string | undefined = ev?.properties?.sessionID
+      if (!sid) return
+      const c = classifyError(ev?.properties?.error)
+      // If turns doesn't have this session (chat.message never fired or didn't
+      // capture it), build the chain on-the-fly so the watchdog can still
+      // re-prompt instead of silently returning.
+      if (!turns.has(sid)) {
+        const anchor = anchorFor(sid)
+        if (!anchor) {
+          logLine(`parent ${sid}: ${c.cls} — no anchor, cannot re-prompt`)
+          return
+        }
+        let agent = ""
+        let parts: any[] = []
+        try {
+          const msgs: any = await client.session.messages({ path: { id: sid }, throwOnError: true }).catch(() => null)
+          const userMsgs = (msgs?.data ?? []).filter((m: any) => m?.info?.role === "user")
+          const lastUserMsg = userMsgs[userMsgs.length - 1]
+          if (lastUserMsg?.info?.agent) agent = lastUserMsg.info.agent
+          parts = lastUserMsg?.parts ?? []
+        } catch {}
+        if (!agent) agent = "developer"
+        const fb = loadFallback(directory)
+        const agentFb = fb.agents?.[agent]
+        const chain: string[] = [anchor]
+        for (const e of agentFb?.fallback ?? fb.defaultFallback ?? []) chain.push(typeof e === "string" ? e : e.model)
+        turns.set(sid, { chain: [...new Set(chain)], parts, agent, rePrompts: 0 })
+        logLine(`parent ${sid}: built chain on-the-fly (agent=${agent}, parts=${parts.length})`)
+      }
+      logLine(`parent ${sid}: ${c.cls}${c.detail ? ` (${c.detail})` : ""}`)
+      const failed = anchorFor(sid)
+      if (failed && (c.cls === "quota" || c.cls === "transient" || c.cls === "provider_level") && !c.ours) {
+        breakerFor(failed).recordFailure()
+        // Re-prompt on the next healthy model in the chain, same as onStall.
+        void reprompt(sid)
+      }
     }
-  }
   }
 
   const onChatMessage = async (input: any, output: any) => {
@@ -856,6 +893,7 @@ function setupParentWatchdog(client: any, directory: string): {
     const agent: string = input?.agent ?? output?.message?.agent ?? ""
     const current = output?.message?.model
     if (!sid || !current?.providerID || !current?.modelID) return
+    logLine(`parent ${sid}: chat.message (agent=${agent}, model=${current.providerID}/${current.modelID}, parts=${output?.parts?.length ?? 0})`)
     const currentModel = `${current.providerID}/${current.modelID}`
 
     const fb = loadFallback(directory)
