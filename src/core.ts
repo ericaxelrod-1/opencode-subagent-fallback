@@ -894,6 +894,7 @@ function setupParentWatchdog(client: any, directory: string): {
             let currentModel: string | undefined
             let agent = ""
             let parts: any[] = []
+            let usedTokens = 0
             try {
               const msgs: any = await client.session.messages({ path: { id: sid }, throwOnError: true }).catch(() => null)
               const allMsgs = msgs?.data ?? []
@@ -903,6 +904,9 @@ function setupParentWatchdog(client: any, directory: string): {
                   currentModel = `${m.info.model.providerID}/${m.info.model.modelID}`
                 }
                 if (!agent && m?.info?.agent) agent = m.info.agent
+            if (usedTokens === 0 && m?.info?.role === 'assistant' && m?.info?.tokens?.input) {
+              usedTokens = m.info.tokens.input
+            }
               }
               const userMsgs = allMsgs.filter((m: any) => m?.info?.role === "user")
               const lastUserMsg = userMsgs[userMsgs.length - 1]
@@ -920,8 +924,8 @@ function setupParentWatchdog(client: any, directory: string): {
               const agentFb = fb.agents?.[agent]
               const chain: string[] = [currentModel]
               for (const e of agentFb?.fallback ?? fb.defaultFallback ?? []) chain.push(typeof e === "string" ? e : e.model)
-              turns.set(sid!, { chain: [...new Set(chain)], parts, agent, rePrompts: 0, usedTokens: 0 })
-              logLine(`parent ${sid}: built chain on-the-fly from message.updated (agent=${agent}, model=${currentModel}, parts=${parts.length})`)
+              turns.set(sid!, { chain: [...new Set(chain)], parts, agent, rePrompts: 0, usedTokens })
+              logLine(`parent ${sid}: built chain on-the-fly from message.updated (agent=${agent}, model=${currentModel}, parts=${parts.length}, usedTokens=${usedTokens})`)
             }
           }
           const failed = anchorFor(sid!) ?? turns.get(sid!)?.chain?.[0]
@@ -968,6 +972,7 @@ function setupParentWatchdog(client: any, directory: string): {
         let currentModel = anchor
         let agent = ""
         let parts: any[] = []
+        let usedTokens = 0
         try {
           const msgs: any = await client.session.messages({ path: { id: sid }, throwOnError: true }).catch(() => null)
           const allMsgs = msgs?.data ?? []
@@ -999,8 +1004,8 @@ function setupParentWatchdog(client: any, directory: string): {
         const agentFb = fb.agents?.[agent]
         const chain: string[] = [currentModel]
         for (const e of agentFb?.fallback ?? fb.defaultFallback ?? []) chain.push(typeof e === "string" ? e : e.model)
-        turns.set(sid, { chain: [...new Set(chain)], parts, agent, rePrompts: 0, usedTokens: 0 })
-        logLine(`parent ${sid}: built chain on-the-fly (agent=${agent}, model=${currentModel}, parts=${parts.length})`)
+        turns.set(sid, { chain: [...new Set(chain)], parts, agent, rePrompts: 0, usedTokens })
+        logLine(`parent ${sid}: built chain on-the-fly (agent=${agent}, model=${currentModel}, parts=${parts.length}, usedTokens=${usedTokens})`)
       }
       logLine(`parent ${sid}: ${c.cls}${c.detail ? ` (${c.detail})` : ""}`)
       const failed = anchorFor(sid)
