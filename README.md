@@ -22,7 +22,7 @@ All config lives in `fallback.json`, beside the chains it modulates. The old plu
 {
   "fallbackBudgetMs": 600000,
   "maxIterations": 10,
-  "compactionRatio": 0.5,
+  "compactionRatio": 0.4,
   "parentWatchdog": {
     "enabled": true,
     "firstTokenMs": 120000,
@@ -49,7 +49,7 @@ All config lives in `fallback.json`, beside the chains it modulates. The old plu
 |---|---|---|
 | `fallbackBudgetMs` | `600000` | Wall-clock ceiling for one walk. |
 | `maxIterations` | `10` | Max full passes over the chain. |
-| `compactionRatio` | `0.5` | Self-compact at this fraction of the model's context window. |
+| `compactionRatio` | `0.4` | Self-compact at this fraction of the model's context window. |
 | `parentWatchdog.enabled` | `false` | Master switch for the parent half. |
 | `parentWatchdog.firstTokenMs` | provider's | Override the parent's first-token clock. |
 | `parentWatchdog.stallTimeoutMs` | provider's | Override the parent's inactivity clock. |
@@ -98,15 +98,30 @@ A partial response is **not** a success. Before returning, we check real SDK fie
 
 Failing any of these fails over instead of returning a truncated answer the parent would mistake for a real one.
 
-## Model anchoring
+## Context pre-filter
 
-`anchor = last model that successfully completed a turn`, scoped per session.
+Before spending an attempt, any model whose `Model.limit.context` can't hold the conversation is ruled out. This makes the small→large chain discipline **self-enforcing from data** rather than manual ordering — and it's why a 1M → 256k fallback is a *config discipline* problem (shard to different agents), not something the plugin papers over.
 
-- **Intra-chain:** a transient failure retries the same model inside `stickyMs`, then advances. One wobble doesn't hop the chain; budget and iterations guarantee a sick model can't hold the walk hostage.
-- **Session:** every turn uses the anchor if it's unblocked and breaker-closed, else walks the chain. Success re-confirms whoever served — including a fallback.
-- **Cross-session:** only breaker/cooldown state, in-process. One session's anchor never steers another.
+The pre-filter uses the **full conversation size** (accumulated tokens from all previous messages + current prompt), not just the current prompt. This prevents small models from being selected for conversations they can't hold.
 
-No "return to configured primary after `blockedUntil` clears" — last-success is self-healing and one fewer rule.
+## Parent watchdog
+
+The parent turn hangs (no parts for `firstTokenMs` / `stallTimeoutMs`) or dies (`session.error`). We abort and re-prompt with the next healthy model in the agent's chain, because the user is staring at a frozen session.
+
+**Agent locking:** The agent type is locked at session start. Only explicit user choice (`input.agent`) updates the agent for fallback chain selection. OpenCode's inferred agent (from model fallback) is ignored — this prevents unintended agent switches when a model falls back to a different agent's primary model.
+
+Mechanism, all grounded in the real hook surface:
+
+- **`chat.message`** — `output.message.model` is a mutable `UserMessage`. Mutating it is the *only* parent-level model lever; `chat.params` cannot change the model.
+- **`session.abort`** — kills the in-flight generation.
+- **`session.prompt`** — re-issues with a different model.
+- **`event`** — liveness stamping and `session.error` observation.
+
+**Known cost:** re-prompting duplicates the user turn in the transcript. Accepted — a frozen user turn is worse than a duplicated one.
+
+**Error handling:** The parent watchdog now re-prompts on `session.error` (rate limits, timeouts, etc.), not just stalls. The agent type is **locked at session start** — only explicit user choice (`input.agent`) changes the fallback chain. OpenCode's inferred agent (from model fallback) is ignored for the fallback chain, preventing unintended agent switches when models fall back.
+
+**Known cost:** re-prompting duplicates the user turn in the transcript. Accepted — a frozen user turn is worse than a duplicated one.
 
 ## Compaction discipline
 
@@ -121,9 +136,28 @@ Delegating routine compaction to a different model is the "primary forgets" fail
 
 Before spending an attempt, any model whose `Model.limit.context` can't hold the conversation is ruled out. This makes the small→large chain discipline **self-enforcing from data** rather than manual ordering — and it's why a 1M → 256k fallback is a *config discipline* problem (shard to different agents), not something the plugin papers over.
 
+The pre-filter uses the **full conversation size** (accumulated tokens from all previous messages + current prompt), not just the current prompt. This prevents small models from being selected for conversations they can't hold.
+
+## Compaction discipline
+
+Two tiers, and the distinction matters:
+
+1. **Normal — self-compaction.** At `compactionRatio`, the model *in the seat* summarizes its own session via `session.summarize` with its own provider. The primary keeps its own summary and doesn't forget what it's doing.
+2. **Catch-all — `largeContextModel`.** Only when a context-too-large failure slips through the pre-filter. Never routine.
+
+Delegating routine compaction to a different model is the "primary forgets" failure, and it's reserved for the catch-all only.
+
+## Catch-all compaction
+
+When a `context_too_large` failure slips through the pre-filter, the catch-all compaction uses the agent's `largeContextModel` (or the failing model as anchor) with the agent's `largeContextFallback` chain. This runs the same `walkChain` logic with the same sticky retry, breaker, and budget discipline — ensuring compaction survives rate limits and unavailable large models.
+
+The `largeContextFallback` chain lets you specify a dedicated list of 1M+ context models for compaction, separate from the regular fallback chain.
+
 ## Parent watchdog
 
 The parent turn hangs (no parts for `firstTokenMs` / `stallTimeoutMs`) or dies (`session.error`). We abort and re-prompt with the next healthy model in the agent's chain, because the user is staring at a frozen session.
+
+**Agent locking:** The agent type is locked at session start. Only explicit user choice (`input.agent`) updates the agent for fallback chain selection. OpenCode's inferred agent (from model fallback) is ignored — this prevents unintended agent switches when a model falls back to another agent's primary model.
 
 Mechanism, all grounded in the real hook surface:
 
@@ -134,9 +168,35 @@ Mechanism, all grounded in the real hook surface:
 
 **Known cost:** re-prompting duplicates the user turn in the transcript. Accepted — a frozen user turn is worse than a duplicated one.
 
-## Diagnostics
+## Subagent context tracking
 
-Every failed hop is logged to stderr as `[subagent-fallback] <model> <class>=<ms>ms msg=<detail>`, and the trail rides along in the tool result as `<fallback_trail>`. A request answered in 40s reads identically whether one provider stalled for 39s or four failed fast — the trail is what tells them apart.
+For `smart_task` subagents, the full conversation token count (from `client.session.messages`) is added to the pre-filter estimate. This prevents small-context models from being selected for large conversations in subagent sessions.
+
+The catch-all compaction for subagents uses the subagent's own `largeContextFallback` chain, with its own sticky retry, breaker, and budget discipline — ensuring compaction survives rate limits and unavailable large models.
+
+## Installation
+
+```json
+{
+  "plugin": ["C:/Users/axelr/OneDrive/Documents/GitHub/opencode-subagent-fallback/src/index.ts"]
+}
+```
+
+The plugin loads from `.ts` directly — no build step needed for testing.
+
+To make `smart_task` the delegation path, deny the built-in tool on primary agents and allow the wrapper:
+
+```json
+{
+  "agent": {
+    "developer": {
+      "permission": { "task": "deny", "smart_task": "allow" }
+    }
+  }
+}
+```
+
+And `"smart_task": "deny"` on subagents to prevent recursion.
 
 ## Installation
 
