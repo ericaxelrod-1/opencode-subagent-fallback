@@ -857,26 +857,45 @@ function setupParentWatchdog(client: any, directory: string): {
       // re-prompt instead of silently returning.
       if (!turns.has(sid)) {
         const anchor = anchorFor(sid)
-        if (!anchor) {
-          logLine(`parent ${sid}: ${c.cls} — no anchor, cannot re-prompt`)
-          return
-        }
+        // anchorFor is usually undefined for parent sessions (only set after
+        // a successful smart_task). Fall back to the session's last model or
+        // the agent's configured model.
+        let currentModel = anchor
         let agent = ""
         let parts: any[] = []
         try {
           const msgs: any = await client.session.messages({ path: { id: sid }, throwOnError: true }).catch(() => null)
-          const userMsgs = (msgs?.data ?? []).filter((m: any) => m?.info?.role === "user")
+          const allMsgs = msgs?.data ?? []
+          // Find the last assistant or user message with a model.
+          for (let i = allMsgs.length - 1; i >= 0; i--) {
+            const m = allMsgs[i]
+            if (!currentModel && m?.info?.model?.providerID && m?.info?.model?.modelID) {
+              currentModel = `${m.info.model.providerID}/${m.info.model.modelID}`
+            }
+            if (!agent && m?.info?.agent) agent = m.info.agent
+          }
+          const userMsgs = allMsgs.filter((m: any) => m?.info?.role === "user")
           const lastUserMsg = userMsgs[userMsgs.length - 1]
-          if (lastUserMsg?.info?.agent) agent = lastUserMsg.info.agent
-          parts = lastUserMsg?.parts ?? []
+          if (lastUserMsg?.parts?.length) parts = lastUserMsg.parts
         } catch {}
+        if (!currentModel) {
+          // Last resort: use the agent's configured model from opencode config.
+          try {
+            const cfg: any = (await client.config.get({ throwOnError: true }))?.data
+            if (agent && cfg?.agent?.[agent]?.model) currentModel = cfg.agent[agent].model
+          } catch {}
+        }
+        if (!currentModel) {
+          logLine(`parent ${sid}: ${c.cls} — no model available, cannot re-prompt`)
+          return
+        }
         if (!agent) agent = "developer"
         const fb = loadFallback(directory)
         const agentFb = fb.agents?.[agent]
-        const chain: string[] = [anchor]
+        const chain: string[] = [currentModel]
         for (const e of agentFb?.fallback ?? fb.defaultFallback ?? []) chain.push(typeof e === "string" ? e : e.model)
         turns.set(sid, { chain: [...new Set(chain)], parts, agent, rePrompts: 0 })
-        logLine(`parent ${sid}: built chain on-the-fly (agent=${agent}, parts=${parts.length})`)
+        logLine(`parent ${sid}: built chain on-the-fly (agent=${agent}, model=${currentModel}, parts=${parts.length})`)
       }
       logLine(`parent ${sid}: ${c.cls}${c.detail ? ` (${c.detail})` : ""}`)
       const failed = anchorFor(sid)
