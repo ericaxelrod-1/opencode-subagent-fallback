@@ -454,7 +454,7 @@ export function classifyError(err: any): Classified {
     return { cls: "transient", detail: "truncated/empty completion" }
   }
 
-  const is429 = status === 429 || msg.includes("429") || msg.includes("rate limit") || msg.includes("too many requests")
+  const is429 = status === 429 || msg.includes("429") || msg.includes("rate limit") || msg.includes("too many requests") || msg.includes("busy") || msg.includes("all providers for model")
   const quotaWords = msg.includes("daily") || msg.includes("quota") || msg.includes("insufficient_quota") || msg.includes("used up")
   const longReset = retryAfterMs !== undefined && retryAfterMs > QUOTA_THRESHOLD_MS
 
@@ -553,6 +553,8 @@ export async function walkChain(input: WalkInput): Promise<WalkOutcome> {
   if (anchor && candidates.includes(anchor)) ordered.push(anchor)
   for (const m of candidates) if (m !== anchor) ordered.push(m)
 
+  log(`walk starting: ${ordered.join(" -> ")} (anchor=${anchor ?? "none"}, est=${est ?? "n/a"})`)
+
   // Request-scoped exclusions.
   const outModels = new Set<string>()
   const outProviders = new Set<string>()
@@ -632,7 +634,10 @@ export async function walkChain(input: WalkInput): Promise<WalkOutcome> {
           transientStreak.set(model, streak)
           // Streak-bounded exemption: below 3, no bench — truncation is model
           // behavior for this request, not provider health.
-          if (streak >= 3) b.recordFailure()
+          if (streak >= 3) {
+            b.recordFailure()
+            log(`${model}: circuit breaker tripped (streak=${streak}) — advancing chain`)
+          }
 
           const since = transientSince.get(model)
           const firstTransient = since === undefined
@@ -701,6 +706,7 @@ export async function walkChain(input: WalkInput): Promise<WalkOutcome> {
   const reason = soonestResetMs
     ? `all candidates unavailable; soonest reset ~${Math.round(Math.max(0, soonestResetMs - now()) / 1000)}s`
     : "all candidates failed or were ruled out for this request"
+  log(`walk finished: ${trail.length} attempts, ${trail.filter(t => t.cls === "ok").length} succeeded`)
   return { ok: false, trail, reason, soonestResetMs }
 }
 
@@ -860,8 +866,8 @@ const turns = new Map<string, {
     if (entry) {
       entry.startedAt = now()
       entry.lastPartAt = now()
-      entry.firstTokenMs = ROOT.parentWatchdog.firstTokenMs ?? pcfg.firstTokenMs
-      entry.stallTimeoutMs = ROOT.parentWatchdog.stallTimeoutMs ?? pcfg.stallTimeoutMs
+      entry.firstTokenMs = pcfg.firstTokenMs ?? ROOT.parentWatchdog.firstTokenMs
+      entry.stallTimeoutMs = pcfg.stallTimeoutMs ?? ROOT.parentWatchdog.stallTimeoutMs
     }
     try {
       await client.session.prompt({
@@ -880,11 +886,68 @@ const turns = new Map<string, {
 
   const onEvent = async (ev: any) => {
     const type = ev?.type
+    // DEBUG: log all event types received
+    if (type) logLine(`parent DEBUG: event type=${type}`)
     // Liveness stamping is unconditional: child attempts register for the sweep
     // even when the parent watchdog is off, and they need these events.
     if (type === "message.part.updated") {
-      const sid: string | undefined = ev?.properties?.part?.sessionID
+      const part = ev?.properties?.part
+      const sid: string | undefined = part?.sessionID
       if (sid) stampAlive(sid)
+
+      // DEBUG: log ALL events to understand what's emitted
+      logLine(`parent ${sid}: EVENT message.part.updated part.type=${part?.type} part.sessionID=${part?.sessionID} part.error=${part?.error ? "YES" : "no"}`)
+
+      // Detect streaming errors (rate limits, etc.) via RetryPart
+      if (part?.type === "retry" && part?.error && ROOT.parentWatchdog.enabled) {
+        const c = classifyError(part.error)
+        logLine(`parent ${sid}: stream error ${c.cls}${c.detail ? ` (${c.detail})` : ""}`)
+        const lastErr = lastParentErrorAt.get(sid!) ?? 0
+        if (now() - lastErr >= 5000 && (c.cls === "quota" || c.cls === "transient" || c.cls === "provider_level") && !c.ours) {
+          lastParentErrorAt.set(sid!, now())
+          if (!turns.has(sid!)) {
+            let currentModel: string | undefined
+            let agent = ""
+            let parts: any[] = []
+            let usedTokens = 0
+            try {
+              const msgs: any = await client.session.messages({ path: { id: sid }, throwOnError: true }).catch(() => null)
+              const allMsgs = msgs?.data ?? []
+              for (let i = allMsgs.length - 1; i >= 0; i--) {
+                const m = allMsgs[i]
+                if (!currentModel && m?.info?.model?.providerID && m?.info?.model?.modelID) {
+                  currentModel = `${m.info.model.providerID}/${m.info.model.modelID}`
+                }
+                if (!agent && m?.info?.agent) agent = m.info.agent
+                if (usedTokens === 0 && m?.info?.role === 'assistant' && m?.info?.tokens?.input) {
+                  usedTokens = m.info.tokens.input
+                }
+              }
+              const userMsgs = allMsgs.filter((m: any) => m?.info?.role === "user")
+              const lastUserMsg = userMsgs[userMsgs.length - 1]
+              if (lastUserMsg?.parts?.length) parts = lastUserMsg.parts
+            } catch {}
+            if (!currentModel) {
+              try {
+                const cfg: any = (await client.config.get({ throwOnError: true }))?.data
+                if (agent && cfg?.agent?.[agent]?.model) currentModel = cfg.agent[agent].model
+              } catch {}
+            }
+            if (currentModel) {
+              if (!agent) agent = "developer"
+              const fb = loadFallback(directory)
+              const agentFb = fb.agents?.[agent]
+              const chain: string[] = [currentModel]
+              for (const e of agentFb?.fallback ?? fb.defaultFallback ?? []) chain.push(typeof e === "string" ? e : e.model)
+              turns.set(sid!, { chain: [...new Set(chain)], parts, agent, rePrompts: 0, usedTokens, partialResponse: "", responseStarted: false, responseStartTime: 0, lastTokenAt: 0 })
+              logLine(`parent ${sid}: built chain on-the-fly from stream error (agent=${agent}, model=${currentModel}, parts=${parts.length}, usedTokens=${usedTokens})`)
+            }
+          }
+          const failed = anchorFor(sid!) ?? turns.get(sid!)?.chain?.[0]
+          if (failed) breakerFor(failed).recordFailure()
+          void reprompt(sid!)
+        }
+      }
       return
     }
     if (!ROOT.parentWatchdog.enabled) return
@@ -892,6 +955,7 @@ const turns = new Map<string, {
       const info = ev?.properties?.info
       const sid: string | undefined = info?.sessionID
       if (sid) stampAlive(sid)
+      logLine(`parent ${sid}: EVENT message.updated role=${info?.role} error=${info?.error ? "YES" : "no"}`)
 
       // Update used tokens for context-size filtering in nextHealthy.
       const used: number | undefined = info?.tokens?.input
@@ -979,6 +1043,7 @@ const turns = new Map<string, {
       return
     }
     if (type === "session.error") {
+      logLine(`parent ${ev?.properties?.sessionID}: EVENT session.error=${JSON.stringify(ev?.properties).slice(0,200)}`)
       const sid: string | undefined = ev?.properties?.sessionID
       if (!sid) return
       const c = classifyError(ev?.properties?.error)
@@ -1082,8 +1147,8 @@ const onChatMessage = async (input: any, output: any) => {
     registerLiveness(sid, {
       startedAt: now(),
       lastPartAt: now(),
-      firstTokenMs: ROOT.parentWatchdog.firstTokenMs ?? pcfg.firstTokenMs,
-      stallTimeoutMs: ROOT.parentWatchdog.stallTimeoutMs ?? pcfg.stallTimeoutMs,
+      firstTokenMs: pcfg.firstTokenMs ?? ROOT.parentWatchdog.firstTokenMs,
+      stallTimeoutMs: pcfg.stallTimeoutMs ?? ROOT.parentWatchdog.stallTimeoutMs,
       onStall: (s) => void reprompt(s),
     })
   }
@@ -1266,8 +1331,34 @@ const plugin: Plugin = async (input: PluginInput) => {
   if (ROOT.parentWatchdog.enabled) {
     const wd = setupParentWatchdog(client, directory)
     // The watchdog's superset handler already stamps liveness first.
-    hooks.event = async ({ event }) => wd.onEvent(event as any)
+    hooks.event = async (input: any) => {
+      const event = input?.event ?? input
+      logLine(`parent HOOK event type=${event?.type}`)
+      wd.onEvent(event as any)
+    }
     hooks["chat.message"] = async (input, output) => wd.onChatMessage(input, output)
+
+    // Also subscribe to global SSE event stream to catch stream errors
+    // that don't go through the plugin hook.
+    logLine(`parent SSE attempting subscription...`)
+    const sseResult = await client.global.event({}).catch((e: any) => {
+      logLine(`parent SSE subscription failed: ${e?.message ?? e}`)
+      return null
+    })
+    logLine(`parent SSE result: ${sseResult ? "ok" : "null"}, stream: ${sseResult?.stream ? "yes" : "no"}`)
+    if (sseResult?.stream) {
+      logLine(`parent SSE subscribed`)
+      ;(async () => {
+        try {
+          for await (const event of sseResult.stream) {
+            logLine(`parent SSE event: ${JSON.stringify(event).slice(0,100)}`)
+            wd.onEvent(event as any)
+          }
+        } catch (e: any) {
+          logLine(`parent SSE reader error: ${e?.message ?? e}`)
+        }
+      })()
+    }
   }
 
   return hooks
