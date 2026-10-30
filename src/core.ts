@@ -2,7 +2,7 @@ import type { Plugin, PluginInput, Hooks } from "@opencode-ai/plugin"
 import type { OpencodeClient } from "@opencode-ai/sdk"
 import { tool } from "@opencode-ai/plugin"
 import { z } from "zod"
-import { readFileSync, statSync, writeFileSync } from "fs"
+import { readFileSync, statSync, writeFileSync, appendFileSync, mkdirSync } from "fs"
 import { join, resolve, isAbsolute } from "path"
 import { pathToFileURL } from "url"
 import { homedir } from "os"
@@ -946,8 +946,21 @@ function setupFetchInterceptor(directory: string): void {
 
 // ── Parent watchdog ─────────────────────────────────────────────────────────
 
+const LOG_FILE = join(homedir(), ".local", "share", "opencode", "log", "fallback.log")
+
 function logLine(msg: string): void {
-  console.error(`[subagent-fallback] ${msg}`)
+  const line = `${new Date().toISOString()} [subagent-fallback] ${msg}\n`
+  try {
+    appendFileSync(LOG_FILE, line, "utf8")
+  } catch {
+    try {
+      mkdirSync(join(homedir(), ".local", "share", "opencode", "log"), { recursive: true })
+      appendFileSync(LOG_FILE, line, "utf8")
+    } catch {}
+  }
+  if (process.env.OPENCODE_FALLBACK_CONSOLE === "1") {
+    console.error(`[subagent-fallback] ${msg}`)
+  }
 }
 
 interface TurnState {
@@ -1088,8 +1101,6 @@ function setupParentWatchdog(client: any, directory: string): {
 
   const onEvent = async (ev: any) => {
     const type = ev?.type
-    // DEBUG: log all event types received
-    if (type) logLine(`parent DEBUG: event type=${type}`)
     if (type === "session.status") {
       const sid: string | undefined = ev?.properties?.sessionID
       const status = ev?.properties?.status
@@ -1110,9 +1121,6 @@ function setupParentWatchdog(client: any, directory: string): {
       const part = ev?.properties?.part
       const sid: string | undefined = part?.sessionID
       if (sid) stampAlive(sid)
-
-      // DEBUG: log ALL events to understand what's emitted
-      logLine(`parent ${sid}: EVENT message.part.updated part.type=${part?.type} part.sessionID=${part?.sessionID} part.error=${part?.error ? "YES" : "no"}`)
 
       // Detect streaming errors (rate limits, etc.) via RetryPart
       if (part?.type === "retry" && part?.error && ROOT.parentWatchdog.enabled) {
@@ -1174,7 +1182,6 @@ function setupParentWatchdog(client: any, directory: string): {
       const info = ev?.properties?.info
       const sid: string | undefined = info?.sessionID
       if (sid) stampAlive(sid)
-      logLine(`parent ${sid}: EVENT message.updated role=${info?.role} error=${info?.error ? "YES" : "no"}`)
 
       // Update used tokens for context-size filtering in nextHealthy.
       const used: number | undefined = info?.tokens?.input
@@ -1591,7 +1598,6 @@ const plugin: Plugin = async (input: PluginInput) => {
     // The watchdog's superset handler already stamps liveness first.
     hooks.event = async (input: any) => {
       const event = input?.event ?? input
-      logLine(`parent HOOK event type=${event?.type}`)
       await wd.onEvent(event as any)
     }
     hooks["chat.message"] = async (input, output) => wd.onChatMessage(input, output)
