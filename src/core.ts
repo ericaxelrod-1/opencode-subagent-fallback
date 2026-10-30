@@ -2,7 +2,7 @@ import type { Plugin, PluginInput, Hooks } from "@opencode-ai/plugin"
 import type { OpencodeClient } from "@opencode-ai/sdk"
 import { tool } from "@opencode-ai/plugin"
 import { z } from "zod"
-import { readFileSync, statSync } from "fs"
+import { readFileSync, statSync, writeFileSync } from "fs"
 import { join, resolve, isAbsolute } from "path"
 import { pathToFileURL } from "url"
 import { homedir } from "os"
@@ -313,9 +313,39 @@ function configDir(directory: string): string {
   return join(homedir(), ".config", "opencode")
 }
 
+let currentConfigDir = ""
+
+function loadState(dir: string): void {
+  try {
+    const file = join(dir, "fallback-state.json")
+    const raw = JSON.parse(readFileSync(file, "utf8"))
+    const t = now()
+    if (raw.blockedUntil && typeof raw.blockedUntil === "object") {
+      for (const [m, until] of Object.entries<any>(raw.blockedUntil)) {
+        if (typeof until === "number" && until > t) blockedUntil.set(m, until)
+      }
+    }
+  } catch {}
+}
+
+function saveState(): void {
+  if (!currentConfigDir) return
+  try {
+    const file = join(currentConfigDir, "fallback-state.json")
+    const t = now()
+    const activeBlocks: Record<string, number> = {}
+    for (const [m, until] of blockedUntil.entries()) {
+      if (until > t) activeBlocks[m] = until
+    }
+    writeFileSync(file, JSON.stringify({ blockedUntil: activeBlocks, savedAt: t }, null, 2), "utf8")
+  } catch {}
+}
+
 function loadRoot(directory: string): RootConfig {
   const cfg = DEFAULTS()
   const dir = configDir(directory)
+  currentConfigDir = dir
+  loadState(dir)
   try {
     const raw = JSON.parse(readFileSync(join(dir, "fallback.json"), "utf8"))
     if (typeof raw.fallbackBudgetMs === "number") cfg.budgetMs = raw.fallbackBudgetMs
@@ -646,6 +676,7 @@ export async function walkChain(input: WalkInput): Promise<WalkOutcome> {
 
           if (c.retryAfterMs !== undefined && c.retryAfterMs > QUOTA_THRESHOLD_MS) {
             blockedUntil.set(model, now() + c.retryAfterMs)
+            saveState()
             if (soonestResetMs === undefined || now() + c.retryAfterMs < soonestResetMs) soonestResetMs = now() + c.retryAfterMs
             log(`${model}: quota reset ~${Math.round(c.retryAfterMs / 1000)}s — advancing`)
             break
@@ -664,6 +695,7 @@ export async function walkChain(input: WalkInput): Promise<WalkOutcome> {
         if (c.cls === "quota") {
           const reset = c.retryAfterMs ?? QUOTA_THRESHOLD_MS
           blockedUntil.set(model, now() + reset)
+          saveState()
           if (soonestResetMs === undefined || now() + reset < soonestResetMs) soonestResetMs = now() + reset
           log(`${model}: quota — fast skip, reset ~${Math.round(reset / 1000)}s`)
           await sleep(pcfg.skipDelayMs)
@@ -749,10 +781,111 @@ function resolvePromptParts(template: string, worktree: string): ResolvedPart[] 
   return parts
 }
 
+// ── In-stream fetch interceptor (transparent fallback for opencode run) ──
+
+function setupFetchInterceptor(directory: string): void {
+  const origFetch = globalThis.fetch
+  if (!origFetch || (origFetch as any).__opencode_fallback_installed) return
+
+  const interceptedFetch: typeof globalThis.fetch = async (input, init) => {
+    const isPost =
+      init?.method?.toUpperCase() === "POST" ||
+      (typeof input === "object" && input !== null && "method" in input && (input as any).method?.toUpperCase() === "POST")
+
+    if (!isPost || !init?.body || typeof init.body !== "string") {
+      return origFetch(input, init)
+    }
+
+    let parsed: any
+    try {
+      parsed = JSON.parse(init.body)
+    } catch {
+      return origFetch(input, init)
+    }
+
+    if (!parsed || typeof parsed.model !== "string" || (!Array.isArray(parsed.messages) && !Array.isArray(parsed.prompt))) {
+      return origFetch(input, init)
+    }
+
+    const requestedModel: string = parsed.model
+    const response = await origFetch(input, init)
+    if (response.ok) return response
+
+    const status = response.status
+    if (status === 429 || status >= 500) {
+      const fb = loadFallback(directory)
+      let candidateChain: string[] = []
+      for (const agentFb of Object.values(fb.agents ?? {})) {
+        const chain = (agentFb?.fallback ?? []).map((e) => (typeof e === "string" ? e : e.model))
+        if (chain.some((m) => m === requestedModel || m.endsWith(`/${requestedModel}`))) {
+          candidateChain = chain
+          break
+        }
+      }
+      if (candidateChain.length === 0 && fb.defaultFallback) {
+        candidateChain = fb.defaultFallback
+      }
+
+      if (candidateChain.length > 0) {
+        const b = breakerFor(requestedModel)
+        b.recordFailure()
+        saveState()
+        logLine(`fetch interceptor: ${requestedModel} returned HTTP ${status} — attempting in-stream fallback`)
+
+        for (const candidate of candidateChain) {
+          const [, modelOnly] = splitModel(candidate)
+          if (modelOnly === requestedModel || candidate === requestedModel) continue
+          const candidateBreaker = breakerFor(candidate)
+          const bt = blockedUntil.get(candidate)
+          if (candidateBreaker.isOpen || (bt !== undefined && bt > now())) continue
+
+          const useFull = requestedModel.includes("/")
+          parsed.model = useFull ? candidate : modelOnly
+          logLine(`fetch interceptor: falling back ${requestedModel} -> ${parsed.model} (in-stream)`)
+
+          const newInit = { ...init, body: JSON.stringify(parsed) }
+          try {
+            const fallbackResponse = await origFetch(input, newInit)
+            if (fallbackResponse.ok) {
+              logLine(`fetch interceptor: in-stream fallback to ${parsed.model} succeeded (HTTP ${fallbackResponse.status})`)
+              candidateBreaker.recordSuccess()
+              saveState()
+              return fallbackResponse
+            }
+            logLine(`fetch interceptor: ${parsed.model} also failed with HTTP ${fallbackResponse.status}`)
+            candidateBreaker.recordFailure()
+            saveState()
+          } catch (e: any) {
+            logLine(`fetch interceptor: network error on ${parsed.model}: ${e?.message ?? e}`)
+          }
+        }
+      }
+    }
+
+    return response
+  }
+
+  ;(interceptedFetch as any).__opencode_fallback_installed = true
+  globalThis.fetch = interceptedFetch
+}
+
 // ── Parent watchdog ─────────────────────────────────────────────────────────
 
 function logLine(msg: string): void {
   console.error(`[subagent-fallback] ${msg}`)
+}
+
+interface TurnState {
+  chain: string[]
+  parts: any[]
+  agent: string
+  rePrompts: number
+  usedTokens: number
+  partialResponse: string
+  responseStarted: boolean
+  responseStartTime: number
+  lastTokenAt: number
+  triedModels: Set<string>
 }
 
 function setupParentWatchdog(client: any, directory: string): {
@@ -762,23 +895,14 @@ function setupParentWatchdog(client: any, directory: string): {
   // Re-prompt bookkeeping. After an abort we re-issue the captured user parts
   // on the next healthy model. A re-prompt duplicates the user turn in the
   // transcript — accepted; a frozen user turn is worse.
-const turns = new Map<string, { 
-    chain: string[]; 
-    parts: any[]; 
-    agent: string; 
-    rePrompts: number; 
-    usedTokens: number;
-    partialResponse: string;
-    responseStarted: boolean;
-    responseStartTime: number;
-    lastTokenAt: number;
-  }>()
+  const turns = new Map<string, TurnState>()
 
-  // First healthy model in the chain that isn't the one that just stalled.
-  const nextHealthy = (chain: string[], exclude: string, est?: number): string | undefined => {
+  // First healthy model in the chain that isn't excluded or on cooldown.
+  const nextHealthy = (chain: string[], exclude: string | Set<string>, est?: number): string | undefined => {
     const t = now()
     return chain.find((m) => {
-      if (m === exclude) return false
+      const isExcluded = typeof exclude === "string" ? m === exclude : exclude.has(m)
+      if (isExcluded) return false
       const b = breakerFor(m)
       const bt = blockedUntil.get(m)
       if (b.isOpen || (bt !== undefined && bt > t)) return false
@@ -800,7 +924,8 @@ const turns = new Map<string, {
       return
     }
     const stalled = anchorFor(sid) ?? st.chain[0]
-    const next = nextHealthy(st.chain, stalled, st.usedTokens || undefined)
+    st.triedModels.add(stalled)
+    const next = nextHealthy(st.chain, st.triedModels, st.usedTokens || undefined)
     // If no model can hold the conversation (all too small), compact first
     // using the large-context models, then retry.
     if (!next && st.usedTokens > 0) {
@@ -839,7 +964,7 @@ const turns = new Map<string, {
         logLine(`parent ${sid}: compaction exception: ${e?.message ?? e}`)
       }
     }
-    const nextAfterCompact = next ?? nextHealthy(st.chain, stalled, st.usedTokens || undefined)
+    const nextAfterCompact = next ?? nextHealthy(st.chain, st.triedModels, st.usedTokens || undefined)
     // If parts are empty (chat.message didn't capture them), try fetching
     // from the session before giving up.
     if (st.parts.length === 0) {
@@ -860,6 +985,8 @@ const turns = new Map<string, {
     }
     st.rePrompts += 1
     logLine(`parent ${sid}: re-prompting on ${nextAfterCompact} (attempt ${st.rePrompts})`)
+    setAnchor(sid, nextAfterCompact)
+    st.triedModels.add(nextAfterCompact)
     const [providerID, modelID] = splitModel(nextAfterCompact)
     const pcfg = providerCfg(nextAfterCompact)
     const entry = liveness.get(sid)
@@ -888,6 +1015,20 @@ const turns = new Map<string, {
     const type = ev?.type
     // DEBUG: log all event types received
     if (type) logLine(`parent DEBUG: event type=${type}`)
+    if (type === "session.status") {
+      const sid: string | undefined = ev?.properties?.sessionID
+      const status = ev?.properties?.status
+      if (sid && status?.type === "retry") {
+        logLine(`parent ${sid}: session.status retry attempt=${status.attempt} message=${status.message}`)
+        const stalled = anchorFor(sid) ?? turns.get(sid)?.chain?.[0]
+        if (stalled) {
+          breakerFor(stalled).recordFailure()
+          saveState()
+        }
+      }
+      return
+    }
+
     // Liveness stamping is unconditional: child attempts register for the sweep
     // even when the parent watchdog is off, and they need these events.
     if (type === "message.part.updated") {
@@ -939,12 +1080,15 @@ const turns = new Map<string, {
               const agentFb = fb.agents?.[agent]
               const chain: string[] = [currentModel]
               for (const e of agentFb?.fallback ?? fb.defaultFallback ?? []) chain.push(typeof e === "string" ? e : e.model)
-              turns.set(sid!, { chain: [...new Set(chain)], parts, agent, rePrompts: 0, usedTokens, partialResponse: "", responseStarted: false, responseStartTime: 0, lastTokenAt: 0 })
+              turns.set(sid!, { chain: [...new Set(chain)], parts, agent, rePrompts: 0, usedTokens, partialResponse: "", responseStarted: false, responseStartTime: 0, lastTokenAt: 0, triedModels: new Set([currentModel]) })
               logLine(`parent ${sid}: built chain on-the-fly from stream error (agent=${agent}, model=${currentModel}, parts=${parts.length}, usedTokens=${usedTokens})`)
             }
           }
           const failed = anchorFor(sid!) ?? turns.get(sid!)?.chain?.[0]
-          if (failed) breakerFor(failed).recordFailure()
+          if (failed) {
+            breakerFor(failed).recordFailure()
+            saveState()
+          }
           void reprompt(sid!)
         }
       }
@@ -959,9 +1103,9 @@ const turns = new Map<string, {
 
       // Update used tokens for context-size filtering in nextHealthy.
       const used: number | undefined = info?.tokens?.input
-      if (sid && used !== undefined) {
+      if (sid && used !== undefined && used > 0) {
         const st = turns.get(sid)
-        if (st) st.usedTokens = (st.usedTokens || 0) + used
+        if (st) st.usedTokens = used
       }
 
       // Error detection: if the assistant message has an error, trigger
@@ -1009,12 +1153,15 @@ const turns = new Map<string, {
               const agentFb = fb.agents?.[agent]
               const chain: string[] = [currentModel]
               for (const e of agentFb?.fallback ?? fb.defaultFallback ?? []) chain.push(typeof e === "string" ? e : e.model)
-              turns.set(sid!, { chain: [...new Set(chain)], parts, agent, rePrompts: 0, usedTokens, partialResponse: "", responseStarted: false, responseStartTime: 0, lastTokenAt: 0 })
+              turns.set(sid!, { chain: [...new Set(chain)], parts, agent, rePrompts: 0, usedTokens, partialResponse: "", responseStarted: false, responseStartTime: 0, lastTokenAt: 0, triedModels: new Set([currentModel]) })
               logLine(`parent ${sid}: built chain on-the-fly from message.updated (agent=${agent}, model=${currentModel}, parts=${parts.length}, usedTokens=${usedTokens})`)
             }
           }
           const failed = anchorFor(sid!) ?? turns.get(sid!)?.chain?.[0]
-          if (failed) breakerFor(failed).recordFailure()
+          if (failed) {
+            breakerFor(failed).recordFailure()
+            saveState()
+          }
           void reprompt(sid!)
         }
         return
@@ -1090,22 +1237,22 @@ const turns = new Map<string, {
         const agentFb = fb.agents?.[agent]
         const chain: string[] = [currentModel]
         for (const e of agentFb?.fallback ?? fb.defaultFallback ?? []) chain.push(typeof e === "string" ? e : e.model)
-        turns.set(sid, { chain: [...new Set(chain)], parts, agent, rePrompts: 0, usedTokens, partialResponse: "", responseStarted: false, responseStartTime: 0, lastTokenAt: 0 })
+        turns.set(sid, { chain: [...new Set(chain)], parts, agent, rePrompts: 0, usedTokens, partialResponse: "", responseStarted: false, responseStartTime: 0, lastTokenAt: 0, triedModels: new Set([currentModel]) })
         logLine(`parent ${sid}: built chain on-the-fly (agent=${agent}, model=${currentModel}, parts=${parts.length}, usedTokens=${usedTokens})`)
       }
       logLine(`parent ${sid}: ${c.cls}${c.detail ? ` (${c.detail})` : ""}`)
-      const failed = anchorFor(sid)
+      const failed = anchorFor(sid) ?? turns.get(sid)?.chain?.[0]
       if (failed && (c.cls === "quota" || c.cls === "transient" || c.cls === "provider_level") && !c.ours) {
         breakerFor(failed).recordFailure()
+        saveState()
         // Re-prompt on the next healthy model in the chain, same as onStall.
         void reprompt(sid)
       }
     }
   }
 
-const onChatMessage = async (input: any, output: any) => {
+  const onChatMessage = async (input: any, output: any) => {
     const sid: string | undefined = input?.sessionID
-    // Only explicit user choice (input.agent) updates the agent; inferred agent from model is ignored
     const explicitAgent = input?.agent
     const current = output?.message?.model
     if (!sid || !current?.providerID || !current?.modelID) return
@@ -1113,37 +1260,55 @@ const onChatMessage = async (input: any, output: any) => {
 
     // Get or create turn state, tracking the effective agent for fallback
     let st = turns.get(sid)
+    const effectiveAgent = explicitAgent ?? st?.agent ?? "developer"
+    const fb = loadFallback(directory)
+    const agentFb = fb.agents?.[effectiveAgent]
+    const chainRaw: string[] = [currentModel]
+    for (const e of agentFb?.fallback ?? fb.defaultFallback ?? []) chainRaw.push(typeof e === "string" ? e : e.model)
+    const chain = [...new Set(chainRaw)]
+
     if (!st) {
-      // First message: initialize with explicit agent or default
-      const fb = loadFallback(directory)
-      const initialAgent = input?.agent ?? "developer"
-      const agentFb = fb.agents?.[initialAgent]
-      const chain: string[] = [currentModel]
-      for (const e of agentFb?.fallback ?? fb.defaultFallback ?? []) chain.push(typeof e === "string" ? e : e.model)
-      turns.set(sid, { chain: [...new Set(chain)], parts: output?.parts ?? [], agent: input?.agent ?? "developer", rePrompts: 0, usedTokens: 0, partialResponse: "", responseStarted: false, responseStartTime: 0, lastTokenAt: 0 })
+      turns.set(sid, {
+        chain,
+        parts: output?.parts ?? [],
+        agent: effectiveAgent,
+        rePrompts: 0,
+        usedTokens: 0,
+        partialResponse: "",
+        responseStarted: false,
+        responseStartTime: 0,
+        lastTokenAt: 0,
+        triedModels: new Set([currentModel]),
+      })
       st = turns.get(sid)!
     } else {
-      // Update chain with current model, but KEEP the agent for fallback (only explicitAgent updates it)
-      const fb = loadFallback(directory)
-      const effectiveAgent = input?.agent ?? st.agent ?? "developer"
-      const agentFb = fb.agents?.[input?.agent ?? st.agent ?? "developer"]
-      const chain: string[] = [currentModel]
-      for (const e of agentFb?.fallback ?? fb.defaultFallback ?? []) chain.push(typeof e === "string" ? e : e.model)
-      st.chain = [...new Set(chain)]
+      st.chain = chain
       st.parts = output?.parts ?? []
-// Only update agent if user explicitly changed it
-      if (input?.agent) st.agent = input.agent
+      if (explicitAgent) st.agent = explicitAgent
+      st.triedModels.clear()
+      st.triedModels.add(currentModel)
     }
 
-    const fb = loadFallback(directory)
-    const effectiveAgent = input?.agent ?? st.agent ?? "developer"
-    const agentFb = fb.agents?.[effectiveAgent]
-    const chain: string[] = [currentModel]
-    for (const e of agentFb?.fallback ?? fb.defaultFallback ?? []) chain.push(typeof e === "string" ? e : e.model)
-    st.chain = [...new Set(chain)]
-    st.parts = output?.parts ?? []
+    setAnchor(sid, currentModel)
 
-    const pcfg = providerCfg(currentModel)
+    // Pre-turn proactive model override:
+    // If currentModel is already broken (breaker open or quota blocked),
+    // proactively rewrite output.message.model to the first healthy model in the chain.
+    const b = breakerFor(currentModel)
+    const bt = blockedUntil.get(currentModel)
+    if (b.isOpen || (bt !== undefined && bt > now())) {
+      const healthy = nextHealthy(st.chain, currentModel, st.usedTokens || undefined)
+      if (healthy) {
+        const [pID, mID] = splitModel(healthy)
+        output.message.model = { providerID: pID, modelID: mID }
+        setAnchor(sid, healthy)
+        st.triedModels.add(healthy)
+        logLine(`parent ${sid}: proactively switched starting model from ${currentModel} to ${healthy}`)
+      }
+    }
+
+    const effectiveModel = `${output.message.model.providerID}/${output.message.model.modelID}`
+    const pcfg = providerCfg(effectiveModel)
     registerLiveness(sid, {
       startedAt: now(),
       lastPartAt: now(),
@@ -1328,37 +1493,17 @@ const plugin: Plugin = async (input: PluginInput) => {
   // Liveness needs events whether or not the parent watchdog is on.
   // hooks.event disabled for test
 
+  setupFetchInterceptor(directory)
+
   if (ROOT.parentWatchdog.enabled) {
     const wd = setupParentWatchdog(client, directory)
     // The watchdog's superset handler already stamps liveness first.
     hooks.event = async (input: any) => {
       const event = input?.event ?? input
       logLine(`parent HOOK event type=${event?.type}`)
-      wd.onEvent(event as any)
+      await wd.onEvent(event as any)
     }
     hooks["chat.message"] = async (input, output) => wd.onChatMessage(input, output)
-
-    // Also subscribe to global SSE event stream to catch stream errors
-    // that don't go through the plugin hook.
-    logLine(`parent SSE attempting subscription...`)
-    const sseResult = await client.global.event({}).catch((e: any) => {
-      logLine(`parent SSE subscription failed: ${e?.message ?? e}`)
-      return null
-    })
-    logLine(`parent SSE result: ${sseResult ? "ok" : "null"}, stream: ${sseResult?.stream ? "yes" : "no"}`)
-    if (sseResult?.stream) {
-      logLine(`parent SSE subscribed`)
-      ;(async () => {
-        try {
-          for await (const event of sseResult.stream) {
-            logLine(`parent SSE event: ${JSON.stringify(event).slice(0,100)}`)
-            wd.onEvent(event as any)
-          }
-        } catch (e: any) {
-          logLine(`parent SSE reader error: ${e?.message ?? e}`)
-        }
-      })()
-    }
   }
 
   return hooks

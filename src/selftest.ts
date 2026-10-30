@@ -167,7 +167,7 @@ async function main() {
 
   // 10. Sticky window: a transient model is NOT retried forever.
   __resetStateForTests()
-  __setRootForTests(root({ providers: { p: provider({ retryDelayMs: 1, stickyMs: 30 }) } }))
+  __setRootForTests(root({ budgetMs: 300, providers: { p: provider({ retryDelayMs: 1, stickyMs: 30 }), q: provider({ retryDelayMs: 1, stickyMs: 30 }) } }))
   __resetStateForTests()
   calls = []
   o = await walkChain({ chain: [P, Q], attempt: async (m) => { calls.push(m); return fail(err({ statusCode: 429 })) } })
@@ -195,6 +195,14 @@ async function main() {
   __setRootForTests(root({ providers: { p: provider(), q: provider() } }))
   o = await walkChain({ chain: [P, Q], attempt: async (m) => { calls.push(m); return (m === P ? fail(err({ statusCode: 500 })) : ok()) } })
   check("trail records the failed hop", o.trail.length === 2 && o.trail[0].cls === "provider_level" && o.trail[1].cls === "ok", JSON.stringify(o.trail.map((x) => x.cls)))
+
+  // 13. Quota block skips model on subsequent walk.
+  __resetStateForTests()
+  __setRootForTests(root({ providers: { p: provider(), q: provider() } }))
+  await walkChain({ chain: [P, Q], attempt: async (m) => { return m === P ? fail(err({ statusCode: 429, responseHeaders: { "retry-after": "7200" } })) : ok() } })
+  calls = []
+  o = await walkChain({ chain: [P, Q], attempt: async (m) => { calls.push(m); return ok() } })
+  check("quota-blocked model skipped on next walk", o.ok && o.model === Q && calls.length === 1 && calls[0] === Q, JSON.stringify(calls))
 
   console.log("\nselftest result:")
   if (failures === 0) {
