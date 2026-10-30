@@ -1101,6 +1101,10 @@ function logLine(msg: string): void {
   }
 }
 
+function sanitizeParts(parts: any[]): any[] {
+  return (parts || []).filter((p: any) => p && (p.type === "text" || p.type === "file" || p.type === "agent" || p.type === "subtask"))
+}
+
 interface TurnState {
   chain: string[]
   parts: any[]
@@ -1203,7 +1207,7 @@ function setupParentWatchdog(client: any, directory: string): {
         const userMsgs = (msgs?.data ?? []).filter((m: any) => m?.info?.role === "user")
         const lastUserMsg = userMsgs[userMsgs.length - 1]
         if (lastUserMsg?.parts?.length) {
-          st.parts = lastUserMsg.parts
+          st.parts = sanitizeParts(lastUserMsg.parts)
           logLine(`parent ${sid}: recovered ${st.parts.length} parts from session messages`)
         }
       } catch {}
@@ -1291,7 +1295,7 @@ function setupParentWatchdog(client: any, directory: string): {
               }
               const userMsgs = allMsgs.filter((m: any) => m?.info?.role === "user")
               const lastUserMsg = userMsgs[userMsgs.length - 1]
-              if (lastUserMsg?.parts?.length) parts = lastUserMsg.parts
+              if (lastUserMsg?.parts?.length) parts = sanitizeParts(lastUserMsg.parts)
             } catch {}
             if (!currentModel) {
               try {
@@ -1363,7 +1367,7 @@ function setupParentWatchdog(client: any, directory: string): {
               }
               const userMsgs = allMsgs.filter((m: any) => m?.info?.role === "user")
               const lastUserMsg = userMsgs[userMsgs.length - 1]
-              if (lastUserMsg?.parts?.length) parts = lastUserMsg.parts
+              if (lastUserMsg?.parts?.length) parts = sanitizeParts(lastUserMsg.parts)
             } catch {}
             if (!currentModel) {
               try {
@@ -1443,7 +1447,7 @@ function setupParentWatchdog(client: any, directory: string): {
           }
           const userMsgs = allMsgs.filter((m: any) => m?.info?.role === "user")
           const lastUserMsg = userMsgs[userMsgs.length - 1]
-          if (lastUserMsg?.parts?.length) parts = lastUserMsg.parts
+          if (lastUserMsg?.parts?.length) parts = sanitizeParts(lastUserMsg.parts)
         } catch {}
         if (!currentModel) {
           // Last resort: use the agent's configured model from opencode config.
@@ -1512,7 +1516,7 @@ function setupParentWatchdog(client: any, directory: string): {
     if (!st) {
       turns.set(sid, {
         chain,
-        parts: output?.parts ?? [],
+        parts: sanitizeParts(output?.parts),
         agent: effectiveAgent,
         rePrompts: 0,
         usedTokens: 0,
@@ -1525,7 +1529,7 @@ function setupParentWatchdog(client: any, directory: string): {
       st = turns.get(sid)!
     } else {
       st.chain = chain
-      st.parts = output?.parts ?? []
+      st.parts = sanitizeParts(output?.parts)
       if (explicitAgent && !isCompaction) st.agent = explicitAgent
       st.triedModels.clear()
       st.triedModels.add(currentModel)
