@@ -1014,22 +1014,22 @@ function setupParentWatchdog(client: any, directory: string): {
     const stalled = anchorFor(sid) ?? st.chain[0]
     st.triedModels.add(stalled)
     const next = nextHealthy(st.chain, st.triedModels, st.usedTokens || undefined)
-    // If no model can hold the conversation (all too small), compact first
-    // using the large-context models, then retry.
-    if (!next && st.usedTokens > 0) {
+    // If no model can hold the conversation (all too small) or context overflow occurred,
+    // compact first using the agent's largeContextFallback chain, then retry.
+    if (!next) {
       const fb = loadFallback(directory)
       const agentFb = fb.agents?.[st.agent]
       const largeChainRaw: string[] = []
-      const compactAnchor = agentFb?.largeContextModel ?? stalled
+      const compactAnchor = agentFb?.largeContextModel ?? fb.defaultLargeContextModel ?? stalled
       if (compactAnchor) largeChainRaw.push(compactAnchor)
-      for (const e of agentFb?.largeContextFallback ?? fb.defaultFallback ?? []) largeChainRaw.push(typeof e === "string" ? e : e.model)
+      for (const e of agentFb?.largeContextFallback ?? fb.defaultLargeContextFallback ?? fb.defaultFallback ?? []) largeChainRaw.push(typeof e === "string" ? e : e.model)
       const largeChain = [...new Set(largeChainRaw)]
-      logLine(`parent ${sid}: no model holds ~${st.usedTokens} tokens — compacting via large chain`)
+      logLine(`parent ${sid}: compacting via ${st.agent} large context fallback chain (${largeChain.join(" -> ")})`)
       try {
         const result = await walkChain({
           chain: largeChain,
           sessionKey: sid,
-          estimateTokens: st.usedTokens,
+          estimateTokens: st.usedTokens > 0 ? st.usedTokens : undefined,
           log: logLine,
           attempt: async (m) => {
             const [providerID, modelID] = splitModel(m)
@@ -1043,7 +1043,7 @@ function setupParentWatchdog(client: any, directory: string): {
         })
         if (result.ok) {
           logLine(`parent ${sid}: compaction completed on ${result.model} — retrying`)
-          st.usedTokens = Math.round(st.usedTokens * ROOT.compactionRatio)
+          if (st.usedTokens > 0) st.usedTokens = Math.round(st.usedTokens * ROOT.compactionRatio)
           // Re-check nextHealthy after compaction
         } else {
           logLine(`parent ${sid}: compaction failed: ${result.reason}`)
@@ -1324,11 +1324,17 @@ function setupParentWatchdog(client: any, directory: string): {
       }
       logLine(`parent ${sid}: ${c.cls}${c.detail ? ` (${c.detail})` : ""}`)
       const failed = anchorFor(sid) ?? turns.get(sid)?.chain?.[0]
-      if (failed && (c.cls === "quota" || c.cls === "transient" || c.cls === "provider_level") && !c.ours) {
-        breakerFor(failed).recordFailure()
-        saveState()
-        // Re-prompt on the next healthy model in the chain, same as onStall.
-        void reprompt(sid)
+      if (failed && !c.ours) {
+        if (c.cls === "quota" || c.cls === "transient" || c.cls === "provider_level") {
+          breakerFor(failed).recordFailure()
+          saveState()
+          // Re-prompt on the next healthy model in the chain, same as onStall.
+          void reprompt(sid)
+        } else if (c.cls === "context_too_large") {
+          // Context overflow: force compaction via largeContextFallback or re-prompt on next healthy large model
+          logLine(`parent ${sid}: context overflow detected in session.error — triggering compaction/reprompt`)
+          void reprompt(sid)
+        }
       }
     }
   }
