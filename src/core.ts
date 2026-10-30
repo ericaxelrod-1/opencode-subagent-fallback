@@ -1006,9 +1006,15 @@ function setupFetchInterceptor(directory: string): void {
 
         const incomingUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : (input as Request).url
         const incomingProvider = detectIncomingProvider(requestedModel, incomingUrl, directory)
+        const deadline = now() + (ROOT.budgetMs || 600000)
+        const maxPasses = ROOT.maxIterations || 10
 
-        for (let pass = 0; pass < 2; pass++) {
+        for (let pass = 0; pass < maxPasses; pass++) {
+          if (now() >= deadline) break
+          let attemptedInPass = 0
+
           for (const candidate of candidateChain) {
+            if (now() >= deadline) break
             const [candProvider, modelOnly] = splitModel(candidate)
             // On pass 0, skip requestedModel because it just failed
             if (pass === 0 && (modelOnly === requestedModel || candidate === requestedModel)) continue
@@ -1031,6 +1037,7 @@ function setupFetchInterceptor(directory: string): void {
               targetHeaders = buildHeaders(init.headers, pInfo.apiKey, targetProvider === "openrouter")
             }
 
+            attemptedInPass++
             parsed.model = modelOnly
             logLine(`fetch interceptor (pass ${pass + 1}): falling back ${requestedModel} -> ${candidate} (${targetUrl})`)
 
@@ -1056,19 +1063,28 @@ function setupFetchInterceptor(directory: string): void {
             }
           }
 
-          // If all candidates in chain failed on pass 0 due to rate limits, wait for cooldown if within 20s
-          if (pass === 0 && !isContextOverflow) {
+          if (pass < maxPasses - 1) {
             let soonestCooldown = Infinity
             for (const candidate of candidateChain) {
               const cb = breakerFor(candidate)
               if (cb.isOpen && cb.openUntil < soonestCooldown) soonestCooldown = cb.openUntil
+              const bt = blockedUntil.get(candidate)
+              if (bt !== undefined && bt > now() && bt < soonestCooldown) soonestCooldown = bt
             }
-            if (soonestCooldown !== Infinity && soonestCooldown > now() && soonestCooldown - now() <= 20000) {
-              const wait = soonestCooldown - now() + 100
-              logLine(`fetch interceptor: chain exhausted on pass 1 — waiting ${Math.round(wait / 1000)}s for cooldown before pass 2`)
-              await sleep(wait)
+
+            // If all candidates are in cooldown, pause until the soonest cooldown (up to 15s)
+            if (soonestCooldown !== Infinity && soonestCooldown > now()) {
+              const remainingBudget = deadline - now()
+              if (soonestCooldown - now() > remainingBudget) break
+              const waitMs = Math.min(soonestCooldown - now() + 100, 15000)
+              logLine(`fetch interceptor: pass ${pass + 1} exhausted (${attemptedInPass} attempted) — all eligible candidates in cooldown, waiting ${Math.round(waitMs / 1000)}s before pass ${pass + 2}`)
+              await sleep(waitMs)
             } else {
-              break
+              // Candidates failed with transient errors without tripping cooldown: brief backoff (2s) to hammer endpoints again
+              const pcfg = providerCfg(requestedModel)
+              const waitMs = Math.min(pcfg.retryDelayMs || 2000, 5000)
+              logLine(`fetch interceptor: pass ${pass + 1} exhausted (${attemptedInPass} attempted) — retrying chain in ${Math.round(waitMs / 1000)}s (pass ${pass + 2})`)
+              await sleep(waitMs)
             }
           }
         }
