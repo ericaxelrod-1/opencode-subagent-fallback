@@ -950,29 +950,29 @@ function setupFetchInterceptor(directory: string): void {
     if (status === 429 || status >= 500 || isContextOverflow) {
       const fb = loadFallback(directory)
       let matchedAgent: string | undefined
-      for (const [agentName, agentFb] of Object.entries(fb.agents ?? {})) {
-        const fallbacks = (agentFb?.fallback ?? []).map((e) => (typeof e === "string" ? e : e.model))
-        const largeFallbacks = (agentFb?.largeContextFallback ?? []).map((e) => (typeof e === "string" ? e : e.model))
-        if (
-          agentFb?.largeContextModel === requestedModel ||
-          agentFb?.largeContextModel?.endsWith(`/${requestedModel}`) ||
-          fallbacks.some((m) => m === requestedModel || m.endsWith(`/${requestedModel}`)) ||
-          largeFallbacks.some((m) => m === requestedModel || m.endsWith(`/${requestedModel}`))
-        ) {
-          matchedAgent = agentName
-          break
-        }
-      }
-      if (!matchedAgent) {
-        try {
-          const ocConfig = JSON.parse(readFileSync(join(configDir(directory), "opencode.json"), "utf8"))
-          for (const [agentName, aCfg] of Object.entries<any>(ocConfig?.agent ?? {})) {
-            if (aCfg?.model === requestedModel || aCfg?.model?.endsWith(`/${requestedModel}`)) {
-              matchedAgent = agentName
-              break
-            }
+      try {
+        const ocConfig = JSON.parse(readFileSync(join(configDir(directory), "opencode.json"), "utf8"))
+        for (const [agentName, aCfg] of Object.entries<any>(ocConfig?.agent ?? {})) {
+          if (aCfg?.model === requestedModel || aCfg?.model?.endsWith(`/${requestedModel}`)) {
+            matchedAgent = agentName
+            break
           }
-        } catch {}
+        }
+      } catch {}
+      if (!matchedAgent) {
+        for (const [agentName, agentFb] of Object.entries(fb.agents ?? {})) {
+          const fallbacks = (agentFb?.fallback ?? []).map((e) => (typeof e === "string" ? e : e.model))
+          const largeFallbacks = (agentFb?.largeContextFallback ?? []).map((e) => (typeof e === "string" ? e : e.model))
+          if (
+            agentFb?.largeContextModel === requestedModel ||
+            agentFb?.largeContextModel?.endsWith(`/${requestedModel}`) ||
+            fallbacks.some((m) => m === requestedModel || m.endsWith(`/${requestedModel}`)) ||
+            largeFallbacks.some((m) => m === requestedModel || m.endsWith(`/${requestedModel}`))
+          ) {
+            matchedAgent = agentName
+            break
+          }
+        }
       }
       if (!matchedAgent) matchedAgent = "developer"
 
