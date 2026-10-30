@@ -18,20 +18,44 @@ The old plugin walks the chain once and stops, and it does it fast — it can ex
 
 All config lives in `fallback.json`, beside the chains it modulates. The old plugin ignores unknown keys, so both can coexist during migration.
 
-```json
+```jsonc
 {
-  "fallbackBudgetMs": 600000,
-  "maxIterations": 10,
-  "compactionRatio": 0.4,
-  "parentWatchdog": {
+  "budgets": {
+    "fallbackBudgetMs": 600000,
+    "maxIterations": 10,
+    "compactionRatio": 0.5,
+    "charsPerToken": 4,
+    "quotaThresholdMs": 600000,
+    "maxCooldownSleepMs": 30000
+  },
+  "interceptor": {
+    "fastRetryMs": 500,
+    "defaultRateLimitMs": 60000,
+    "maxCooldownSleepMs": 60000
+  },
+  "watchdog": {
     "enabled": true,
     "firstTokenMs": 120000,
-    "stallTimeoutMs": 90000
+    "stallTimeoutMs": 90000,
+    "sweepIntervalMs": 5000,
+    "debounceMs": 5000,
+    "compactionDebounceMs": 120000
+  },
+  "providerDefaults": {
+    "firstTokenMs": 30000,
+    "stallTimeoutMs": 90000,
+    "retryDelayMs": 10000,
+    "skipDelayMs": 0,
+    "stickyMs": 180000,
+    "maxTimeMs": 300000,
+    "timeoutMs": 180000,
+    "breaker": { "threshold": 3, "cooldownMs": 60000, "maxCooldownMs": 600000 }
   },
   "providers": {
     "unorouter-custom": {
+      "rateLimitMs": 60000,
       "firstTokenMs": 120000,
-      "stallTimeoutMs": 90000,
+      "stallTimeoutMs": 300000,
       "retryDelayMs": 20000,
       "skipDelayMs": 0,
       "stickyMs": 180000,
@@ -43,29 +67,49 @@ All config lives in `fallback.json`, beside the chains it modulates. The old plu
 }
 ```
 
-### Root keys
+Comments (`//` and `/* */`) and trailing commas are natively supported in `fallback.json`.
 
+### Categories
+
+#### `budgets`
 | Key | Default | Meaning |
 |---|---|---|
-| `fallbackBudgetMs` | `600000` | Wall-clock ceiling for one walk. |
-| `maxIterations` | `10` | Max full passes over the chain. |
-| `compactionRatio` | `0.4` | Self-compact at this fraction of the model's context window. |
-| `parentWatchdog.enabled` | `false` | Master switch for the parent half. |
-| `parentWatchdog.firstTokenMs` | provider's | Override the parent's first-token clock. |
-| `parentWatchdog.stallTimeoutMs` | provider's | Override the parent's inactivity clock. |
+| `fallbackBudgetMs` | `600000` | Wall-clock ceiling for one walk / fallback sequence. |
+| `maxIterations` | `10` | Max full passes over the candidate chain. |
+| `compactionRatio` | `0.5` | Self-compact at this fraction of the model's context window. |
+| `charsPerToken` | `4` | Character-to-token heuristic ratio for context pre-filtering. |
+| `quotaThresholdMs` | `600000` | Rate limit duration threshold separating quota exhaustion from transient blips. |
+| `maxCooldownSleepMs` | `30000` | Max pause during `walkChain` when all models are on cooldown before next pass. |
 
-### Per-provider keys
+#### `interceptor`
+| Key | Default | Meaning |
+|---|---|---|
+| `fastRetryMs` | `500` | Retry interval for 503 concurrency slot search. |
+| `defaultRateLimitMs` | `60000` | Cooldown on HTTP 429 when no Retry-After is supplied (e.g. UnoRouter free tier). |
+| `maxCooldownSleepMs` | `60000` | Max sleep when all candidates in interceptor chain are in cooldown. |
 
-Provider = the part of `provider/model` before the `/`.
+#### `watchdog`
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Master switch for parent turn stall watchdog. |
+| `firstTokenMs` | `120000` | Maximum wait before the first streaming token arrives. |
+| `stallTimeoutMs` | `90000` | Silence timeout between streaming token chunks. |
+| `sweepIntervalMs` | `5000` | Liveness background sweep interval. |
+| `debounceMs` | `5000` | Error event processing debounce. |
+| `compactionDebounceMs` | `120000` | Minimum interval between self-compactions on the same session. |
+
+#### `providerDefaults` & `providers`
+Provider = the part of `provider/model` before the `/`. Unlisted providers inherit from `providerDefaults`.
 
 | Key | Meaning |
 |---|---|
+| `rateLimitMs` | Optional provider-specific 429 cooldown duration (e.g. `60000` for UnoRouter). |
 | `firstTokenMs` | How long the model may stay silent **before its first token**. Generous for slow-prefill providers. |
-| `stallTimeoutMs` | Inactivity budget **after** the first token arrived. Inter-chunk silence, not total duration — a legitimately long generation is never killed. |
+| `stallTimeoutMs` | Inactivity budget **after** the first token arrived. Inter-chunk silence, not total duration. |
 | `retryDelayMs` | Pause between sticky retries on the same model. |
 | `skipDelayMs` | Pause before advancing to the next model on a hard failure. |
 | `stickyMs` | The window a transient model keeps being preferred before the chain advances. |
-| `maxTimeMs` | Per-pass ceiling on one provider. **Resets each pass** — a provider is never permanently excluded, because router intermittency is normal. |
+| `maxTimeMs` | Per-pass ceiling on one provider. Resets each pass. |
 | `timeoutMs` | Total ceiling for one attempt. |
 | `breaker.threshold` | Consecutive failures before the breaker opens. |
 | `breaker.cooldownMs` | Base cooldown; doubles per re-trip. |

@@ -30,6 +30,47 @@ import { homedir } from "os"
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
+export function stripJsonComments(str: string): string {
+  let inString = false
+  let escaped = false
+  let out = ""
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i]
+    const next = str[i + 1]
+    if (inString) {
+      out += ch
+      if (escaped) {
+        escaped = false
+      } else if (ch === "\\") {
+        escaped = true
+      } else if (ch === '"') {
+        inString = false
+      }
+    } else {
+      if (ch === '"') {
+        inString = true
+        out += ch
+      } else if (ch === "/" && next === "/") {
+        while (i < str.length && str[i] !== "\n") i++
+        out += "\n"
+      } else if (ch === "/" && next === "*") {
+        i += 2
+        while (i < str.length && !(str[i] === "*" && str[i + 1] === "/")) i++
+        i++ // skip closing '/'
+      } else {
+        out += ch
+      }
+    }
+  }
+  return out
+}
+
+export function parseJsonWithComments(str: string): any {
+  const stripped = stripJsonComments(str)
+  const sanitized = stripped.replace(/,\s*([\]}])/g, "$1")
+  return JSON.parse(sanitized)
+}
+
 interface BreakerConfig {
   threshold: number
   cooldownMs: number
@@ -44,14 +85,43 @@ interface ProviderConfig {
   stickyMs: number
   maxTimeMs: number
   timeoutMs: number
+  rateLimitMs?: number
   breaker: BreakerConfig
+}
+
+interface BudgetsConfig {
+  fallbackBudgetMs: number
+  maxIterations: number
+  compactionRatio: number
+  charsPerToken: number
+  quotaThresholdMs: number
+  maxCooldownSleepMs: number
+}
+
+interface InterceptorConfig {
+  fastRetryMs: number
+  defaultRateLimitMs: number
+  maxCooldownSleepMs: number
+}
+
+interface WatchdogConfig {
+  enabled: boolean
+  firstTokenMs?: number
+  stallTimeoutMs?: number
+  sweepIntervalMs?: number
+  debounceMs?: number
+  compactionDebounceMs?: number
 }
 
 interface RootConfig {
   budgetMs: number
   maxIterations: number
   compactionRatio: number
-  parentWatchdog: { enabled: boolean; firstTokenMs?: number; stallTimeoutMs?: number }
+  budgets: BudgetsConfig
+  interceptor: InterceptorConfig
+  watchdog: WatchdogConfig
+  parentWatchdog: WatchdogConfig
+  providerDefaults: ProviderConfig
   providers: Record<string, ProviderConfig>
 }
 
@@ -119,11 +189,86 @@ interface WalkOutcome {
 
 // ── Module state (in-process; nothing survives a restart, by design) ────────
 
+const DEFAULT_PROVIDER: ProviderConfig = {
+  firstTokenMs: 30000,
+  stallTimeoutMs: 90000,
+  retryDelayMs: 10000,
+  skipDelayMs: 0,
+  stickyMs: 180000,
+  maxTimeMs: 300000,
+  timeoutMs: 180000,
+  rateLimitMs: undefined,
+  breaker: { threshold: 3, cooldownMs: 60000, maxCooldownMs: 600000 },
+}
+
+function DEFAULTS(): RootConfig {
+  const budgets: BudgetsConfig = {
+    fallbackBudgetMs: 600000,
+    maxIterations: 10,
+    compactionRatio: 0.5,
+    charsPerToken: 4,
+    quotaThresholdMs: 600000,
+    maxCooldownSleepMs: 30000,
+  }
+  const interceptor: InterceptorConfig = {
+    fastRetryMs: 500,
+    defaultRateLimitMs: 60000,
+    maxCooldownSleepMs: 60000,
+  }
+  const watchdog: WatchdogConfig = {
+    enabled: false,
+    firstTokenMs: 120000,
+    stallTimeoutMs: 90000,
+    sweepIntervalMs: 5000,
+    debounceMs: 5000,
+    compactionDebounceMs: 120000,
+  }
+  return {
+    budgetMs: budgets.fallbackBudgetMs,
+    maxIterations: budgets.maxIterations,
+    compactionRatio: budgets.compactionRatio,
+    budgets,
+    interceptor,
+    watchdog,
+    parentWatchdog: watchdog,
+    providerDefaults: { ...DEFAULT_PROVIDER, breaker: { ...DEFAULT_PROVIDER.breaker } },
+    providers: {},
+  }
+}
+
 let ROOT: RootConfig = { ...DEFAULTS(), providers: {} }
 
 /** Test seam: loadRoot is the production path; the self-test sets ROOT directly. */
 export function __setRootForTests(cfg: Partial<RootConfig>): void {
-  ROOT = { ...DEFAULTS(), providers: ROOT.providers, ...cfg }
+  const d = DEFAULTS()
+  const b: BudgetsConfig = { ...d.budgets, ...(cfg as any).budgets }
+  if (typeof cfg.budgetMs === "number") b.fallbackBudgetMs = cfg.budgetMs
+  if (typeof cfg.maxIterations === "number") b.maxIterations = cfg.maxIterations
+  if (typeof cfg.compactionRatio === "number") b.compactionRatio = cfg.compactionRatio
+
+  const wd: WatchdogConfig = {
+    ...d.watchdog,
+    ...(cfg as any).watchdog,
+    ...(cfg as any).parentWatchdog,
+  }
+  if ((cfg as any).parentWatchdog?.enabled !== undefined) wd.enabled = (cfg as any).parentWatchdog.enabled
+
+  const ic: InterceptorConfig = {
+    ...d.interceptor,
+    ...(cfg as any).interceptor,
+  }
+
+  ROOT = {
+    budgetMs: b.fallbackBudgetMs,
+    maxIterations: b.maxIterations,
+    compactionRatio: b.compactionRatio,
+    budgets: b,
+    interceptor: ic,
+    watchdog: wd,
+    parentWatchdog: wd,
+    providerDefaults: (cfg as any).providerDefaults ?? d.providerDefaults,
+    providers: { ...d.providers, ...cfg.providers },
+  }
 }
 
 /** Test seam: loadModelLimits is the production path (client.config.get). */
@@ -203,6 +348,7 @@ function handleLivenessEvent(ev: any): void {
  * children just get aborted and their attempt classifies it as ours.
  */
 function startLivenessSweep(client: any): void {
+  const interval = ROOT.watchdog?.sweepIntervalMs ?? 5000
   setInterval(() => {
     const t = now()
     for (const [sid, l] of [...liveness]) {
@@ -219,29 +365,9 @@ function startLivenessSweep(client: any): void {
       l.lastPartAt = t
       l.onStall?.(sid)
     }
-  }, 5000)
+  }, interval)
 }
 
-function DEFAULTS(): RootConfig {
-  return {
-    budgetMs: 600000,
-    maxIterations: 10,
-    compactionRatio: 0.4,
-    parentWatchdog: { enabled: false },
-    providers: {},
-  }
-}
-
-const DEFAULT_PROVIDER: ProviderConfig = {
-  firstTokenMs: 30000,
-  stallTimeoutMs: 90000,
-  retryDelayMs: 10000,
-  skipDelayMs: 0,
-  stickyMs: 180000,
-  maxTimeMs: 300000,
-  timeoutMs: 180000,
-  breaker: { threshold: 3, cooldownMs: 60000, maxCooldownMs: 600000 },
-}
 
 // ── Small utilities ─────────────────────────────────────────────────────────
 
@@ -262,7 +388,7 @@ function splitModel(model: string): [string, string] {
 }
 
 function providerCfg(model: string): ProviderConfig {
-  return ROOT.providers[providerOf(model)] ?? DEFAULT_PROVIDER
+  return ROOT.providers[providerOf(model)] ?? ROOT.providerDefaults ?? DEFAULT_PROVIDER
 }
 
 function breakerFor(model: string): Breaker {
@@ -352,19 +478,50 @@ function loadRoot(directory: string): RootConfig {
   currentConfigDir = dir
   loadState(dir)
   try {
-    const raw = JSON.parse(readFileSync(join(dir, "fallback.json"), "utf8"))
-    if (typeof raw.fallbackBudgetMs === "number") cfg.budgetMs = raw.fallbackBudgetMs
-    if (typeof raw.maxIterations === "number") cfg.maxIterations = raw.maxIterations
-    if (typeof raw.compactionRatio === "number") cfg.compactionRatio = raw.compactionRatio
-    if (raw.parentWatchdog && typeof raw.parentWatchdog === "object") {
-      cfg.parentWatchdog = {
-        enabled: raw.parentWatchdog.enabled === true,
-        firstTokenMs: raw.parentWatchdog.firstTokenMs,
-        stallTimeoutMs: raw.parentWatchdog.stallTimeoutMs,
-      }
+    const raw = parseJsonWithComments(readFileSync(join(dir, "fallback.json"), "utf8"))
+
+    // Budgets category
+    const b = raw.budgets ?? {}
+    if (typeof b.fallbackBudgetMs === "number") cfg.budgets.fallbackBudgetMs = b.fallbackBudgetMs
+    else if (typeof raw.fallbackBudgetMs === "number") cfg.budgets.fallbackBudgetMs = raw.fallbackBudgetMs
+    cfg.budgetMs = cfg.budgets.fallbackBudgetMs
+
+    if (typeof b.maxIterations === "number") cfg.budgets.maxIterations = b.maxIterations
+    else if (typeof raw.maxIterations === "number") cfg.budgets.maxIterations = raw.maxIterations
+    cfg.maxIterations = cfg.budgets.maxIterations
+
+    if (typeof b.compactionRatio === "number") cfg.budgets.compactionRatio = b.compactionRatio
+    else if (typeof raw.compactionRatio === "number") cfg.budgets.compactionRatio = raw.compactionRatio
+    cfg.compactionRatio = cfg.budgets.compactionRatio
+
+    if (typeof b.charsPerToken === "number") cfg.budgets.charsPerToken = b.charsPerToken
+    if (typeof b.quotaThresholdMs === "number") cfg.budgets.quotaThresholdMs = b.quotaThresholdMs
+    if (typeof b.maxCooldownSleepMs === "number") cfg.budgets.maxCooldownSleepMs = b.maxCooldownSleepMs
+
+    // Interceptor category
+    const ic = raw.interceptor ?? {}
+    if (typeof ic.fastRetryMs === "number") cfg.interceptor.fastRetryMs = ic.fastRetryMs
+    if (typeof ic.defaultRateLimitMs === "number") cfg.interceptor.defaultRateLimitMs = ic.defaultRateLimitMs
+    if (typeof ic.maxCooldownSleepMs === "number") cfg.interceptor.maxCooldownSleepMs = ic.maxCooldownSleepMs
+
+    // Watchdog category
+    const wd = raw.watchdog ?? raw.parentWatchdog ?? {}
+    if (typeof wd.enabled === "boolean") cfg.watchdog.enabled = wd.enabled
+    if (typeof wd.firstTokenMs === "number") cfg.watchdog.firstTokenMs = wd.firstTokenMs
+    if (typeof wd.stallTimeoutMs === "number") cfg.watchdog.stallTimeoutMs = wd.stallTimeoutMs
+    if (typeof wd.sweepIntervalMs === "number") cfg.watchdog.sweepIntervalMs = wd.sweepIntervalMs
+    if (typeof wd.debounceMs === "number") cfg.watchdog.debounceMs = wd.debounceMs
+    if (typeof wd.compactionDebounceMs === "number") cfg.watchdog.compactionDebounceMs = wd.compactionDebounceMs
+    cfg.parentWatchdog = cfg.watchdog
+
+    // Provider defaults override
+    if (raw.providerDefaults && typeof raw.providerDefaults === "object") {
+      cfg.providerDefaults = mergeProvider(raw.providerDefaults, DEFAULT_PROVIDER)
     }
+
+    // Providers category
     for (const [k, v] of Object.entries<any>(raw.providers ?? {})) {
-      cfg.providers[k] = mergeProvider(v)
+      cfg.providers[k] = mergeProvider(v, cfg.providerDefaults)
     }
   } catch {
     /* no fallback.json: defaults only */
@@ -372,10 +529,10 @@ function loadRoot(directory: string): RootConfig {
   return cfg
 }
 
-function mergeProvider(raw: any): ProviderConfig {
-  const p: ProviderConfig = { ...DEFAULT_PROVIDER, breaker: { ...DEFAULT_PROVIDER.breaker } }
+function mergeProvider(raw: any, base: ProviderConfig = DEFAULT_PROVIDER): ProviderConfig {
+  const p: ProviderConfig = { ...base, breaker: { ...base.breaker } }
   if (!raw || typeof raw !== "object") return p
-  for (const k of ["firstTokenMs", "stallTimeoutMs", "retryDelayMs", "skipDelayMs", "stickyMs", "maxTimeMs", "timeoutMs"] as const) {
+  for (const k of ["firstTokenMs", "stallTimeoutMs", "retryDelayMs", "skipDelayMs", "stickyMs", "maxTimeMs", "timeoutMs", "rateLimitMs"] as const) {
     if (typeof raw[k] === "number" && Number.isFinite(raw[k])) p[k] = raw[k]
   }
   const b = raw.breaker ?? {}
@@ -389,7 +546,12 @@ function loadFallback(directory: string): FallbackFile {
   const cached = fallbackCache.get(directory)
   if (cached) return cached
   try {
-    const parsed = JSON.parse(readFileSync(join(configDir(directory), "fallback.json"), "utf8"))
+    const parsed = parseJsonWithComments(readFileSync(join(configDir(directory), "fallback.json"), "utf8"))
+    if (parsed.defaults && typeof parsed.defaults === "object") {
+      if (!parsed.defaultFallback && parsed.defaults.fallback) parsed.defaultFallback = parsed.defaults.fallback
+      if (!parsed.defaultLargeContextModel && parsed.defaults.largeContextModel) parsed.defaultLargeContextModel = parsed.defaults.largeContextModel
+      if (!parsed.defaultLargeContextFallback && parsed.defaults.largeContextFallback) parsed.defaultLargeContextFallback = parsed.defaults.largeContextFallback
+    }
     fallbackCache.set(directory, parsed)
     return parsed
   } catch {
@@ -413,10 +575,11 @@ async function loadModelLimits(client: any): Promise<void> {
   }
 }
 
-// Rough token estimate. Deliberately crude (4 chars/token): it only decides
+// Rough token estimate. Deliberately crude: it only decides
 // whether a model is a candidate, not exact accounting.
 export function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4)
+  const ratio = ROOT.budgets?.charsPerToken ?? 4
+  return Math.ceil(text.length / (ratio > 0 ? ratio : 4))
 }
 
 async function getSessionTokens(client: OpencodeClient, sessionId: string): Promise<number> {
@@ -458,6 +621,10 @@ function isOurs(err: any): boolean {
 
 const QUOTA_THRESHOLD_MS = 600000 // 10 min: beyond this a rate limit is a quota, not a blip
 
+function getQuotaThreshold(): number {
+  return ROOT.budgets?.quotaThresholdMs ?? QUOTA_THRESHOLD_MS
+}
+
 export function classifyError(err: any): Classified {
   if (!err) return { cls: "fatal", detail: "unknown error" }
   if (isOurs(err)) return { cls: "transient", detail: String(err?.message ?? "watchdog abort"), ours: true }
@@ -491,7 +658,7 @@ export function classifyError(err: any): Classified {
 
   const is429 = status === 429 || msg.includes("429") || msg.includes("rate limit") || msg.includes("too many requests") || msg.includes("busy") || msg.includes("all providers for model")
   const quotaWords = msg.includes("daily") || msg.includes("quota") || msg.includes("insufficient_quota") || msg.includes("used up")
-  const longReset = retryAfterMs !== undefined && retryAfterMs > QUOTA_THRESHOLD_MS
+  const longReset = retryAfterMs !== undefined && retryAfterMs > getQuotaThreshold()
 
   if (is429) {
     if (quotaWords || longReset) return { cls: "quota", retryAfterMs, detail: "quota" }
@@ -578,7 +745,7 @@ export async function walkChain(input: WalkInput): Promise<WalkOutcome> {
     return { ok: false, trail: [], reason: `no candidate model fits ~${est} tokens` }
   }
 
-  const deadline = now() + ROOT.budgetMs
+  const deadline = now() + (ROOT.budgets?.fallbackBudgetMs ?? ROOT.budgetMs)
   const trail: TrailEntry[] = []
   let soonestResetMs: number | undefined
 
@@ -598,7 +765,8 @@ export async function walkChain(input: WalkInput): Promise<WalkOutcome> {
   const transientSince = new Map<string, number>()
   const transientStreak = new Map<string, number>()
 
-  for (let pass = 0; pass < ROOT.maxIterations; pass++) {
+  const maxPasses = ROOT.budgets?.maxIterations ?? ROOT.maxIterations
+  for (let pass = 0; pass < maxPasses; pass++) {
     if (now() >= deadline) break
 
     for (const model of ordered) {
@@ -679,7 +847,7 @@ export async function walkChain(input: WalkInput): Promise<WalkOutcome> {
           const windowElapsed = firstTransient ? 0 : now() - (since as number)
           if (firstTransient) transientSince.set(model, now())
 
-          if (c.retryAfterMs !== undefined && c.retryAfterMs > QUOTA_THRESHOLD_MS) {
+          if (c.retryAfterMs !== undefined && c.retryAfterMs > getQuotaThreshold()) {
             blockedUntil.set(model, now() + c.retryAfterMs)
             saveState()
             if (soonestResetMs === undefined || now() + c.retryAfterMs < soonestResetMs) soonestResetMs = now() + c.retryAfterMs
@@ -698,7 +866,7 @@ export async function walkChain(input: WalkInput): Promise<WalkOutcome> {
         }
 
         if (c.cls === "quota") {
-          const reset = c.retryAfterMs ?? QUOTA_THRESHOLD_MS
+          const reset = c.retryAfterMs ?? getQuotaThreshold()
           blockedUntil.set(model, now() + reset)
           saveState()
           if (soonestResetMs === undefined || now() + reset < soonestResetMs) soonestResetMs = now() + reset
@@ -745,7 +913,7 @@ export async function walkChain(input: WalkInput): Promise<WalkOutcome> {
 
     // If all eligible models are in cooldown / breaker, pause until the soonest one cools down
     // instead of burning all remaining passes in milliseconds.
-    if (pass < ROOT.maxIterations - 1) {
+    if (pass < maxPasses - 1) {
       let soonestCooldown = Infinity
       for (const m of eligible) {
         const b = breakerFor(m)
@@ -756,7 +924,8 @@ export async function walkChain(input: WalkInput): Promise<WalkOutcome> {
       if (soonestCooldown !== Infinity && soonestCooldown > now()) {
         const remainingBudget = deadline - now()
         if (soonestCooldown - now() > remainingBudget) break
-        const waitMs = Math.min(soonestCooldown - now() + 50, 30000)
+        const maxCooldownSleep = ROOT.budgets?.maxCooldownSleepMs ?? 30000
+        const waitMs = Math.min(soonestCooldown - now() + 50, maxCooldownSleep)
         log(`walk pass ${pass + 1} finished: all eligible models in cooldown — waiting ${Math.round(waitMs / 1000)}s before pass ${pass + 2}`)
         await sleep(waitMs)
       }
@@ -1004,13 +1173,21 @@ function setupFetchInterceptor(directory: string): void {
       if (candidateChain.length > 0) {
         const incomingUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : (input as Request).url
         const incomingProvider = detectIncomingProvider(requestedModel, incomingUrl, directory)
-        const deadline = now() + (ROOT.budgetMs || 600000)
-        const maxPasses = ROOT.maxIterations || 10
+        const deadline = now() + (ROOT.budgets?.fallbackBudgetMs ?? ROOT.budgetMs ?? 600000)
+        const maxPasses = ROOT.budgets?.maxIterations ?? ROOT.maxIterations ?? 10
+        const fastRetryMs = ROOT.interceptor?.fastRetryMs ?? 500
+        const defaultRateLimitMs = ROOT.interceptor?.defaultRateLimitMs ?? 60000
+        const maxSleepMs = ROOT.interceptor?.maxCooldownSleepMs ?? 60000
 
         if (status === 429) {
+          const pcfg = providerCfg(requestedModel)
           const isUno = incomingProvider === "unorouter-custom" || incomingProvider === "unorouter" || incomingUrl.includes("unorouter.com")
-          if (isUno) blockedUntil.set(requestedModel, now() + 60000)
-          else breakerFor(requestedModel).recordFailure()
+          const cooldown = pcfg.rateLimitMs ?? (isUno ? defaultRateLimitMs : undefined)
+          if (cooldown !== undefined && cooldown > 0) {
+            blockedUntil.set(requestedModel, now() + cooldown)
+          } else {
+            breakerFor(requestedModel).recordFailure()
+          }
           saveState()
         }
         logLine(`fetch interceptor: ${requestedModel} returned HTTP ${status} (contextOverflow=${isContextOverflow}) — attempting in-stream fallback`)
@@ -1066,13 +1243,14 @@ function setupFetchInterceptor(directory: string): void {
 
               if (respStatus === 503 || respStatus >= 500) {
                 // 503/5xx: Cloud concurrency slot busy.
-                // No exponential cooldown: retried next pass (after 500ms) to find an opening.
+                // No exponential cooldown: retried next pass (after fastRetryMs) to find an opening.
               } else if (respStatus === 429) {
                 // 429: Rate limit / quota exhaustion.
+                const candCfg = providerCfg(candidate)
                 const isUno = targetProvider === "unorouter-custom" || targetProvider === "unorouter" || targetUrl.includes("unorouter.com")
-                if (isUno) {
-                  // UnoRouter free tier: 1 minute between requests
-                  blockedUntil.set(candidate, now() + 60000)
+                const cooldown = candCfg.rateLimitMs ?? (isUno ? defaultRateLimitMs : undefined)
+                if (cooldown !== undefined && cooldown > 0) {
+                  blockedUntil.set(candidate, now() + cooldown)
                 } else {
                   candidateBreaker.recordFailure()
                 }
@@ -1105,12 +1283,12 @@ function setupFetchInterceptor(directory: string): void {
             if (!anyAvailable && soonestCooldown !== Infinity && soonestCooldown > now()) {
               const remainingBudget = deadline - now()
               if (soonestCooldown - now() > remainingBudget) break
-              const waitMs = Math.max(500, Math.min(soonestCooldown - now() + 50, 60000))
+              const waitMs = Math.max(fastRetryMs, Math.min(soonestCooldown - now() + 50, maxSleepMs))
               logLine(`fetch interceptor: all candidates in cooldown — waiting ${Math.round(waitMs / 1000)}s for next opening before pass ${pass + 2}`)
               await sleep(waitMs)
             } else {
-              logLine(`fetch interceptor: pass ${pass + 1} finished (${attemptedInPass} attempted) — searching for opening in 500ms (pass ${pass + 2})`)
-              await sleep(500)
+              logLine(`fetch interceptor: pass ${pass + 1} finished (${attemptedInPass} attempted) — searching for opening in ${fastRetryMs}ms (pass ${pass + 2})`)
+              await sleep(fastRetryMs)
             }
           }
         }
@@ -1286,6 +1464,8 @@ function setupParentWatchdog(client: any, directory: string): {
   // the debounce window (each summarize costs a full turn).
   const lastCompactAt = new Map<string, number>()
   const lastParentErrorAt = new Map<string, number>()
+  const debounceMs = ROOT.watchdog?.debounceMs ?? 5000
+  const compactDebounceMs = ROOT.watchdog?.compactionDebounceMs ?? 120000
 
   const onEvent = async (ev: any) => {
     const type = ev?.type
@@ -1315,7 +1495,7 @@ function setupParentWatchdog(client: any, directory: string): {
         const c = classifyError(part.error)
         logLine(`parent ${sid}: stream error ${c.cls}${c.detail ? ` (${c.detail})` : ""}`)
         const lastErr = lastParentErrorAt.get(sid!) ?? 0
-        if (now() - lastErr >= 5000 && (c.cls === "quota" || c.cls === "transient" || c.cls === "provider_level") && !c.ours) {
+        if (now() - lastErr >= debounceMs && (c.cls === "quota" || c.cls === "transient" || c.cls === "provider_level") && !c.ours) {
           lastParentErrorAt.set(sid!, now())
           if (!turns.has(sid!)) {
             let currentModel: string | undefined
@@ -1386,7 +1566,7 @@ function setupParentWatchdog(client: any, directory: string): {
         logLine(`parent ${sid}: message.updated error ${c.cls}${c.detail ? ` (${c.detail})` : ""}`)
         // Debounce: don't re-prompt more than once every 5s
         const lastErr = lastParentErrorAt.get(sid!) ?? 0
-        if (now() - lastErr >= 5000 && (c.cls === "quota" || c.cls === "transient" || c.cls === "provider_level") && !c.ours) {
+        if (now() - lastErr >= debounceMs && (c.cls === "quota" || c.cls === "transient" || c.cls === "provider_level") && !c.ours) {
           lastParentErrorAt.set(sid!, now())
           // Build turns on-the-fly if missing (same as session.error handler)
           if (!turns.has(sid!)) {
@@ -1446,7 +1626,7 @@ function setupParentWatchdog(client: any, directory: string): {
       if (!sid || limit === undefined || usedTokens === undefined) return
       if (usedTokens < limit * ROOT.compactionRatio) return
       const last = lastCompactAt.get(sid) ?? 0
-      if (now() - last < 120000) return // debounce: 2 min
+      if (now() - last < compactDebounceMs) return // debounce: compactionDebounceMs
       lastCompactAt.set(sid, now())
       const [providerID, modelID] = splitModel(model)
       logLine(`parent ${sid}: ${Math.round((usedTokens / limit) * 100)}% of ${model} — self-compacting at ${ROOT.compactionRatio * 100}%`)

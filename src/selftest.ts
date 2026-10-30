@@ -4,7 +4,7 @@
  *   cd C:\Users\axelr\OneDrive\Documents\GitHub\opencode-subagent-fallback
  *   npm run build && node dist/selftest.js
  */
-import { walkChain, classifyError, checkCompletion, WatchdogAbort, __setRootForTests, __setModelLimitsForTests, __resetStateForTests } from "./core.js"
+import { walkChain, classifyError, checkCompletion, WatchdogAbort, __setRootForTests, __setModelLimitsForTests, __resetStateForTests, stripJsonComments, parseJsonWithComments } from "./core.js"
 
 let failures = 0
 function check(name: string, cond: boolean, extra?: string) {
@@ -203,6 +203,25 @@ async function main() {
   calls = []
   o = await walkChain({ chain: [P, Q], attempt: async (m) => { calls.push(m); return ok() } })
   check("quota-blocked model skipped on next walk", o.ok && o.model === Q && calls.length === 1 && calls[0] === Q, JSON.stringify(calls))
+
+  console.log("\njsonComments:")
+  const sampleJsonc = `
+  {
+    // Single line comment
+    "budgets": {
+      /* Block comment */
+      "fallbackBudgetMs": 500000,
+      "url": "http://api.example.com//test/*keep*/",
+    },
+    "interceptor": {
+      "fastRetryMs": 250,
+    }
+  }
+  `
+  const parsed = parseJsonWithComments(sampleJsonc)
+  check("parseJsonWithComments parses comments and trailing commas", parsed.budgets.fallbackBudgetMs === 500000)
+  check("parseJsonWithComments preserves comments inside string literals", parsed.budgets.url === "http://api.example.com//test/*keep*/")
+  check("parseJsonWithComments parses subcategory values", parsed.interceptor.fastRetryMs === 250)
 
   console.log("\nselftest result:")
   if (failures === 0) {
