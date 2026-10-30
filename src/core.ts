@@ -808,6 +808,105 @@ function resolvePromptParts(template: string, worktree: string): ResolvedPart[] 
 
 // ── In-stream fetch interceptor (transparent fallback for opencode run) ──
 
+const KNOWN_PROVIDER_BASE_URLS: Record<string, string> = {
+  openrouter: "https://openrouter.ai/api/v1",
+  unorouter: "https://api.unorouter.com/v1",
+  "unorouter-custom": "https://api.unorouter.com/v1",
+  zai: "https://open.bigmodel.cn/api/paas/v4",
+  sambanova: "https://api.sambanova.ai/v1",
+  orcarouter: "https://api.orcarouter.com/v1",
+  groq: "https://api.groq.com/openai/v1",
+  deepseek: "https://api.deepseek.com/v1",
+  together: "https://api.together.xyz/v1",
+  openai: "https://api.openai.com/v1",
+}
+
+interface ResolvedProvider {
+  baseURL: string
+  apiKey?: string
+}
+
+function resolveProviderInfo(providerId: string, directory: string): ResolvedProvider | null {
+  let baseURL: string | undefined = KNOWN_PROVIDER_BASE_URLS[providerId]
+  let apiKey: string | undefined
+
+  try {
+    const ocFile = join(configDir(directory), "opencode.json")
+    const ocCfg = JSON.parse(readFileSync(ocFile, "utf8"))
+    const pCfg = ocCfg?.provider?.[providerId]
+    if (pCfg?.options?.baseURL) baseURL = pCfg.options.baseURL
+    if (pCfg?.options?.apiKey) apiKey = pCfg.options.apiKey
+  } catch {}
+
+  try {
+    const authFile = join(homedir(), ".local", "share", "opencode", "auth.json")
+    const authCfg = JSON.parse(readFileSync(authFile, "utf8"))
+    const entry = authCfg?.[providerId]
+    if (entry?.key) apiKey = entry.key
+  } catch {}
+
+  if (!apiKey) {
+    const envKeyName = `${providerId.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_API_KEY`
+    if (process.env[envKeyName]) apiKey = process.env[envKeyName]
+    else if (providerId === "openrouter" && process.env.OPENROUTER_API_KEY) apiKey = process.env.OPENROUTER_API_KEY
+  }
+
+  if (!baseURL) return null
+  return { baseURL, apiKey }
+}
+
+function detectIncomingProvider(requestedModel: string, urlStr: string, directory: string): string {
+  if (requestedModel.includes("/")) {
+    const [p] = splitModel(requestedModel)
+    if (p) return p
+  }
+  for (const [p, base] of Object.entries(KNOWN_PROVIDER_BASE_URLS)) {
+    try {
+      if (urlStr.includes(new URL(base).hostname)) return p
+    } catch {}
+  }
+  try {
+    const ocFile = join(configDir(directory), "opencode.json")
+    const ocCfg = JSON.parse(readFileSync(ocFile, "utf8"))
+    for (const [p, pCfg] of Object.entries<any>(ocCfg?.provider ?? {})) {
+      if (pCfg?.options?.baseURL) {
+        try {
+          if (urlStr.includes(new URL(pCfg.options.baseURL).hostname)) return p
+        } catch {}
+      }
+    }
+  } catch {}
+  return ""
+}
+
+function buildHeaders(originalHeaders: any, apiKey?: string, isTargetOpenRouter?: boolean): Record<string, string> {
+  const headers: Record<string, string> = {}
+  if (originalHeaders) {
+    if (typeof originalHeaders.forEach === "function") {
+      originalHeaders.forEach((value: string, key: string) => {
+        headers[key.toLowerCase()] = value
+      })
+    } else if (Array.isArray(originalHeaders)) {
+      for (const [k, v] of originalHeaders) {
+        headers[k.toLowerCase()] = String(v)
+      }
+    } else if (typeof originalHeaders === "object") {
+      for (const [k, v] of Object.entries(originalHeaders)) {
+        headers[k.toLowerCase()] = String(v)
+      }
+    }
+  }
+  if (apiKey) {
+    headers["authorization"] = `Bearer ${apiKey}`
+  }
+  if (isTargetOpenRouter) {
+    if (!headers["http-referer"]) headers["http-referer"] = "https://opencode.ai"
+    if (!headers["x-title"]) headers["x-title"] = "OpenCode"
+  }
+  delete headers["host"]
+  return headers
+}
+
 function setupFetchInterceptor(directory: string): void {
   const origFetch = globalThis.fetch
   if (!origFetch || (origFetch as any).__opencode_fallback_installed) return
@@ -850,34 +949,53 @@ function setupFetchInterceptor(directory: string): void {
 
     if (status === 429 || status >= 500 || isContextOverflow) {
       const fb = loadFallback(directory)
+      let matchedAgent: string | undefined
+      for (const [agentName, agentFb] of Object.entries(fb.agents ?? {})) {
+        const fallbacks = (agentFb?.fallback ?? []).map((e) => (typeof e === "string" ? e : e.model))
+        const largeFallbacks = (agentFb?.largeContextFallback ?? []).map((e) => (typeof e === "string" ? e : e.model))
+        if (
+          agentFb?.largeContextModel === requestedModel ||
+          agentFb?.largeContextModel?.endsWith(`/${requestedModel}`) ||
+          fallbacks.some((m) => m === requestedModel || m.endsWith(`/${requestedModel}`)) ||
+          largeFallbacks.some((m) => m === requestedModel || m.endsWith(`/${requestedModel}`))
+        ) {
+          matchedAgent = agentName
+          break
+        }
+      }
+      if (!matchedAgent) {
+        try {
+          const ocConfig = JSON.parse(readFileSync(join(configDir(directory), "opencode.json"), "utf8"))
+          for (const [agentName, aCfg] of Object.entries<any>(ocConfig?.agent ?? {})) {
+            if (aCfg?.model === requestedModel || aCfg?.model?.endsWith(`/${requestedModel}`)) {
+              matchedAgent = agentName
+              break
+            }
+          }
+        } catch {}
+      }
+      if (!matchedAgent) matchedAgent = "developer"
+
+      const agentFb = fb.agents?.[matchedAgent]
       let candidateChain: string[] = []
 
       if (isContextOverflow) {
-        logLine(`fetch interceptor: ${requestedModel} exceeded context length — attempting large-context fallback`)
-        for (const agentFb of Object.values(fb.agents ?? {})) {
-          const largeChain = (agentFb?.largeContextFallback ?? []).map((e) => (typeof e === "string" ? e : e.model))
-          if (largeChain.length > 0) {
-            candidateChain = largeChain
-            break
-          }
+        logLine(`fetch interceptor: ${requestedModel} exceeded context length — attempting large-context fallback for agent ${matchedAgent}`)
+        const rawLarge: string[] = []
+        const compactAnchor = agentFb?.largeContextModel ?? fb.agents?.["compaction"]?.largeContextModel ?? fb.defaultLargeContextModel
+        if (compactAnchor) rawLarge.push(compactAnchor)
+        for (const e of agentFb?.largeContextFallback ?? agentFb?.fallback ?? fb.agents?.["compaction"]?.largeContextFallback ?? fb.defaultLargeContextFallback ?? fb.defaultFallback ?? []) {
+          rawLarge.push(typeof e === "string" ? e : e.model)
         }
-        if (candidateChain.length === 0 && fb.defaultLargeContextFallback) {
-          candidateChain = (fb.defaultLargeContextFallback ?? []).map((e) => (typeof e === "string" ? e : e.model))
-        }
-        if (candidateChain.length === 0 && fb.defaultLargeContextModel) {
-          candidateChain = [fb.defaultLargeContextModel]
-        }
+        candidateChain = [...new Set(rawLarge)]
       } else {
-        for (const agentFb of Object.values(fb.agents ?? {})) {
-          const chain = (agentFb?.fallback ?? []).map((e) => (typeof e === "string" ? e : e.model))
-          if (chain.some((m) => m === requestedModel || m.endsWith(`/${requestedModel}`))) {
-            candidateChain = chain
-            break
-          }
+        const rawChain: string[] = []
+        // Current model is ALWAYS included in candidate chain
+        rawChain.push(requestedModel)
+        for (const e of agentFb?.fallback ?? fb.defaultFallback ?? []) {
+          rawChain.push(typeof e === "string" ? e : e.model)
         }
-        if (candidateChain.length === 0 && fb.defaultFallback) {
-          candidateChain = fb.defaultFallback
-        }
+        candidateChain = [...new Set(rawChain)]
       }
 
       if (candidateChain.length > 0) {
@@ -886,35 +1004,55 @@ function setupFetchInterceptor(directory: string): void {
         saveState()
         logLine(`fetch interceptor: ${requestedModel} returned HTTP ${status} (contextOverflow=${isContextOverflow}) — attempting in-stream fallback`)
 
-        // Multi-pass loop: retry chain up to 2 passes with cooldown wait
+        const incomingUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : (input as Request).url
+        const incomingProvider = detectIncomingProvider(requestedModel, incomingUrl, directory)
+
         for (let pass = 0; pass < 2; pass++) {
-          let triedAny = false
           for (const candidate of candidateChain) {
-            const [, modelOnly] = splitModel(candidate)
-            if (modelOnly === requestedModel || candidate === requestedModel) continue
+            const [candProvider, modelOnly] = splitModel(candidate)
+            // On pass 0, skip requestedModel because it just failed
+            if (pass === 0 && (modelOnly === requestedModel || candidate === requestedModel)) continue
+
             const candidateBreaker = breakerFor(candidate)
             const bt = blockedUntil.get(candidate)
             if (candidateBreaker.isOpen || (bt !== undefined && bt > now())) continue
 
-            triedAny = true
-            const useFull = requestedModel.includes("/")
-            parsed.model = useFull ? candidate : modelOnly
-            logLine(`fetch interceptor (pass ${pass + 1}): falling back ${requestedModel} -> ${parsed.model} (in-stream)`)
+            const targetProvider = candProvider || incomingProvider
+            let targetUrl = incomingUrl
+            let targetHeaders: Record<string, string> | undefined
 
-            const newInit = { ...init, body: JSON.stringify(parsed) }
+            if (targetProvider && incomingProvider && targetProvider !== incomingProvider) {
+              const pInfo = resolveProviderInfo(targetProvider, directory)
+              if (!pInfo || !pInfo.baseURL) {
+                logLine(`fetch interceptor: candidate ${candidate} provider ${targetProvider} has no baseURL/auth — skipping`)
+                continue
+              }
+              targetUrl = `${pInfo.baseURL.replace(/\/+$/, "")}/chat/completions`
+              targetHeaders = buildHeaders(init.headers, pInfo.apiKey, targetProvider === "openrouter")
+            }
+
+            parsed.model = modelOnly
+            logLine(`fetch interceptor (pass ${pass + 1}): falling back ${requestedModel} -> ${candidate} (${targetUrl})`)
+
+            const newInit: RequestInit = {
+              ...init,
+              headers: targetHeaders ?? init.headers,
+              body: JSON.stringify(parsed),
+            }
+
             try {
-              const fallbackResponse = await origFetch(input, newInit)
+              const fallbackResponse = await origFetch(targetUrl, newInit)
               if (fallbackResponse.ok) {
-                logLine(`fetch interceptor: in-stream fallback to ${parsed.model} succeeded (HTTP ${fallbackResponse.status})`)
+                logLine(`fetch interceptor: in-stream fallback to ${candidate} succeeded (HTTP ${fallbackResponse.status})`)
                 candidateBreaker.recordSuccess()
                 saveState()
                 return fallbackResponse
               }
-              logLine(`fetch interceptor: ${parsed.model} also failed with HTTP ${fallbackResponse.status}`)
+              logLine(`fetch interceptor: ${candidate} also failed with HTTP ${fallbackResponse.status}`)
               candidateBreaker.recordFailure()
               saveState()
             } catch (e: any) {
-              logLine(`fetch interceptor: network error on ${parsed.model}: ${e?.message ?? e}`)
+              logLine(`fetch interceptor: network error on ${candidate}: ${e?.message ?? e}`)
             }
           }
 
@@ -1018,13 +1156,17 @@ function setupParentWatchdog(client: any, directory: string): {
     // compact first using the agent's largeContextFallback chain, then retry.
     if (!next) {
       const fb = loadFallback(directory)
-      const agentFb = fb.agents?.[st.agent]
+      const effectiveAgent = st.agent && st.agent !== "compaction" ? st.agent : "developer"
+      const agentFb = fb.agents?.[effectiveAgent] ?? fb.agents?.["compaction"]
       const largeChainRaw: string[] = []
-      const compactAnchor = agentFb?.largeContextModel ?? fb.defaultLargeContextModel ?? stalled
+      const compactAnchor = agentFb?.largeContextModel ?? fb.agents?.["compaction"]?.largeContextModel ?? fb.defaultLargeContextModel ?? stalled
       if (compactAnchor) largeChainRaw.push(compactAnchor)
-      for (const e of agentFb?.largeContextFallback ?? fb.defaultLargeContextFallback ?? fb.defaultFallback ?? []) largeChainRaw.push(typeof e === "string" ? e : e.model)
+      if (stalled && stalled !== compactAnchor) largeChainRaw.push(stalled)
+      for (const e of agentFb?.largeContextFallback ?? agentFb?.fallback ?? fb.agents?.["compaction"]?.largeContextFallback ?? fb.defaultLargeContextFallback ?? fb.defaultFallback ?? []) {
+        largeChainRaw.push(typeof e === "string" ? e : e.model)
+      }
       const largeChain = [...new Set(largeChainRaw)]
-      logLine(`parent ${sid}: compacting via ${st.agent} large context fallback chain (${largeChain.join(" -> ")})`)
+      logLine(`parent ${sid}: compacting via ${effectiveAgent} large context fallback chain (${largeChain.join(" -> ")})`)
       try {
         const result = await walkChain({
           chain: largeChain,
@@ -1142,7 +1284,7 @@ function setupParentWatchdog(client: any, directory: string): {
                 if (!currentModel && m?.info?.model?.providerID && m?.info?.model?.modelID) {
                   currentModel = `${m.info.model.providerID}/${m.info.model.modelID}`
                 }
-                if (!agent && m?.info?.agent) agent = m.info.agent
+                if (!agent && m?.info?.agent && m.info.agent !== "compaction") agent = m.info.agent
                 if (usedTokens === 0 && m?.info?.role === 'assistant' && m?.info?.tokens?.input) {
                   usedTokens = m.info.tokens.input
                 }
@@ -1160,7 +1302,7 @@ function setupParentWatchdog(client: any, directory: string): {
             if (currentModel) {
               if (!agent) agent = "developer"
               const fb = loadFallback(directory)
-              const agentFb = fb.agents?.[agent]
+              const agentFb = fb.agents?.[agent] ?? fb.agents?.["compaction"]
               const chain: string[] = [currentModel]
               for (const e of agentFb?.fallback ?? fb.defaultFallback ?? []) chain.push(typeof e === "string" ? e : e.model)
               turns.set(sid!, { chain: [...new Set(chain)], parts, agent, rePrompts: 0, usedTokens, partialResponse: "", responseStarted: false, responseStartTime: 0, lastTokenAt: 0, triedModels: new Set([currentModel]) })
@@ -1214,7 +1356,7 @@ function setupParentWatchdog(client: any, directory: string): {
                 if (!currentModel && m?.info?.model?.providerID && m?.info?.model?.modelID) {
                   currentModel = `${m.info.model.providerID}/${m.info.model.modelID}`
                 }
-                if (!agent && m?.info?.agent) agent = m.info.agent
+                if (!agent && m?.info?.agent && m.info.agent !== "compaction") agent = m.info.agent
             if (usedTokens === 0 && m?.info?.role === 'assistant' && m?.info?.tokens?.input) {
               usedTokens = m.info.tokens.input
             }
@@ -1232,7 +1374,7 @@ function setupParentWatchdog(client: any, directory: string): {
             if (currentModel) {
               if (!agent) agent = "developer"
               const fb = loadFallback(directory)
-              const agentFb = fb.agents?.[agent]
+              const agentFb = fb.agents?.[agent] ?? fb.agents?.["compaction"]
               const chain: string[] = [currentModel]
               for (const e of agentFb?.fallback ?? fb.defaultFallback ?? []) chain.push(typeof e === "string" ? e : e.model)
               turns.set(sid!, { chain: [...new Set(chain)], parts, agent, rePrompts: 0, usedTokens, partialResponse: "", responseStarted: false, responseStartTime: 0, lastTokenAt: 0, triedModels: new Set([currentModel]) })
@@ -1297,7 +1439,7 @@ function setupParentWatchdog(client: any, directory: string): {
             if (!currentModel && m?.info?.model?.providerID && m?.info?.model?.modelID) {
               currentModel = `${m.info.model.providerID}/${m.info.model.modelID}`
             }
-            if (!agent && m?.info?.agent) agent = m.info.agent
+            if (!agent && m?.info?.agent && m.info.agent !== "compaction") agent = m.info.agent
           }
           const userMsgs = allMsgs.filter((m: any) => m?.info?.role === "user")
           const lastUserMsg = userMsgs[userMsgs.length - 1]
@@ -1316,7 +1458,7 @@ function setupParentWatchdog(client: any, directory: string): {
         }
         if (!agent) agent = "developer"
         const fb = loadFallback(directory)
-        const agentFb = fb.agents?.[agent]
+        const agentFb = fb.agents?.[agent] ?? fb.agents?.["compaction"]
         const chain: string[] = [currentModel]
         for (const e of agentFb?.fallback ?? fb.defaultFallback ?? []) chain.push(typeof e === "string" ? e : e.model)
         turns.set(sid, { chain: [...new Set(chain)], parts, agent, rePrompts: 0, usedTokens, partialResponse: "", responseStarted: false, responseStartTime: 0, lastTokenAt: 0, triedModels: new Set([currentModel]) })
@@ -1351,13 +1493,14 @@ function setupParentWatchdog(client: any, directory: string): {
     const isCompaction = explicitAgent === "compaction"
     const effectiveAgent = isCompaction ? (st?.agent ?? "developer") : (explicitAgent ?? st?.agent ?? "developer")
     const fb = loadFallback(directory)
-    const agentFb = fb.agents?.[effectiveAgent]
+    const agentFb = fb.agents?.[effectiveAgent] ?? (isCompaction ? fb.agents?.["compaction"] : undefined)
 
     let chainRaw: string[] = []
     if (isCompaction) {
-      const largeAnchor = agentFb?.largeContextModel ?? fb.defaultLargeContextModel ?? currentModel
+      const largeAnchor = agentFb?.largeContextModel ?? fb.agents?.["compaction"]?.largeContextModel ?? fb.defaultLargeContextModel ?? currentModel
       chainRaw.push(largeAnchor)
-      for (const e of agentFb?.largeContextFallback ?? fb.defaultLargeContextFallback ?? fb.defaultFallback ?? []) {
+      if (currentModel && currentModel !== largeAnchor) chainRaw.push(currentModel)
+      for (const e of agentFb?.largeContextFallback ?? agentFb?.fallback ?? fb.agents?.["compaction"]?.largeContextFallback ?? fb.defaultLargeContextFallback ?? fb.defaultFallback ?? []) {
         chainRaw.push(typeof e === "string" ? e : e.model)
       }
     } else {
