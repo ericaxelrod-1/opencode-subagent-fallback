@@ -292,11 +292,14 @@ class Breaker {
   get isOpen(): boolean {
     return this.openUntil > now()
   }
-  recordFailure(): void {
+  recordFailure(cooldownMs?: number): void {
     this.failures++
     if (this.failures < (this.cfg.threshold ?? 1)) return
     this.trips++
-    const wait = Math.min(this.cfg.maxCooldownMs ?? this.cfg.cooldownMs, this.cfg.cooldownMs * 2 ** Math.max(0, this.trips - 1))
+    const wait =
+      cooldownMs !== undefined
+        ? cooldownMs
+        : Math.min(this.cfg.maxCooldownMs ?? this.cfg.cooldownMs, this.cfg.cooldownMs * 2 ** Math.max(0, this.trips - 1))
     this.openUntil = now() + wait
   }
   recordSuccess(): void {
@@ -999,15 +1002,18 @@ function setupFetchInterceptor(directory: string): void {
       }
 
       if (candidateChain.length > 0) {
-        const b = breakerFor(requestedModel)
-        b.recordFailure()
-        saveState()
-        logLine(`fetch interceptor: ${requestedModel} returned HTTP ${status} (contextOverflow=${isContextOverflow}) — attempting in-stream fallback`)
-
         const incomingUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : (input as Request).url
         const incomingProvider = detectIncomingProvider(requestedModel, incomingUrl, directory)
         const deadline = now() + (ROOT.budgetMs || 600000)
         const maxPasses = ROOT.maxIterations || 10
+
+        if (status === 429) {
+          const isUno = incomingProvider === "unorouter-custom" || incomingProvider === "unorouter" || incomingUrl.includes("unorouter.com")
+          if (isUno) blockedUntil.set(requestedModel, now() + 60000)
+          else breakerFor(requestedModel).recordFailure()
+          saveState()
+        }
+        logLine(`fetch interceptor: ${requestedModel} returned HTTP ${status} (contextOverflow=${isContextOverflow}) — attempting in-stream fallback`)
 
         for (let pass = 0; pass < maxPasses; pass++) {
           if (now() >= deadline) break
@@ -1055,9 +1061,26 @@ function setupFetchInterceptor(directory: string): void {
                 saveState()
                 return fallbackResponse
               }
-              logLine(`fetch interceptor: ${candidate} also failed with HTTP ${fallbackResponse.status}`)
-              candidateBreaker.recordFailure()
-              saveState()
+              const respStatus = fallbackResponse.status
+              logLine(`fetch interceptor: ${candidate} also failed with HTTP ${respStatus}`)
+
+              if (respStatus === 503 || respStatus >= 500) {
+                // 503/5xx: Cloud concurrency slot busy.
+                // No exponential cooldown: retried next pass (after 500ms) to find an opening.
+              } else if (respStatus === 429) {
+                // 429: Rate limit / quota exhaustion.
+                const isUno = targetProvider === "unorouter-custom" || targetProvider === "unorouter" || targetUrl.includes("unorouter.com")
+                if (isUno) {
+                  // UnoRouter free tier: 1 minute between requests
+                  blockedUntil.set(candidate, now() + 60000)
+                } else {
+                  candidateBreaker.recordFailure()
+                }
+                saveState()
+              } else {
+                candidateBreaker.recordFailure()
+                saveState()
+              }
             } catch (e: any) {
               logLine(`fetch interceptor: network error on ${candidate}: ${e?.message ?? e}`)
             }
@@ -1065,26 +1088,29 @@ function setupFetchInterceptor(directory: string): void {
 
           if (pass < maxPasses - 1) {
             let soonestCooldown = Infinity
+            let anyAvailable = false
+
             for (const candidate of candidateChain) {
               const cb = breakerFor(candidate)
-              if (cb.isOpen && cb.openUntil < soonestCooldown) soonestCooldown = cb.openUntil
               const bt = blockedUntil.get(candidate)
-              if (bt !== undefined && bt > now() && bt < soonestCooldown) soonestCooldown = bt
+              const isBlocked = cb.isOpen || (bt !== undefined && bt > now())
+              if (!isBlocked) {
+                anyAvailable = true
+              } else {
+                if (cb.isOpen && cb.openUntil < soonestCooldown) soonestCooldown = cb.openUntil
+                if (bt !== undefined && bt > now() && bt < soonestCooldown) soonestCooldown = bt
+              }
             }
 
-            // If all candidates are in cooldown, pause until the soonest cooldown (up to 15s)
-            if (soonestCooldown !== Infinity && soonestCooldown > now()) {
+            if (!anyAvailable && soonestCooldown !== Infinity && soonestCooldown > now()) {
               const remainingBudget = deadline - now()
               if (soonestCooldown - now() > remainingBudget) break
-              const waitMs = Math.min(soonestCooldown - now() + 100, 15000)
-              logLine(`fetch interceptor: pass ${pass + 1} exhausted (${attemptedInPass} attempted) — all eligible candidates in cooldown, waiting ${Math.round(waitMs / 1000)}s before pass ${pass + 2}`)
+              const waitMs = Math.max(500, Math.min(soonestCooldown - now() + 50, 60000))
+              logLine(`fetch interceptor: all candidates in cooldown — waiting ${Math.round(waitMs / 1000)}s for next opening before pass ${pass + 2}`)
               await sleep(waitMs)
             } else {
-              // Candidates failed with transient errors without tripping cooldown: brief backoff (2s) to hammer endpoints again
-              const pcfg = providerCfg(requestedModel)
-              const waitMs = Math.min(pcfg.retryDelayMs || 2000, 5000)
-              logLine(`fetch interceptor: pass ${pass + 1} exhausted (${attemptedInPass} attempted) — retrying chain in ${Math.round(waitMs / 1000)}s (pass ${pass + 2})`)
-              await sleep(waitMs)
+              logLine(`fetch interceptor: pass ${pass + 1} finished (${attemptedInPass} attempted) — searching for opening in 500ms (pass ${pass + 2})`)
+              await sleep(500)
             }
           }
         }
