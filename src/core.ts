@@ -73,6 +73,8 @@ interface FallbackFile {
   enabled?: boolean
   agents?: Record<string, AgentFallback>
   defaultFallback?: string[]
+  defaultLargeContextModel?: string
+  defaultLargeContextFallback?: (FallbackEntry | string)[]
 }
 
 type FailClass =
@@ -733,6 +735,29 @@ export async function walkChain(input: WalkInput): Promise<WalkOutcome> {
         break
       }
     }
+
+    // End of pass: check if any models remain eligible (not permanently ruled out).
+    const eligible = ordered.filter((m) => !outModels.has(m) && !outProviders.has(providerOf(m)))
+    if (eligible.length === 0) break
+
+    // If all eligible models are in cooldown / breaker, pause until the soonest one cools down
+    // instead of burning all remaining passes in milliseconds.
+    if (pass < ROOT.maxIterations - 1) {
+      let soonestCooldown = Infinity
+      for (const m of eligible) {
+        const b = breakerFor(m)
+        if (b.isOpen && b.openUntil < soonestCooldown) soonestCooldown = b.openUntil
+        const bt = blockedUntil.get(m)
+        if (bt !== undefined && bt > now() && bt < soonestCooldown) soonestCooldown = bt
+      }
+      if (soonestCooldown !== Infinity && soonestCooldown > now()) {
+        const remainingBudget = deadline - now()
+        if (soonestCooldown - now() > remainingBudget) break
+        const waitMs = Math.min(soonestCooldown - now() + 50, 30000)
+        log(`walk pass ${pass + 1} finished: all eligible models in cooldown — waiting ${Math.round(waitMs / 1000)}s before pass ${pass + 2}`)
+        await sleep(waitMs)
+      }
+    }
   }
 
   const reason = soonestResetMs
@@ -812,51 +837,101 @@ function setupFetchInterceptor(directory: string): void {
     if (response.ok) return response
 
     const status = response.status
-    if (status === 429 || status >= 500) {
+    let isContextOverflow = status === 413
+    if (status === 400) {
+      try {
+        const cloned = response.clone()
+        const text = (await cloned.text()).toLowerCase()
+        if (text.includes("context length") || text.includes("maximum context") || text.includes("too many tokens") || text.includes("context_length_exceeded") || text.includes("request too large")) {
+          isContextOverflow = true
+        }
+      } catch {}
+    }
+
+    if (status === 429 || status >= 500 || isContextOverflow) {
       const fb = loadFallback(directory)
       let candidateChain: string[] = []
-      for (const agentFb of Object.values(fb.agents ?? {})) {
-        const chain = (agentFb?.fallback ?? []).map((e) => (typeof e === "string" ? e : e.model))
-        if (chain.some((m) => m === requestedModel || m.endsWith(`/${requestedModel}`))) {
-          candidateChain = chain
-          break
+
+      if (isContextOverflow) {
+        logLine(`fetch interceptor: ${requestedModel} exceeded context length — attempting large-context fallback`)
+        for (const agentFb of Object.values(fb.agents ?? {})) {
+          const largeChain = (agentFb?.largeContextFallback ?? []).map((e) => (typeof e === "string" ? e : e.model))
+          if (largeChain.length > 0) {
+            candidateChain = largeChain
+            break
+          }
         }
-      }
-      if (candidateChain.length === 0 && fb.defaultFallback) {
-        candidateChain = fb.defaultFallback
+        if (candidateChain.length === 0 && fb.defaultLargeContextFallback) {
+          candidateChain = (fb.defaultLargeContextFallback ?? []).map((e) => (typeof e === "string" ? e : e.model))
+        }
+        if (candidateChain.length === 0 && fb.defaultLargeContextModel) {
+          candidateChain = [fb.defaultLargeContextModel]
+        }
+      } else {
+        for (const agentFb of Object.values(fb.agents ?? {})) {
+          const chain = (agentFb?.fallback ?? []).map((e) => (typeof e === "string" ? e : e.model))
+          if (chain.some((m) => m === requestedModel || m.endsWith(`/${requestedModel}`))) {
+            candidateChain = chain
+            break
+          }
+        }
+        if (candidateChain.length === 0 && fb.defaultFallback) {
+          candidateChain = fb.defaultFallback
+        }
       }
 
       if (candidateChain.length > 0) {
         const b = breakerFor(requestedModel)
         b.recordFailure()
         saveState()
-        logLine(`fetch interceptor: ${requestedModel} returned HTTP ${status} — attempting in-stream fallback`)
+        logLine(`fetch interceptor: ${requestedModel} returned HTTP ${status} (contextOverflow=${isContextOverflow}) — attempting in-stream fallback`)
 
-        for (const candidate of candidateChain) {
-          const [, modelOnly] = splitModel(candidate)
-          if (modelOnly === requestedModel || candidate === requestedModel) continue
-          const candidateBreaker = breakerFor(candidate)
-          const bt = blockedUntil.get(candidate)
-          if (candidateBreaker.isOpen || (bt !== undefined && bt > now())) continue
+        // Multi-pass loop: retry chain up to 2 passes with cooldown wait
+        for (let pass = 0; pass < 2; pass++) {
+          let triedAny = false
+          for (const candidate of candidateChain) {
+            const [, modelOnly] = splitModel(candidate)
+            if (modelOnly === requestedModel || candidate === requestedModel) continue
+            const candidateBreaker = breakerFor(candidate)
+            const bt = blockedUntil.get(candidate)
+            if (candidateBreaker.isOpen || (bt !== undefined && bt > now())) continue
 
-          const useFull = requestedModel.includes("/")
-          parsed.model = useFull ? candidate : modelOnly
-          logLine(`fetch interceptor: falling back ${requestedModel} -> ${parsed.model} (in-stream)`)
+            triedAny = true
+            const useFull = requestedModel.includes("/")
+            parsed.model = useFull ? candidate : modelOnly
+            logLine(`fetch interceptor (pass ${pass + 1}): falling back ${requestedModel} -> ${parsed.model} (in-stream)`)
 
-          const newInit = { ...init, body: JSON.stringify(parsed) }
-          try {
-            const fallbackResponse = await origFetch(input, newInit)
-            if (fallbackResponse.ok) {
-              logLine(`fetch interceptor: in-stream fallback to ${parsed.model} succeeded (HTTP ${fallbackResponse.status})`)
-              candidateBreaker.recordSuccess()
+            const newInit = { ...init, body: JSON.stringify(parsed) }
+            try {
+              const fallbackResponse = await origFetch(input, newInit)
+              if (fallbackResponse.ok) {
+                logLine(`fetch interceptor: in-stream fallback to ${parsed.model} succeeded (HTTP ${fallbackResponse.status})`)
+                candidateBreaker.recordSuccess()
+                saveState()
+                return fallbackResponse
+              }
+              logLine(`fetch interceptor: ${parsed.model} also failed with HTTP ${fallbackResponse.status}`)
+              candidateBreaker.recordFailure()
               saveState()
-              return fallbackResponse
+            } catch (e: any) {
+              logLine(`fetch interceptor: network error on ${parsed.model}: ${e?.message ?? e}`)
             }
-            logLine(`fetch interceptor: ${parsed.model} also failed with HTTP ${fallbackResponse.status}`)
-            candidateBreaker.recordFailure()
-            saveState()
-          } catch (e: any) {
-            logLine(`fetch interceptor: network error on ${parsed.model}: ${e?.message ?? e}`)
+          }
+
+          // If all candidates in chain failed on pass 0 due to rate limits, wait for cooldown if within 20s
+          if (pass === 0 && !isContextOverflow) {
+            let soonestCooldown = Infinity
+            for (const candidate of candidateChain) {
+              const cb = breakerFor(candidate)
+              if (cb.isOpen && cb.openUntil < soonestCooldown) soonestCooldown = cb.openUntil
+            }
+            if (soonestCooldown !== Infinity && soonestCooldown > now() && soonestCooldown - now() <= 20000) {
+              const wait = soonestCooldown - now() + 100
+              logLine(`fetch interceptor: chain exhausted on pass 1 — waiting ${Math.round(wait / 1000)}s for cooldown before pass 2`)
+              await sleep(wait)
+            } else {
+              break
+            }
           }
         }
       }
@@ -1260,11 +1335,22 @@ function setupParentWatchdog(client: any, directory: string): {
 
     // Get or create turn state, tracking the effective agent for fallback
     let st = turns.get(sid)
-    const effectiveAgent = explicitAgent ?? st?.agent ?? "developer"
+    const isCompaction = explicitAgent === "compaction"
+    const effectiveAgent = isCompaction ? (st?.agent ?? "developer") : (explicitAgent ?? st?.agent ?? "developer")
     const fb = loadFallback(directory)
     const agentFb = fb.agents?.[effectiveAgent]
-    const chainRaw: string[] = [currentModel]
-    for (const e of agentFb?.fallback ?? fb.defaultFallback ?? []) chainRaw.push(typeof e === "string" ? e : e.model)
+
+    let chainRaw: string[] = []
+    if (isCompaction) {
+      const largeAnchor = agentFb?.largeContextModel ?? fb.defaultLargeContextModel ?? currentModel
+      chainRaw.push(largeAnchor)
+      for (const e of agentFb?.largeContextFallback ?? fb.defaultLargeContextFallback ?? fb.defaultFallback ?? []) {
+        chainRaw.push(typeof e === "string" ? e : e.model)
+      }
+    } else {
+      chainRaw.push(currentModel)
+      for (const e of agentFb?.fallback ?? fb.defaultFallback ?? []) chainRaw.push(typeof e === "string" ? e : e.model)
+    }
     const chain = [...new Set(chainRaw)]
 
     if (!st) {
@@ -1284,7 +1370,7 @@ function setupParentWatchdog(client: any, directory: string): {
     } else {
       st.chain = chain
       st.parts = output?.parts ?? []
-      if (explicitAgent) st.agent = explicitAgent
+      if (explicitAgent && !isCompaction) st.agent = explicitAgent
       st.triedModels.clear()
       st.triedModels.add(currentModel)
     }
@@ -1292,18 +1378,23 @@ function setupParentWatchdog(client: any, directory: string): {
     setAnchor(sid, currentModel)
 
     // Pre-turn proactive model override:
-    // If currentModel is already broken (breaker open or quota blocked),
-    // proactively rewrite output.message.model to the first healthy model in the chain.
+    // If compaction turn, or if currentModel is already broken/quota blocked,
+    // or if conversation size exceeds currentModel context limit:
     const b = breakerFor(currentModel)
     const bt = blockedUntil.get(currentModel)
-    if (b.isOpen || (bt !== undefined && bt > now())) {
-      const healthy = nextHealthy(st.chain, currentModel, st.usedTokens || undefined)
+    const curLimit = modelLimits.get(currentModel)
+    const estTokens = st.usedTokens || undefined
+    const isContextExceeded = curLimit !== undefined && estTokens !== undefined && estTokens > curLimit
+
+    if (isCompaction || b.isOpen || (bt !== undefined && bt > now()) || isContextExceeded) {
+      const healthy = nextHealthy(st.chain, isCompaction ? "" : currentModel, estTokens)
       if (healthy) {
         const [pID, mID] = splitModel(healthy)
         output.message.model = { providerID: pID, modelID: mID }
         setAnchor(sid, healthy)
         st.triedModels.add(healthy)
-        logLine(`parent ${sid}: proactively switched starting model from ${currentModel} to ${healthy}`)
+        const reason = isCompaction ? "compaction turn" : isContextExceeded ? `context overflow (~${estTokens} > ${curLimit})` : "cooldown/breaker"
+        logLine(`parent ${sid}: proactively switched starting model from ${currentModel} to ${healthy} (${reason})`)
       }
     }
 
