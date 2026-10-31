@@ -205,7 +205,7 @@ function DEFAULTS(): RootConfig {
   const budgets: BudgetsConfig = {
     fallbackBudgetMs: 600000,
     maxIterations: 10,
-    compactionRatio: 0.5,
+    compactionRatio: 0.4,
     charsPerToken: 4,
     quotaThresholdMs: 600000,
     maxCooldownSleepMs: 30000,
@@ -238,8 +238,11 @@ function DEFAULTS(): RootConfig {
 
 let ROOT: RootConfig = { ...DEFAULTS(), providers: {} }
 
+let isTestRoot = false
+
 /** Test seam: loadRoot is the production path; the self-test sets ROOT directly. */
 export function __setRootForTests(cfg: Partial<RootConfig>): void {
+  isTestRoot = true
   const d = DEFAULTS()
   const b: BudgetsConfig = { ...d.budgets, ...(cfg as any).budgets }
   if (typeof cfg.budgetMs === "number") b.fallbackBudgetMs = cfg.budgetMs
@@ -278,6 +281,7 @@ export function __setModelLimitsForTests(limits: Record<string, number>): void {
 
 /** Test seam: clear all in-process state between cases. */
 export function __resetStateForTests(): void {
+  isTestRoot = false
   breakers.clear()
   blockedUntil.clear()
   anchors.clear()
@@ -349,7 +353,7 @@ function handleLivenessEvent(ev: any): void {
  */
 function startLivenessSweep(client: any): void {
   const interval = ROOT.watchdog?.sweepIntervalMs ?? 5000
-  setInterval(() => {
+  const timer = setInterval(() => {
     const t = now()
     for (const [sid, l] of [...liveness]) {
       const seenFirstToken = l.lastPartAt > l.startedAt
@@ -366,6 +370,7 @@ function startLivenessSweep(client: any): void {
       l.onStall?.(sid)
     }
   }, interval)
+  timer.unref?.()
 }
 
 
@@ -630,10 +635,15 @@ export function classifyError(err: any): Classified {
   if (isOurs(err)) return { cls: "transient", detail: String(err?.message ?? "watchdog abort"), ours: true }
 
   const d = err?.data ?? err
-  const status: number | undefined = typeof d?.statusCode === "number" ? d.statusCode : typeof d?.status === "number" ? d.status : undefined
+  let status: number | undefined = typeof d?.statusCode === "number" ? d.statusCode : typeof d?.status === "number" ? d.status : undefined
   const name: string = d?.name ?? ""
   const msg = String(d?.message ?? "").toLowerCase()
   const retryAfterMs = headerRetryAfter(d?.responseHeaders)
+
+  if (status === undefined) {
+    const m = msg.match(/status(?:_code)?\s*[:=]\s*(\d{3})/i)
+    if (m) status = Number(m[1])
+  }
 
   if (name === "ProviderAuthError" || status === 401) return { cls: "auth", detail: "auth" }
   if (status === 403) return { cls: "forbidden", detail: "forbidden" }
@@ -650,7 +660,13 @@ export function classifyError(err: any): Classified {
     return { cls: "context_too_large", detail: "context too large" }
   }
 
-  if (name === "MessageOutputLengthError" || msg.includes("finish_reason 'length'") || msg.includes("empty completion")) {
+  if (
+    name === "MessageOutputLengthError" ||
+    msg.includes("finish_reason 'length'") ||
+    msg.includes("finish=length") ||
+    msg.includes("incomplete response") ||
+    msg.includes("empty completion")
+  ) {
     // Model behavior for THIS request, not provider health — exempt from
     // benching (streak-bounded at the walk), but it still fails over.
     return { cls: "transient", detail: "truncated/empty completion" }
@@ -840,6 +856,16 @@ export async function walkChain(input: WalkInput): Promise<WalkOutcome> {
           if (streak >= 3) {
             b.recordFailure()
             log(`${model}: circuit breaker tripped (streak=${streak}) — advancing chain`)
+            await sleep(pcfg.skipDelayMs)
+            break
+          }
+
+          // If 400 validation / bad request: sticky retry is futile, advance immediately
+          if (c.detail === "provider 400" || c.detail?.includes("400")) {
+            b.recordFailure()
+            log(`${model}: provider 400 validation error — advancing chain`)
+            await sleep(pcfg.skipDelayMs)
+            break
           }
 
           const since = transientSince.get(model)
@@ -1119,7 +1145,7 @@ function setupFetchInterceptor(directory: string): void {
       } catch {}
     }
 
-    if (status === 429 || status >= 500 || isContextOverflow) {
+    if (status === 429 || status >= 500 || status === 400 || isContextOverflow) {
       const fb = loadFallback(directory)
       let matchedAgent: string | undefined
       try {
@@ -1192,6 +1218,8 @@ function setupFetchInterceptor(directory: string): void {
         }
         logLine(`fetch interceptor: ${requestedModel} returned HTTP ${status} (contextOverflow=${isContextOverflow}) — attempting in-stream fallback`)
 
+        const estTokens = estimateTokens(typeof init?.body === "string" ? init.body : "")
+
         for (let pass = 0; pass < maxPasses; pass++) {
           if (now() >= deadline) break
           let attemptedInPass = 0
@@ -1205,6 +1233,12 @@ function setupFetchInterceptor(directory: string): void {
             const candidateBreaker = breakerFor(candidate)
             const bt = blockedUntil.get(candidate)
             if (candidateBreaker.isOpen || (bt !== undefined && bt > now())) continue
+
+            const candLimit = modelLimits.get(candidate)
+            if (candLimit !== undefined && estTokens > 0 && estTokens > candLimit) {
+              logLine(`fetch interceptor: candidate ${candidate} limit ${candLimit} too small for ~${estTokens} tokens — skipping`)
+              continue
+            }
 
             const targetProvider = candProvider || incomingProvider
             let targetUrl = incomingUrl
@@ -1241,7 +1275,27 @@ function setupFetchInterceptor(directory: string): void {
               const respStatus = fallbackResponse.status
               logLine(`fetch interceptor: ${candidate} also failed with HTTP ${respStatus}`)
 
-              if (respStatus === 503 || respStatus >= 500) {
+              if (respStatus === 400) {
+                // If endpoint rejected an unsupported parameter (e.g. `usage`), strip it and retry once
+                try {
+                  const errText = (await fallbackResponse.clone().text()).toLowerCase()
+                  const paramMatch = errText.match(/unsupported parameter\(s\):\s*`?([a-zA-Z0-9_]+)`?/i)
+                  if (paramMatch && parsed[paramMatch[1]] !== undefined) {
+                    delete parsed[paramMatch[1]]
+                    newInit.body = JSON.stringify(parsed)
+                    const retryRes = await origFetch(targetUrl, newInit)
+                    if (retryRes.ok) {
+                      logLine(`fetch interceptor: stripped unsupported parameter ${paramMatch[1]} for ${candidate} — succeeded (HTTP ${retryRes.status})`)
+                      candidateBreaker.recordSuccess()
+                      saveState()
+                      return retryRes
+                    }
+                  }
+                } catch {}
+                candidateBreaker.recordFailure()
+                blockedUntil.set(candidate, now() + 60000)
+                saveState()
+              } else if (respStatus === 503 || respStatus >= 500) {
                 // 503/5xx: Cloud concurrency slot busy.
                 // No exponential cooldown: retried next pass (after fastRetryMs) to find an opening.
               } else if (respStatus === 429) {
@@ -1371,6 +1425,7 @@ function setupParentWatchdog(client: any, directory: string): {
     if (st.rePrompts >= ROOT.maxIterations) {
       logLine(`parent ${sid}: ${st.rePrompts} consecutive stalls — giving up`)
       turns.delete(sid)
+      unregisterLiveness(sid)
       return
     }
     const stalled = anchorFor(sid) ?? st.chain[0]
@@ -1472,6 +1527,11 @@ function setupParentWatchdog(client: any, directory: string): {
     if (type === "session.status") {
       const sid: string | undefined = ev?.properties?.sessionID
       const status = ev?.properties?.status
+      if (sid && status?.type === "idle") {
+        unregisterLiveness(sid)
+        turns.delete(sid)
+        return
+      }
       if (sid && status?.type === "retry") {
         logLine(`parent ${sid}: session.status retry attempt=${status.attempt} message=${status.message}`)
         const stalled = anchorFor(sid) ?? turns.get(sid)?.chain?.[0]
@@ -1550,6 +1610,9 @@ function setupParentWatchdog(client: any, directory: string): {
       const info = ev?.properties?.info
       const sid: string | undefined = info?.sessionID
       if (sid) stampAlive(sid)
+      if (sid && info?.role === "assistant" && info?.time?.completed != null && !info?.error) {
+        unregisterLiveness(sid)
+      }
 
       // Update used tokens for context-size filtering in nextHealthy.
       const used: number | undefined = info?.tokens?.input
@@ -1798,7 +1861,9 @@ function setupParentWatchdog(client: any, directory: string): {
 
 const plugin: Plugin = async (input: PluginInput) => {
   const { client, directory } = input
-  ROOT = loadRoot(directory)
+  if (!isTestRoot) {
+    ROOT = loadRoot(directory)
+  }
   void loadModelLimits(client)
   // One sweep for both halves: child attempts stall on the same clocks.
   startLivenessSweep(client)
@@ -1822,15 +1887,15 @@ const plugin: Plugin = async (input: PluginInput) => {
       try {
         cfg = (await client.config.get({ throwOnError: true }))?.data
       } catch {}
-      const agentConfig = cfg?.agent?.[subagent_type]
-      if (!agentConfig) {
+      const fb = loadFallback(directory)
+      const agentFb = fb.agents?.[subagent_type]
+      const agentConfig = cfg?.agent?.[subagent_type] ?? cfg?.agents?.[subagent_type]
+      if (!agentConfig && !agentFb) {
         return { title: description, output: `Unknown agent type: ${subagent_type}`, metadata: { error: true } }
       }
 
-      const fb = loadFallback(directory)
-      const agentFb = fb.agents?.[subagent_type]
       const chainRaw: string[] = []
-      if (agentConfig.model) chainRaw.push(agentConfig.model)
+      if (agentConfig?.model) chainRaw.push(agentConfig.model)
       for (const e of agentFb?.fallback ?? fb.defaultFallback ?? []) chainRaw.push(typeof e === "string" ? e : e.model)
       const chain = [...new Set(chainRaw)]
       if (chain.length === 0) {
@@ -1839,6 +1904,9 @@ const plugin: Plugin = async (input: PluginInput) => {
 
       let sessionId: string
       try {
+        const createBody: any = { title: `${description} (@${subagent_type} subagent)` }
+        if (context?.sessionID) createBody.parentID = context.sessionID
+
         if (task_id) {
           const msgs: any = await client.session.messages({ path: { id: task_id }, throwOnError: true }).catch(() => null)
           const hasWork = (msgs?.data ?? []).some((m: any) => m?.info?.role === "assistant")
@@ -1846,17 +1914,17 @@ const plugin: Plugin = async (input: PluginInput) => {
             sessionId = task_id
           } else {
             const created: any = await client.session.create({
-              body: { parentID: context.sessionID, title: `${description} (@${subagent_type} subagent)` },
+              body: createBody,
               throwOnError: true,
             })
-            sessionId = created.data.id
+            sessionId = created?.data?.id ?? created?.id
           }
         } else {
           const created: any = await client.session.create({
-            body: { parentID: context.sessionID, title: `${description} (@${subagent_type} subagent)` },
+            body: createBody,
             throwOnError: true,
           })
-          sessionId = created.data.id
+          sessionId = created?.data?.id ?? created?.id
         }
       } catch (e: any) {
         return { title: description, output: `Failed to create session: ${e?.message ?? e}`, metadata: { error: true } }
@@ -1927,7 +1995,7 @@ const plugin: Plugin = async (input: PluginInput) => {
             if (consumeOurAbort(sessionId)) {
               return { ok: false, error: new WatchdogAbort() }
             }
-            const completion = checkCompletion(res.data)
+            const completion = checkCompletion(res?.data ?? res)
             if (!completion.ok) {
               // Truncated / never finished: fail over rather than return a
               // partial answer the parent would mistake for a real one.

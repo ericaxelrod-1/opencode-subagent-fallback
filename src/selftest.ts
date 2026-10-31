@@ -4,7 +4,7 @@
  *   cd C:\Users\axelr\OneDrive\Documents\GitHub\opencode-subagent-fallback
  *   npm run build && node dist/selftest.js
  */
-import { walkChain, classifyError, checkCompletion, WatchdogAbort, __setRootForTests, __setModelLimitsForTests, __resetStateForTests, stripJsonComments, parseJsonWithComments } from "./core.js"
+import plugin, { walkChain, classifyError, checkCompletion, WatchdogAbort, __setRootForTests, __setModelLimitsForTests, __resetStateForTests, stripJsonComments, parseJsonWithComments } from "./core.js"
 
 let failures = 0
 function check(name: string, cond: boolean, extra?: string) {
@@ -59,6 +59,8 @@ async function main() {
   t("503 text", err({ message: "503 unavailable" }), "provider_level")
   t("timeout text", err({ message: "request timed out" }), "transient")
   t("finish length", err({ name: "MessageOutputLengthError" }), "transient")
+  t("nested status_code=400 in message", err({ message: '{"message":"status_code=400, Invalid request"}' }), "transient")
+  t("nested status_code=429 in message", err({ message: '{"message":"status_code=429, Too many requests"}' }), "transient")
   t("watchdog abort", new WatchdogAbort(), "transient")
   check("watchdog abort flagged ours", classifyError(new WatchdogAbort()).ours === true)
   t("unexpected 418", err({ statusCode: 418 }), "fatal")
@@ -222,6 +224,153 @@ async function main() {
   check("parseJsonWithComments parses comments and trailing commas", parsed.budgets.fallbackBudgetMs === 500000)
   check("parseJsonWithComments preserves comments inside string literals", parsed.budgets.url === "http://api.example.com//test/*keep*/")
   check("parseJsonWithComments parses subcategory values", parsed.interceptor.fastRetryMs === 250)
+
+  console.log("\nsmart_task:")
+  const fast = provider({ retryDelayMs: 1, skipDelayMs: 1, stickyMs: 1, breaker: { threshold: 1, cooldownMs: 1 } })
+  __resetStateForTests()
+  __setRootForTests(root({ providers: { p: fast, unorouter: fast, "unorouter-custom": fast } }))
+
+  const mockContext = { sessionID: "ses_parent_999", worktree: process.cwd() }
+
+  // 1. Happy path
+  {
+    const client: any = {
+      config: { get: async () => ({ data: { agent: { developer: { model: "p/modelA" } } } }) },
+      session: {
+        create: async () => ({ data: { id: "ses_sub_1" } }),
+        messages: async () => ({ data: [] }),
+        summarize: async () => ({ data: {} }),
+        prompt: async () => ({
+          data: {
+            info: { time: { completed: 1 }, finish: "stop" },
+            parts: [{ type: "text", text: "Subagent success answer" }],
+          },
+        }),
+      },
+      event: { subscribe: async () => {} },
+    }
+    const hooks: any = await plugin({ client, directory: process.cwd() } as any)
+    const smartTask = hooks.tool.smart_task
+    const res = await smartTask.execute({ description: "Unit test task", prompt: "Hello subagent", subagent_type: "developer" }, mockContext)
+    check("smart_task happy path returns completed task XML", res.output.includes('<task id="ses_sub_1" state="completed">'))
+    check("smart_task happy path includes task_result", res.output.includes("<task_result>\nSubagent success answer\n</task_result>"))
+    check("smart_task happy path metadata model", res.metadata.model === "p/modelA")
+  }
+
+  // 2. Fallback on 429 to secondary model in chain
+  {
+    __resetStateForTests()
+    __setRootForTests(root({ providers: { p: fast, unorouter: fast, "unorouter-custom": fast } }))
+    const attemptedModels: string[] = []
+    const client: any = {
+      config: { get: async () => ({ data: { agent: { developer: { model: "p/primary" } } } }) },
+      session: {
+        create: async () => ({ data: { id: "ses_sub_2" } }),
+        messages: async () => ({ data: [] }),
+        summarize: async () => ({ data: {} }),
+        prompt: async ({ body }: any) => {
+          const m = `${body.model.providerID}/${body.model.modelID}`
+          attemptedModels.push(m)
+          if (m === "p/primary") {
+            return { error: { statusCode: 429 } }
+          }
+          return {
+            data: {
+              info: { time: { completed: 1 }, finish: "stop" },
+              parts: [{ type: "text", text: "Fallback answered successfully" }],
+            },
+          }
+        },
+      },
+      event: { subscribe: async () => {} },
+    }
+    const hooks: any = await plugin({ client, directory: process.cwd() } as any)
+    const smartTask = hooks.tool.smart_task
+    const res = await smartTask.execute({ description: "Fallback test", prompt: "Perform work", subagent_type: "developer" }, mockContext)
+    check("smart_task fallback on 429 attempts multiple models", attemptedModels.length > 1, attemptedModels.join(" -> "))
+    check("smart_task fallback succeeded", res.output.includes('state="completed"'))
+    check("smart_task fallback includes fallback_trail", res.output.includes("<fallback_trail>"))
+  }
+
+  // 3. Fallback on truncated/incomplete completion
+  {
+    __resetStateForTests()
+    __setRootForTests(root({ providers: { p: fast, unorouter: fast, "unorouter-custom": fast } }))
+    const attempted: string[] = []
+    const client: any = {
+      config: { get: async () => ({ data: { agent: { developer: { model: "p/primary" } } } }) },
+      session: {
+        create: async () => ({ data: { id: "ses_sub_3" } }),
+        messages: async () => ({ data: [] }),
+        summarize: async () => ({ data: {} }),
+        prompt: async ({ body }: any) => {
+          const m = `${body.model.providerID}/${body.model.modelID}`
+          attempted.push(m)
+          if (m === "p/primary") {
+            return {
+              data: {
+                info: { time: {}, finish: "length" },
+                parts: [{ type: "text", text: "Truncated cut-off text..." }],
+              },
+            }
+          }
+          return {
+            data: {
+              info: { time: { completed: 1 }, finish: "stop" },
+              parts: [{ type: "text", text: "Complete response" }],
+            },
+          }
+        },
+      },
+      event: { subscribe: async () => {} },
+    }
+    const hooks: any = await plugin({ client, directory: process.cwd() } as any)
+    const smartTask = hooks.tool.smart_task
+    const res = await smartTask.execute({ description: "Truncation test", prompt: "Work", subagent_type: "developer" }, mockContext)
+    check("smart_task fails over on finish=length", attempted[0] === "p/primary" && attempted.length > 1)
+    check("smart_task recovers from truncated response", res.output.includes("Complete response"))
+  }
+
+  // 4. Unknown subagent type returns error metadata
+  {
+    const client: any = {
+      config: { get: async () => ({ data: { agent: {} } }) },
+      session: { create: async () => ({ data: { id: "ses_sub_4" } }) },
+      event: { subscribe: async () => {} },
+    }
+    const hooks: any = await plugin({ client, directory: process.cwd() } as any)
+    const smartTask = hooks.tool.smart_task
+    const res = await smartTask.execute({ description: "Unknown agent test", prompt: "Hello", subagent_type: "unknown_xyz_role" }, mockContext)
+    check("smart_task rejects unknown agent type", res.metadata?.error === true && res.output.includes("Unknown agent type: unknown_xyz_role"))
+  }
+
+  // 5. Task resumption (task_id passed)
+  {
+    let createdCount = 0
+    let promptSessionId = ""
+    const client: any = {
+      config: { get: async () => ({ data: { agent: { developer: { model: "p/primary" } } } }) },
+      session: {
+        create: async () => { createdCount++; return { data: { id: "new_ses" } } },
+        messages: async () => ({ data: [{ info: { role: "assistant" } }] }),
+        prompt: async ({ path }: any) => {
+          promptSessionId = path.id
+          return {
+            data: {
+              info: { time: { completed: 1 }, finish: "stop" },
+              parts: [{ type: "text", text: "Resumed task answer" }],
+            },
+          }
+        },
+      },
+      event: { subscribe: async () => {} },
+    }
+    const hooks: any = await plugin({ client, directory: process.cwd() } as any)
+    const smartTask = hooks.tool.smart_task
+    const res = await smartTask.execute({ description: "Resume task", prompt: "Continue", subagent_type: "developer", task_id: "existing_task_abc" }, mockContext)
+    check("smart_task reuses existing task_id when work exists", createdCount === 0 && promptSessionId === "existing_task_abc")
+    check("smart_task resumed task has correct id in output", res.output.includes('id="existing_task_abc"'))
+  }
 
   console.log("\nselftest result:")
   if (failures === 0) {
