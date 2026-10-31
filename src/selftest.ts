@@ -403,6 +403,73 @@ async function main() {
     check("exhausting fallback chain on 429 does not trigger compaction", summarizeCount === 0)
   }
 
+  // 7. Watchdog recovers parts from earlier user messages when latest message has empty parts
+  {
+    __resetStateForTests()
+    __setRootForTests(root({ providers: { p: fast }, parentWatchdog: { enabled: true, firstTokenMs: 1000, stallTimeoutMs: 1000 } }))
+    let promptedModel = ""
+    let promptedParts: any[] = []
+    const client: any = {
+      config: { get: async () => ({ data: { agent: { developer: { model: "p/modelA" } } } }) },
+      session: {
+        messages: async () => ({
+          data: [
+            { info: { role: "user" }, parts: [{ type: "text", text: "Important original prompt" }] },
+            { info: { role: "assistant", model: { providerID: "p", modelID: "modelA" }, agent: "developer" } },
+            { info: { role: "user" }, parts: [] }, // empty continuation turn!
+          ],
+        }),
+        prompt: async ({ body }: any) => {
+          promptedModel = `${body.model.providerID}/${body.model.modelID}`
+          promptedParts = body.parts
+          return { data: {} }
+        },
+      },
+      event: { subscribe: async () => {} },
+    }
+    const hooks: any = await plugin({ client, directory: process.cwd() } as any)
+    await hooks.event({
+      type: "session.error",
+      properties: {
+        sessionID: "ses_empty_part_test",
+        error: { statusCode: 429 },
+      },
+    })
+    check("watchdog re-prompts on fallback when latest message had empty parts", promptedParts.length === 1 && promptedParts[0]?.text === "Important original prompt")
+  }
+
+  // 8. Watchdog defaults to Continue fallback when session has zero parts anywhere
+  {
+    __resetStateForTests()
+    __setRootForTests(root({ providers: { p: fast }, parentWatchdog: { enabled: true, firstTokenMs: 1000, stallTimeoutMs: 1000 } }))
+    let fallbackPromptText = ""
+    const client: any = {
+      config: { get: async () => ({ data: { agent: { developer: { model: "p/modelA" } } } }) },
+      session: {
+        messages: async () => ({
+          data: [
+            { info: { role: "user" }, parts: [] },
+            { info: { role: "assistant", model: { providerID: "p", modelID: "modelA" }, agent: "developer" } },
+          ],
+        }),
+        prompt: async ({ body }: any) => {
+          fallbackPromptText = body?.parts?.[0]?.text ?? ""
+          return { data: {} }
+        },
+      },
+      event: { subscribe: async () => {} },
+    }
+    const hooks: any = await plugin({ client, directory: process.cwd() } as any)
+    await hooks.event({
+      type: "session.error",
+      properties: {
+        sessionID: "ses_zero_part_test",
+        error: { statusCode: 429 },
+      },
+    })
+    check("watchdog falls back to Continue when no parts exist", fallbackPromptText === "Continue")
+  }
+
   console.log("\nselftest result:")
   if (failures === 0) {
     console.log("  all checks passed\n")

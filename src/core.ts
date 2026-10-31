@@ -293,7 +293,11 @@ const blockedUntil = new Map<string, number>()
 const modelLimits = new Map<string, number>()
 /** sessionID → last model that completed a turn. */
 const anchors = new Map<string, string>()
-const fallbackCache = new Map<string, FallbackFile>()
+interface FallbackCacheEntry {
+  mtime: number
+  data: FallbackFile
+}
+const fallbackCache = new Map<string, FallbackCacheEntry>()
 
 // ── Liveness (shared by both halves) ───────────────────────────────────────
 // One registry, one sweep. A session registers before an attempt and
@@ -548,19 +552,21 @@ function mergeProvider(raw: any, base: ProviderConfig = DEFAULT_PROVIDER): Provi
 }
 
 function loadFallback(directory: string): FallbackFile {
-  const cached = fallbackCache.get(directory)
-  if (cached) return cached
   try {
-    const parsed = parseJsonWithComments(readFileSync(join(configDir(directory), "fallback.json"), "utf8"))
+    const file = join(configDir(directory), "fallback.json")
+    const stat = statSync(file)
+    const cached = fallbackCache.get(directory)
+    if (cached && cached.mtime === stat.mtimeMs) return cached.data
+    const parsed = parseJsonWithComments(readFileSync(file, "utf8"))
     if (parsed.defaults && typeof parsed.defaults === "object") {
       if (!parsed.defaultFallback && parsed.defaults.fallback) parsed.defaultFallback = parsed.defaults.fallback
       if (!parsed.defaultLargeContextModel && parsed.defaults.largeContextModel) parsed.defaultLargeContextModel = parsed.defaults.largeContextModel
       if (!parsed.defaultLargeContextFallback && parsed.defaults.largeContextFallback) parsed.defaultLargeContextFallback = parsed.defaults.largeContextFallback
     }
-    fallbackCache.set(directory, parsed)
+    fallbackCache.set(directory, { mtime: stat.mtimeMs, data: parsed })
     return parsed
   } catch {
-    return {}
+    return fallbackCache.get(directory)?.data ?? {}
   }
 }
 
@@ -1379,6 +1385,18 @@ function sanitizeParts(parts: any[]): any[] {
   return (parts || []).filter((p: any) => p && (p.type === "text" || p.type === "file" || p.type === "agent" || p.type === "subtask"))
 }
 
+function extractLastUserParts(allMsgs: any[]): any[] {
+  for (let i = allMsgs.length - 1; i >= 0; i--) {
+    const m = allMsgs[i]
+    const isUser = !m?.info?.role || m.info.role === "user"
+    if (isUser && m?.parts?.length) {
+      const sanitized = sanitizeParts(m.parts)
+      if (sanitized.length > 0) return sanitized
+    }
+  }
+  return []
+}
+
 interface TurnState {
   chain: string[]
   parts: any[]
@@ -1486,21 +1504,21 @@ function setupParentWatchdog(client: any, directory: string): {
     if (st.parts.length === 0) {
       try {
         const msgs: any = await client.session.messages({ path: { id: sid }, throwOnError: true }).catch(() => null)
-        const userMsgs = (msgs?.data ?? []).filter((m: any) => m?.info?.role === "user")
-        const lastUserMsg = userMsgs[userMsgs.length - 1]
-        if (lastUserMsg?.parts?.length) {
-          st.parts = sanitizeParts(lastUserMsg.parts)
+        const recovered = extractLastUserParts(msgs?.data ?? [])
+        if (recovered.length > 0) {
+          st.parts = recovered
           logLine(`parent ${sid}: recovered ${st.parts.length} parts from session messages`)
         }
       } catch {}
     }
-    if (!nextAfterCompact || st.parts.length === 0) {
-      logLine(`parent ${sid}: no healthy model to re-prompt on (next=${nextAfterCompact ?? "none"}, parts=${st.parts.length})`)
+    if (!nextAfterCompact) {
+      logLine(`parent ${sid}: no healthy model to re-prompt on (next=none)`)
       turns.delete(sid)
       return
     }
+    const promptParts = st.parts.length > 0 ? st.parts : [{ type: "text", text: "Continue" }]
     st.rePrompts += 1
-    logLine(`parent ${sid}: re-prompting on ${nextAfterCompact} (attempt ${st.rePrompts})`)
+    logLine(`parent ${sid}: re-prompting on ${nextAfterCompact} (attempt ${st.rePrompts}, parts=${promptParts.length})`)
     setAnchor(sid, nextAfterCompact)
     st.triedModels.add(nextAfterCompact)
     const [providerID, modelID] = splitModel(nextAfterCompact)
@@ -1515,7 +1533,7 @@ function setupParentWatchdog(client: any, directory: string): {
     try {
       await client.session.prompt({
         path: { id: sid },
-        body: { agent: st.agent, model: { providerID, modelID }, parts: st.parts },
+        body: { agent: st.agent, model: { providerID, modelID }, parts: promptParts },
       })
     } catch (e: any) {
       logLine(`parent ${sid}: re-prompt failed: ${e?.message ?? e}`)
@@ -1582,9 +1600,7 @@ function setupParentWatchdog(client: any, directory: string): {
                   usedTokens = m.info.tokens.input
                 }
               }
-              const userMsgs = allMsgs.filter((m: any) => m?.info?.role === "user")
-              const lastUserMsg = userMsgs[userMsgs.length - 1]
-              if (lastUserMsg?.parts?.length) parts = sanitizeParts(lastUserMsg.parts)
+              parts = extractLastUserParts(allMsgs)
             } catch {}
             if (!currentModel) {
               try {
@@ -1657,9 +1673,7 @@ function setupParentWatchdog(client: any, directory: string): {
               usedTokens = m.info.tokens.input
             }
               }
-              const userMsgs = allMsgs.filter((m: any) => m?.info?.role === "user")
-              const lastUserMsg = userMsgs[userMsgs.length - 1]
-              if (lastUserMsg?.parts?.length) parts = sanitizeParts(lastUserMsg.parts)
+              parts = extractLastUserParts(allMsgs)
             } catch {}
             if (!currentModel) {
               try {
@@ -1740,9 +1754,7 @@ function setupParentWatchdog(client: any, directory: string): {
             }
             if (!agent && m?.info?.agent && m.info.agent !== "compaction") agent = m.info.agent
           }
-          const userMsgs = allMsgs.filter((m: any) => m?.info?.role === "user")
-          const lastUserMsg = userMsgs[userMsgs.length - 1]
-          if (lastUserMsg?.parts?.length) parts = sanitizeParts(lastUserMsg.parts)
+          parts = extractLastUserParts(allMsgs)
         } catch {}
         if (!currentModel) {
           // Last resort: use the agent's configured model from opencode config.
@@ -1824,7 +1836,8 @@ function setupParentWatchdog(client: any, directory: string): {
       st = turns.get(sid)!
     } else {
       st.chain = chain
-      st.parts = sanitizeParts(output?.parts)
+      const incomingParts = sanitizeParts(output?.parts)
+      if (incomingParts.length > 0) st.parts = incomingParts
       if (explicitAgent && !isCompaction) st.agent = explicitAgent
       st.triedModels.clear()
       st.triedModels.add(currentModel)
