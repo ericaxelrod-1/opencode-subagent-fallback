@@ -372,6 +372,37 @@ async function main() {
     check("smart_task resumed task has correct id in output", res.output.includes('id="existing_task_abc"'))
   }
 
+  // 6. Ending the fallback chain on 429 must NOT trigger compaction
+  {
+    __resetStateForTests()
+    __setRootForTests(root({ providers: { p: fast }, parentWatchdog: { enabled: true, firstTokenMs: 1000, stallTimeoutMs: 1000 } }))
+    let summarizeCount = 0
+    const client: any = {
+      config: { get: async () => ({ data: { agent: { developer: { model: "p/modelA" } } } }) },
+      session: {
+        messages: async () => ({
+          data: [
+            { info: { role: "user" }, parts: [{ type: "text", text: "Do some work" }] },
+            { info: { role: "assistant", model: { providerID: "p", modelID: "modelA" }, agent: "developer" } },
+          ],
+        }),
+        summarize: async () => { summarizeCount++; return { data: {} } },
+        prompt: async () => ({ data: {} }),
+      },
+      event: { subscribe: async () => {} },
+    }
+    const hooks: any = await plugin({ client, directory: process.cwd() } as any)
+    // Send session.error with 429
+    await hooks.event({
+      type: "session.error",
+      properties: {
+        sessionID: "ses_exhaustion_test",
+        error: { statusCode: 429 },
+      },
+    })
+    check("exhausting fallback chain on 429 does not trigger compaction", summarizeCount === 0)
+  }
+
   console.log("\nselftest result:")
   if (failures === 0) {
     console.log("  all checks passed\n")
