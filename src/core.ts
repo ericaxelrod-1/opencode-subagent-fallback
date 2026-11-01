@@ -678,11 +678,21 @@ export function classifyError(err: any): Classified {
     return { cls: "transient", detail: "truncated/empty completion" }
   }
 
-  const is429 = status === 429 || msg.includes("429") || msg.includes("rate limit") || msg.includes("too many requests") || msg.includes("busy") || msg.includes("all providers for model")
-  const quotaWords = msg.includes("daily") || msg.includes("quota") || msg.includes("insufficient_quota") || msg.includes("used up")
+  const is429 = status === 429 || msg.includes("429") || msg.includes("rate limit") || msg.includes("too many requests") || msg.includes("busy") || msg.includes("all providers for model") || msg.includes("free usage limit reached") || msg.includes("free usage exceeded")
+  const isFalseUsedUp = msg.includes("nothing is used up")
+  const quotaWords =
+    (!isFalseUsedUp && msg.includes("used up")) ||
+    msg.includes("daily") ||
+    msg.includes("quota") ||
+    msg.includes("insufficient_quota") ||
+    msg.includes("free usage limit") ||
+    msg.includes("usage limit reached") ||
+    msg.includes("free usage exceeded") ||
+    msg.includes("subscribe to go") ||
+    msg.includes("resets in")
   const longReset = retryAfterMs !== undefined && retryAfterMs > getQuotaThreshold()
 
-  if (is429) {
+  if (is429 || quotaWords) {
     if (quotaWords || longReset) return { cls: "quota", retryAfterMs, detail: "quota" }
     return { cls: "transient", retryAfterMs, detail: "rate limited" }
   }
@@ -1013,6 +1023,7 @@ function resolvePromptParts(template: string, worktree: string): ResolvedPart[] 
 // ── In-stream fetch interceptor (transparent fallback for opencode run) ──
 
 const KNOWN_PROVIDER_BASE_URLS: Record<string, string> = {
+  opencode: "https://opencode.ai/inference/openai/v1",
   openrouter: "https://openrouter.ai/api/v1",
   unorouter: "https://api.unorouter.com/v1",
   "unorouter-custom": "https://api.unorouter.com/v1",
@@ -1064,6 +1075,7 @@ function detectIncomingProvider(requestedModel: string, urlStr: string, director
     const [p] = splitModel(requestedModel)
     if (p) return p
   }
+  if (urlStr.includes("opencode.ai")) return "opencode"
   for (const [p, base] of Object.entries(KNOWN_PROVIDER_BASE_URLS)) {
     try {
       if (urlStr.includes(new URL(base).hostname)) return p
@@ -1414,10 +1426,58 @@ function setupParentWatchdog(client: any, directory: string): {
   onEvent: (event: any) => void
   onChatMessage: (input: any, output: any) => Promise<void>
 } {
-  // Re-prompt bookkeeping. After an abort we re-issue the captured user parts
-  // on the next healthy model. A re-prompt duplicates the user turn in the
-  // transcript — accepted; a frozen user turn is worse.
   const turns = new Map<string, TurnState>()
+
+  const ensureTurnState = async (sid: string): Promise<TurnState | null> => {
+    let st = turns.get(sid)
+    if (st) return st
+    let currentModel = anchorFor(sid)
+    let agent = ""
+    let parts: any[] = []
+    let usedTokens = 0
+    try {
+      const msgs: any = await client.session.messages({ path: { id: sid }, throwOnError: true }).catch(() => null)
+      const allMsgs = msgs?.data ?? []
+      for (let i = allMsgs.length - 1; i >= 0; i--) {
+        const m = allMsgs[i]
+        if (!currentModel && m?.info?.model?.providerID && m?.info?.model?.modelID) {
+          currentModel = `${m.info.model.providerID}/${m.info.model.modelID}`
+        }
+        if (!agent && m?.info?.agent && m.info.agent !== "compaction") agent = m.info.agent
+        if (usedTokens === 0 && m?.info?.role === "assistant" && m?.info?.tokens?.input) {
+          usedTokens = m.info.tokens.input
+        }
+      }
+      parts = extractLastUserParts(allMsgs)
+    } catch {}
+    if (!currentModel) {
+      try {
+        const cfg: any = (await client.config.get({ throwOnError: true }))?.data
+        if (agent && cfg?.agent?.[agent]?.model) currentModel = cfg.agent[agent].model
+      } catch {}
+    }
+    if (!currentModel) return null
+    if (!agent) agent = "developer"
+    const fb = loadFallback(directory)
+    const agentFb = fb.agents?.[agent] ?? fb.agents?.["compaction"]
+    const chain: string[] = [currentModel]
+    for (const e of agentFb?.fallback ?? fb.defaultFallback ?? []) chain.push(typeof e === "string" ? e : e.model)
+    st = {
+      chain: [...new Set(chain)],
+      parts,
+      agent,
+      rePrompts: 0,
+      usedTokens,
+      partialResponse: "",
+      responseStarted: false,
+      responseStartTime: 0,
+      lastTokenAt: 0,
+      triedModels: new Set([currentModel]),
+    }
+    turns.set(sid, st)
+    logLine(`parent ${sid}: built chain on-the-fly (agent=${agent}, model=${currentModel}, parts=${parts.length}, usedTokens=${usedTokens})`)
+    return st
+  }
 
   // First healthy model in the chain that isn't excluded or on cooldown.
   const nextHealthy = (chain: string[], exclude: string | Set<string>, est?: number): string | undefined => {
@@ -1438,7 +1498,7 @@ function setupParentWatchdog(client: any, directory: string): {
   }
 
   const reprompt = async (sid: string, opts?: { isContextOverflow?: boolean }): Promise<void> => {
-    const st = turns.get(sid)
+    const st = await ensureTurnState(sid)
     if (!st) return
     if (st.rePrompts >= ROOT.maxIterations) {
       logLine(`parent ${sid}: ${st.rePrompts} consecutive stalls — giving up`)
@@ -1563,6 +1623,18 @@ function setupParentWatchdog(client: any, directory: string): {
         if (stalled) {
           breakerFor(stalled).recordFailure()
           saveState()
+        }
+        const c = classifyError({ message: status?.message })
+        if (c.cls === "quota" || c.detail === "quota") {
+          logLine(`parent ${sid}: retry status indicates quota exhaustion ("${status.message}") — aborting and re-prompting immediately`)
+          if (typeof client?.session?.abort === "function") {
+            try {
+              await client.session.abort({ path: { id: sid } })
+            } catch (e: any) {
+              logLine(`parent ${sid}: abort failed: ${e?.message ?? e}`)
+            }
+          }
+          await reprompt(sid)
         }
       }
       return
@@ -1782,11 +1854,11 @@ function setupParentWatchdog(client: any, directory: string): {
           breakerFor(failed).recordFailure()
           saveState()
           // Re-prompt on the next healthy model in the chain, same as onStall.
-          void reprompt(sid)
+          await reprompt(sid)
         } else if (c.cls === "context_too_large") {
           // Context overflow: force compaction via largeContextFallback or re-prompt on next healthy large model
           logLine(`parent ${sid}: context overflow detected in session.error — triggering compaction/reprompt`)
-          void reprompt(sid, { isContextOverflow: true })
+          await reprompt(sid, { isContextOverflow: true })
         }
       }
     }

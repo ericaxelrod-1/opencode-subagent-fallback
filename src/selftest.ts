@@ -470,6 +470,60 @@ async function main() {
     check("watchdog falls back to Continue when no parts exist", fallbackPromptText === "Continue")
   }
 
+  // 9. Error classification: OpenCode quota phrases vs UnoRouter transient rate limits
+  {
+    const ocQuota1 = classifyError({ message: "Free usage limit reached. Free models work in OpenCode (https://opencode.ai); subscribe to OpenCode Go to keep going: https://opencode.ai/go" })
+    check("classifyError identifies OpenCode 'Free usage limit reached' as quota", ocQuota1.cls === "quota")
+
+    const ocQuota2 = classifyError({ message: "Free usage exceeded, subscribe to Go" })
+    check("classifyError identifies OpenCode 'Free usage exceeded' as quota", ocQuota2.cls === "quota")
+
+    const unoTransient = classifyError({ statusCode: 429, message: "The free tier allows 1 request(s) every 1 min. You have used 1 request(s), and nothing is used up, retry in 31s" })
+    check("classifyError identifies UnoRouter 'nothing is used up' as transient", unoTransient.cls === "transient")
+  }
+
+  // 10. Watchdog aborts and reprompts on session.status retry with quota message
+  {
+    __resetStateForTests()
+    __setRootForTests(root({ providers: { p: fast }, parentWatchdog: { enabled: true, firstTokenMs: 1000, stallTimeoutMs: 1000 } }))
+    let abortedSession = ""
+    let promptedModel = ""
+    const client: any = {
+      config: { get: async () => ({ data: { agent: { developer: { model: "p/modelA" } } } }) },
+      session: {
+        abort: async ({ path }: any) => {
+          abortedSession = path.id
+          return { data: {} }
+        },
+        messages: async () => ({
+          data: [
+            { info: { role: "user" }, parts: [{ type: "text", text: "Retry test" }] },
+            { info: { role: "assistant", model: { providerID: "p", modelID: "modelA" }, agent: "developer" } },
+          ],
+        }),
+        prompt: async ({ body }: any) => {
+          promptedModel = `${body.model.providerID}/${body.model.modelID}`
+          return { data: {} }
+        },
+      },
+      event: { subscribe: async () => {} },
+    }
+    const hooks: any = await plugin({ client, directory: process.cwd() } as any)
+    await hooks.event({
+      type: "session.status",
+      properties: {
+        sessionID: "ses_retry_quota_test",
+        status: {
+          type: "retry",
+          attempt: 1,
+          message: "Free usage exceeded, subscribe to Go",
+        },
+      },
+    })
+    check("watchdog aborts session when session.status retry has quota message", abortedSession === "ses_retry_quota_test")
+    check("watchdog reprompts on healthy fallback model", promptedModel.length > 0 && promptedModel !== "p/modelA")
+  }
+
   console.log("\nselftest result:")
   if (failures === 0) {
     console.log("  all checks passed\n")
