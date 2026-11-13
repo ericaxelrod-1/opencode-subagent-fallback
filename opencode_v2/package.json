@@ -1,0 +1,18 @@
+{
+  "name": "opencode-subagent-fallback-v2",
+  "version": "0.1.0",
+  "description": "Transparent subagent model fallback for OpenCode — V2 failover core (retry-hook driven in-step failover)",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./server": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "tsc && node dist/selftest.js"
+  },
+  "license": "MIT"
+}
