@@ -58,6 +58,7 @@ async function main() {
     t("413", { statusCode: 413 }, "context_too_large");
     t("429 no reset", { statusCode: 429 }, "transient");
     t("429 + 2h retry-after", { statusCode: 429, responseHeaders: { "retry-after": "7200" } }, "quota");
+    t("429 OpenRouter per-day quota", { type: "provider.rate-limit", status: 429, retryAfterMs: 24000, message: "Rate limit exceeded: free-models-per-day-high-balance." }, "quota");
     t("429 UnoRouter transient", { statusCode: 429, message: "The free tier allows 1 request(s) every 1 min. You have used 1 request(s), and nothing is used up, retry in 31s" }, "transient");
     t("500", { statusCode: 500 }, "provider_level");
     t("watchdog abort", { name: "WatchdogAbort" }, "transient");

@@ -114,7 +114,7 @@ function errTypeOf(err: any, status?: number): string {
   if (status !== undefined && status >= 500) return "provider.internal"
   if (name === "MessageOutputLengthError" || msg.includes("finish_reason") || msg.includes("empty completion") || msg.includes("incomplete response")) return "provider.internal"
   if (msg.includes("context length") || msg.includes("maximum context") || msg.includes("context_length_exceeded") || msg.includes("too many tokens") || msg.includes("request too large") || msg.includes("413")) return "context_overflow"
-  if (msg.includes("free usage limit") || msg.includes("free usage exceeded") || msg.includes("used up") || msg.includes("daily") || msg.includes("quota") || msg.includes("insufficient_quota") || msg.includes("usage limit") || msg.includes("subscribe to go") || msg.includes("resets in")) return "provider.quota"
+  if (msg.includes("free usage limit") || msg.includes("free usage exceeded") || msg.includes("used up") || msg.includes("daily") || msg.includes("per-day") || msg.includes("free-models-per-day") || msg.includes("quota") || msg.includes("insufficient_quota") || msg.includes("usage limit") || msg.includes("subscribe to go") || msg.includes("resets in")) return "provider.quota"
   if (msg.includes("rate limit") || msg.includes("too many requests") || msg.includes("429") || msg.includes("busy")) return "provider.rate-limit"
   if (msg.includes("transport") || msg.includes("econnreset") || msg.includes("fetch failed") || msg.includes("socket hang up") || msg.includes("503") || msg.includes("502") || msg.includes("unavailable") || msg.includes("bad gateway")) return "provider.transport"
   if (msg.includes("timeout") || msg.includes("timed out")) return "provider.timeout"
@@ -191,6 +191,8 @@ export function classifyError(err: any): Classified {
   const quotaWords =
     (!isFalseUsedUp && msg.includes("used up")) ||
     msg.includes("daily") ||
+    msg.includes("per-day") ||
+    msg.includes("free-models-per-day") ||
     msg.includes("quota") ||
     msg.includes("insufficient_quota") ||
     msg.includes("free usage limit") ||

@@ -106,7 +106,7 @@ function errTypeOf(err, status) {
         return "provider.internal";
     if (msg.includes("context length") || msg.includes("maximum context") || msg.includes("context_length_exceeded") || msg.includes("too many tokens") || msg.includes("request too large") || msg.includes("413"))
         return "context_overflow";
-    if (msg.includes("free usage limit") || msg.includes("free usage exceeded") || msg.includes("used up") || msg.includes("daily") || msg.includes("quota") || msg.includes("insufficient_quota") || msg.includes("usage limit") || msg.includes("subscribe to go") || msg.includes("resets in"))
+    if (msg.includes("free usage limit") || msg.includes("free usage exceeded") || msg.includes("used up") || msg.includes("daily") || msg.includes("per-day") || msg.includes("free-models-per-day") || msg.includes("quota") || msg.includes("insufficient_quota") || msg.includes("usage limit") || msg.includes("subscribe to go") || msg.includes("resets in"))
         return "provider.quota";
     if (msg.includes("rate limit") || msg.includes("too many requests") || msg.includes("429") || msg.includes("busy"))
         return "provider.rate-limit";
@@ -181,6 +181,8 @@ export function classifyError(err) {
     const isFalseUsedUp = msg.includes("nothing is used up");
     const quotaWords = (!isFalseUsedUp && msg.includes("used up")) ||
         msg.includes("daily") ||
+        msg.includes("per-day") ||
+        msg.includes("free-models-per-day") ||
         msg.includes("quota") ||
         msg.includes("insufficient_quota") ||
         msg.includes("free usage limit") ||
