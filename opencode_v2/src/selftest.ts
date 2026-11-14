@@ -61,6 +61,7 @@ async function main(): Promise<void> {
   t("429 + 2h retry-after", { statusCode: 429, responseHeaders: { "retry-after": "7200" } }, "quota")
   t("429 OpenRouter per-day quota", { type: "provider.rate-limit", status: 429, retryAfterMs: 24000, message: "Rate limit exceeded: free-models-per-day-high-balance." }, "quota")
   t("429 UnoRouter transient", { statusCode: 429, message: "The free tier allows 1 request(s) every 1 min. You have used 1 request(s), and nothing is used up, retry in 31s" }, "transient")
+  t("UnoRouter all providers busy -> transient", { message: 'All providers for model "glm-5.3:free" are busy right now (they hit their rate limit). This is not a spelling error. Please try again in a little while, or switch to another model. (request id: 202611132320494453920678268d9d61vj3HSdF)' }, "transient")
   t("500", { statusCode: 500 }, "provider_level")
   t("watchdog abort", { name: "WatchdogAbort" } as any, "transient")
   t("unexpected 418", { statusCode: 418 }, "fatal")
@@ -301,13 +302,21 @@ async function main(): Promise<void> {
   }
   {
     const capturedAgents: any = {} as Record<string, any>
-    const agentEditor: any = { update: (id: string, fn: any) => { capturedAgents[id] = fn }, get: () => undefined }
+    const existingBuild: any = { id: "build", name: "build", mode: "primary" }
+    const agentEditor: any = {
+      update: (id: string, fn: any) => { capturedAgents[id] = fn },
+      get: (id: string) => (id === "build" ? existingBuild : undefined),
+    }
     const fbAgents = createFallback(mockCtx([]))
     await fbAgents.installAgents(agentEditor)
     check("installAgents upserts fallback agent", typeof capturedAgents["architect"] === "function", Object.keys(capturedAgents).join(","))
-    const draft: any = { name: "architect", mode: "subagent", model: { providerID: "a", id: "previous" } }
+    const draft: any = { name: "architect", mode: "primary" }
     capturedAgents["architect"](draft)
     check("installAgents update writes fallback model ref via toModelRef", draft.model?.providerID === "a" && draft.model?.id === "arch1" && draft.mode === "subagent", JSON.stringify(draft))
+    if (typeof capturedAgents["build"] === "function") {
+      capturedAgents["build"](existingBuild)
+      check("installAgents preserves primary mode on existing built-in agent", existingBuild.mode === "primary", JSON.stringify(existingBuild))
+    }
   }
 
   console.log("\nselftest result:")

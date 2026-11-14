@@ -175,7 +175,7 @@ export function classifyError(err) {
         msg.includes("rate limit") ||
         msg.includes("too many requests") ||
         msg.includes("busy") ||
-        msg.includes("all providers for model") ||
+        /all providers for model .+ are busy right now/i.test(msg) ||
         msg.includes("free usage limit reached") ||
         msg.includes("free usage exceeded");
     const isFalseUsedUp = msg.includes("nothing is used up");
@@ -960,6 +960,10 @@ export function createFallback(ctx, opts) {
             // proactive switch must live here.
             const sid = e?.sessionID;
             const st = sid ? sessions.get(sid) : undefined;
+            if (st && !st.switched && key && key !== "unknown") {
+                st.seat = key;
+                st.originalSeat = key;
+            }
             if (st && !st.preempted) {
                 const limits = await getModelLimits(ctx);
                 const limit = limits.get(key);
@@ -1100,12 +1104,24 @@ export function createFallback(ctx, opts) {
                 };
                 // V2 AgentEditor contract: `update(id, fn)` is an upsert that receives a
                 // mutable draft (creating the agent when absent) and ignores the return.
+                // Preserve existing built-in fields (especially `mode` on `build`!).
                 apply.call(editor, id, (draft) => {
                     const d = draft ?? {};
-                    d.name = agent.name;
-                    d.description = agent.description;
-                    d.mode = agent.mode;
-                    d.model = agent.model;
+                    if (!existingObj) {
+                        d.name = agent.name;
+                        d.description = agent.description;
+                        d.mode = agent.mode;
+                    }
+                    else {
+                        if (!d.name)
+                            d.name = agent.name;
+                        if (!d.description)
+                            d.description = agent.description;
+                        if (!d.mode)
+                            d.mode = agent.mode;
+                    }
+                    if (!d.model)
+                        d.model = agent.model;
                     return d;
                 });
             }
