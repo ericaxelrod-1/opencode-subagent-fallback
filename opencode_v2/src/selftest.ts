@@ -4,7 +4,7 @@
  *   cd <repo>/opencode_v2 && npx tsc && node dist/selftest.js
  */
 import { mkdirSync, rmSync, writeFileSync } from "node:fs"
-import { createFallback, classifyError, checkCompletion, contextTokens, lastAssistantInTurn, assistantText, __resetStateForTests, __setModelLimitsForTests, Breaker, CONTINUE_PROMPT, parseQuotaBlockedUntil } from "./core.js"
+import { createFallback, classifyError, checkCompletion, contextTokens, lastAssistantInTurn, assistantText, __resetStateForTests, __setModelLimitsForTests, __runSweepForTests, Breaker, CONTINUE_PROMPT, parseQuotaBlockedUntil } from "./core.js"
 
 let failures = 0
 function check(name: string, cond: boolean, extra?: string): void {
@@ -317,6 +317,27 @@ async function main(): Promise<void> {
       capturedAgents["build"](existingBuild)
       check("installAgents preserves primary mode on existing built-in agent", existingBuild.mode === "primary", JSON.stringify(existingBuild))
     }
+  }
+
+  console.log("\nwatchdog vs. retry sleep:")
+  {
+    __resetStateForTests()
+    let interrupted = 0
+    const ctxWd: any = {
+      session: {
+        switchModel: async () => {},
+        context: async () => ({ data: [] }),
+        interrupt: async () => { interrupted += 1; return {} },
+        prompt: async () => ({}),
+      },
+      event: { subscribe: () => ({ [Symbol.asyncIterator]: async function* () {} }) },
+    }
+    const fbWd = createFallback(ctxWd, { providerDefaults: { ...STICKY_FAST, stickyMs: 180000, rateLimitMs: 60000 }, watchdog: { enabled: true, firstTokenMs: 1000, stallTimeoutMs: 1000, sweepIntervalMs: 5000, debounceMs: 5000, compactionDebounceMs: 120000 } })
+    await fbWd.onPrompt({ sessionID: "ses_wd", agent: "developer", prompt: { text: "ok lets test" } })
+    const evWd: any = { sessionID: "ses_wd", agent: "developer", model: { providerID: "unorouter-custom", id: "glm-5.3:free" }, error: { message: 'All providers for model "glm-5.3:free" are busy right now' }, attempt: 0, decision: { retry: true, delay: 0 } }
+    await fbWd.onRetry(evWd)
+    await __runSweepForTests(ctxWd, {} as any)
+    check("sticky retry defers watchdog during retry sleep", evWd.decision?.retry === true && evWd.decision?.delay === 60000 && interrupted === 0, `interrupted=${interrupted}`)
   }
 
   console.log("\nselftest result:")

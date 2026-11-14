@@ -26,7 +26,7 @@
  *   7. cleanup, telemetry, redaction
  */
 
-import { readFileSync, statSync } from "node:fs"
+import { appendFileSync, mkdirSync, readFileSync, statSync } from "node:fs"
 import { join } from "node:path"
 import { homedir } from "node:os"
 
@@ -877,9 +877,7 @@ export interface Fallback {
 export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallback {
   const fbOpts = resolveOpts(opts ?? loadRoot(ctx))
 
-  const log = (msg: string): void => {
-    try { console.error(`[subagent-fallback] ${redact(msg)}`) } catch { /* logging must never break the hook */ }
-  }
+  const log = logLine
 
   // ── retry hook: classify → sticky / failover / force retry (step 1 + step 2) ──
   const onRetry = async (e: any): Promise<void> => {
@@ -935,6 +933,7 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
           (typeof fbOpts.interceptor?.defaultRateLimitMs === "number" ? fbOpts.interceptor.defaultRateLimitMs : undefined) ??
           backoffFor(e.attempt ?? 0)
         e.decision = { retry: true, delay }
+        deferLiveness(e.sessionID, delay)
         return
       }
 
@@ -1039,6 +1038,7 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
       // next model's cooldown — 0 when it has no active rate-limit window (O1:
       // sticky failover writes one durable model-switched artifact).
       e.decision = { retry: true, delay: nextCooldownMs(target, st) }
+      deferLiveness(e.sessionID, e.decision.delay)
       log(`retry ${e.sessionID}: switched ${failedKey} -> ${target} (${c.cls}, attempt ${e.attempt})`)
     } catch (err: any) {
       log(`retry hook failed, keeping default decision: ${String(err)}`)
@@ -1059,19 +1059,22 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
       if (explicitAgent && explicitAgent !== st.agent) {
         st.agent = explicitAgent
       }
-      // Reset per-turn state here — NOT on idle (idle does not run after
-      // failure/interrupt). The full fallback chain is restored every turn so
-      // candidates consumed by a previous turn's failover walk do not leak.
-      st.chain = fallbackChainFor(ctx, st.agent).length > 0 ? fallbackChainFor(ctx, st.agent) : [HARDCODED_FALLBACK_TARGET]
-      st.tried = new Set<string>()
-      st.switched = false
-      st.rePrompts += 1
-      st.stickyUntil = 0
-      st.preempted = false
-      st.originalSeat = st.seat
-      st.hops = 0
-      st.outProviders = new Set<string>()
-      st.deadline = now() + (fbOpts.budgets?.fallbackBudgetMs ?? fbOpts.budgetMs ?? DEFAULTS.budgets.fallbackBudgetMs)
+      const isRecovery = recoveringSessions.delete(sid)
+      if (!isRecovery) {
+        // Reset per-turn state here — NOT on idle (idle does not run after
+        // failure/interrupt). The full fallback chain is restored every turn so
+        // candidates consumed by a previous turn's failover walk do not leak.
+        st.chain = fallbackChainFor(ctx, st.agent).length > 0 ? fallbackChainFor(ctx, st.agent) : [HARDCODED_FALLBACK_TARGET]
+        st.tried = new Set<string>()
+        st.switched = false
+        st.rePrompts += 1
+        st.stickyUntil = 0
+        st.preempted = false
+        st.originalSeat = st.seat
+        st.hops = 0
+        st.outProviders = new Set<string>()
+        st.deadline = now() + (fbOpts.budgets?.fallbackBudgetMs ?? fbOpts.budgetMs ?? DEFAULTS.budgets.fallbackBudgetMs)
+      }
       const p: any = e?.prompt ?? {}
       st.prompt = {
         text: typeof p?.text === "string" ? p.text : typeof e?.text === "string" ? e.text : typeof e?.input?.text === "string" ? e.input.text : undefined,
@@ -1445,11 +1448,13 @@ interface LivenessState {
   firstTokenReceived: boolean
   firstTokenMs: number
   stallTimeoutMs: number
+  pausedUntil?: number
   onStall?: (sid: string) => void | Promise<void>
 }
 
 const liveness = new Map<string, LivenessState>()
 const abortStampedAt = new Map<string, number>()
+const recoveringSessions = new Set<string>()
 const watchdogTimers = new Set<ReturnType<typeof setInterval>>()
 
 function registerLiveness(sid: string, l: LivenessState): void { liveness.set(sid, l) }
@@ -1469,7 +1474,15 @@ function ensureLiveness(ctx: any, sid: string, opts: FallbackOptions): LivenessS
   }
   return l
 }
-function stampAlive(sid: string): void { const l = liveness.get(sid); if (l) l.lastPartAt = now() }
+function stampAlive(sid: string): void { const l = liveness.get(sid); if (l) { l.lastPartAt = now(); l.pausedUntil = undefined } }
+function deferLiveness(sid: string, delayMs: number | undefined): void {
+  const l = liveness.get(sid)
+  if (!l || typeof delayMs !== "number" || !Number.isFinite(delayMs) || delayMs <= 0) return
+  const until = now() + delayMs
+  l.pausedUntil = until
+  l.startedAt = until
+  l.lastPartAt = until
+}
 function consumeOurAbort(sid: string): boolean { const t = abortStampedAt.get(sid); if (t === undefined) return false; abortStampedAt.delete(sid); return true }
 function armOurAbort(sid: string, t: number = now()): void { abortStampedAt.set(sid, t) }
 
@@ -1553,25 +1566,46 @@ async function recover(ctx: any, sid: string): Promise<void> {
     if (check.ok) return // turn actually completed while we were away
     const st = sessions.get(sid)
     const payload = st?.prompt
-    await ctx?.session?.prompt?.({
-      sessionID: sid,
-      text: payload?.text ?? CONTINUE_PROMPT,
-      files: payload?.files,
-      agents: payload?.agents,
-      skills: payload?.skills,
-      delivery: payload?.delivery,
-      resume: payload?.resume ?? true,
-    })
+    recoveringSessions.add(sid)
+    try {
+      await ctx?.session?.prompt?.({
+        sessionID: sid,
+        text: payload?.text ?? CONTINUE_PROMPT,
+        files: payload?.files,
+        agents: payload?.agents,
+        skills: payload?.skills,
+        delivery: payload?.delivery,
+        resume: payload?.resume ?? true,
+      })
+    } finally {
+      recoveringSessions.delete(sid)
+    }
   } catch { /* re-prompt is best effort */ }
 }
 
+const LOG_DIR = join(homedir(), ".local", "share", "opencode", "log")
+const LOG_FILE = join(LOG_DIR, "fallback.log")
+
 function logLine(msg: string): void {
-  try { console.error(`[subagent-fallback] ${msg}`) } catch { /* never break the sweep */ }
+  const clean = redact(msg)
+  const line = `${new Date().toISOString()} [subagent-fallback] ${clean}\n`
+  try {
+    appendFileSync(LOG_FILE, line, "utf8")
+  } catch {
+    try {
+      mkdirSync(LOG_DIR, { recursive: true })
+      appendFileSync(LOG_FILE, line, "utf8")
+    } catch { /* logging must never break the hook or sweep */ }
+  }
+  if (process.env.OPENCODE_FALLBACK_CONSOLE === "1") {
+    try { console.error(`[subagent-fallback] ${clean}`) } catch { /* best effort */ }
+  }
 }
 
 async function runSweep(ctx: any, opts: FallbackOptions): Promise<void> {
   const t = now()
   for (const [sid, l] of [...liveness]) {
+    if (l.pausedUntil !== undefined && t < l.pausedUntil) continue
     const seenFirstToken = l.firstTokenReceived
     const silence = t - (seenFirstToken ? l.lastPartAt : l.startedAt)
     const limit = seenFirstToken ? l.stallTimeoutMs : l.firstTokenMs
@@ -1579,6 +1613,7 @@ async function runSweep(ctx: any, opts: FallbackOptions): Promise<void> {
     // Recovery: interrupt, then verify via context before re-prompting.
     // (Single recovery path — l.onStall IS the recovery; do not call recover
     // twice for the same stall.)
+    logLine(`watchdog ${sid}: ${seenFirstToken ? "stall" : "first-token"} timeout (${silence}ms >= ${limit}ms) — interrupting`)
     armOurAbort(sid, t)
     try { await ctx?.session?.interrupt?.({ sessionID: sid }) } catch { /* best effort */ }
     l.startedAt = t
@@ -1617,3 +1652,4 @@ function redact(s: string): string {
 }
 
 export const __redactForTests = redact
+export const __runSweepForTests = runSweep

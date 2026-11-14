@@ -25,7 +25,7 @@
  *   6. compaction/overflow pre-emption
  *   7. cleanup, telemetry, redaction
  */
-import { readFileSync, statSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 const QUOTA_THRESHOLD_MS = 600000; // 10 min: beyond this a rate limit is a quota, not a blip
@@ -729,12 +729,7 @@ async function pickLargeContext(ctx, st, agent, anchorKey) {
 }
 export function createFallback(ctx, opts) {
     const fbOpts = resolveOpts(opts ?? loadRoot(ctx));
-    const log = (msg) => {
-        try {
-            console.error(`[subagent-fallback] ${redact(msg)}`);
-        }
-        catch { /* logging must never break the hook */ }
-    };
+    const log = logLine;
     // ── retry hook: classify → sticky / failover / force retry (step 1 + step 2) ──
     const onRetry = async (e) => {
         try {
@@ -780,6 +775,7 @@ export function createFallback(ctx, opts) {
                     (typeof fbOpts.interceptor?.defaultRateLimitMs === "number" ? fbOpts.interceptor.defaultRateLimitMs : undefined) ??
                     backoffFor(e.attempt ?? 0);
                 e.decision = { retry: true, delay };
+                deferLiveness(e.sessionID, delay);
                 return;
             }
             // Wall-clock failover budget (HIGH, requirement: fallbackBudgetMs /
@@ -882,6 +878,7 @@ export function createFallback(ctx, opts) {
             // next model's cooldown — 0 when it has no active rate-limit window (O1:
             // sticky failover writes one durable model-switched artifact).
             e.decision = { retry: true, delay: nextCooldownMs(target, st) };
+            deferLiveness(e.sessionID, e.decision.delay);
             log(`retry ${e.sessionID}: switched ${failedKey} -> ${target} (${c.cls}, attempt ${e.attempt})`);
         }
         catch (err) {
@@ -903,19 +900,22 @@ export function createFallback(ctx, opts) {
             if (explicitAgent && explicitAgent !== st.agent) {
                 st.agent = explicitAgent;
             }
-            // Reset per-turn state here — NOT on idle (idle does not run after
-            // failure/interrupt). The full fallback chain is restored every turn so
-            // candidates consumed by a previous turn's failover walk do not leak.
-            st.chain = fallbackChainFor(ctx, st.agent).length > 0 ? fallbackChainFor(ctx, st.agent) : [HARDCODED_FALLBACK_TARGET];
-            st.tried = new Set();
-            st.switched = false;
-            st.rePrompts += 1;
-            st.stickyUntil = 0;
-            st.preempted = false;
-            st.originalSeat = st.seat;
-            st.hops = 0;
-            st.outProviders = new Set();
-            st.deadline = now() + (fbOpts.budgets?.fallbackBudgetMs ?? fbOpts.budgetMs ?? DEFAULTS.budgets.fallbackBudgetMs);
+            const isRecovery = recoveringSessions.delete(sid);
+            if (!isRecovery) {
+                // Reset per-turn state here — NOT on idle (idle does not run after
+                // failure/interrupt). The full fallback chain is restored every turn so
+                // candidates consumed by a previous turn's failover walk do not leak.
+                st.chain = fallbackChainFor(ctx, st.agent).length > 0 ? fallbackChainFor(ctx, st.agent) : [HARDCODED_FALLBACK_TARGET];
+                st.tried = new Set();
+                st.switched = false;
+                st.rePrompts += 1;
+                st.stickyUntil = 0;
+                st.preempted = false;
+                st.originalSeat = st.seat;
+                st.hops = 0;
+                st.outProviders = new Set();
+                st.deadline = now() + (fbOpts.budgets?.fallbackBudgetMs ?? fbOpts.budgetMs ?? DEFAULTS.budgets.fallbackBudgetMs);
+            }
             const p = e?.prompt ?? {};
             st.prompt = {
                 text: typeof p?.text === "string" ? p.text : typeof e?.text === "string" ? e.text : typeof e?.input?.text === "string" ? e.input.text : undefined,
@@ -1301,6 +1301,7 @@ export function checkCompletion(msgs) {
 }
 const liveness = new Map();
 const abortStampedAt = new Map();
+const recoveringSessions = new Set();
 const watchdogTimers = new Set();
 function registerLiveness(sid, l) { liveness.set(sid, l); }
 function unregisterLiveness(sid) { liveness.delete(sid); }
@@ -1319,8 +1320,19 @@ function ensureLiveness(ctx, sid, opts) {
     }
     return l;
 }
-function stampAlive(sid) { const l = liveness.get(sid); if (l)
-    l.lastPartAt = now(); }
+function stampAlive(sid) { const l = liveness.get(sid); if (l) {
+    l.lastPartAt = now();
+    l.pausedUntil = undefined;
+} }
+function deferLiveness(sid, delayMs) {
+    const l = liveness.get(sid);
+    if (!l || typeof delayMs !== "number" || !Number.isFinite(delayMs) || delayMs <= 0)
+        return;
+    const until = now() + delayMs;
+    l.pausedUntil = until;
+    l.startedAt = until;
+    l.lastPartAt = until;
+}
 function consumeOurAbort(sid) { const t = abortStampedAt.get(sid); if (t === undefined)
     return false; abortStampedAt.delete(sid); return true; }
 function armOurAbort(sid, t = now()) { abortStampedAt.set(sid, t); }
@@ -1410,27 +1422,51 @@ async function recover(ctx, sid) {
             return; // turn actually completed while we were away
         const st = sessions.get(sid);
         const payload = st?.prompt;
-        await ctx?.session?.prompt?.({
-            sessionID: sid,
-            text: payload?.text ?? CONTINUE_PROMPT,
-            files: payload?.files,
-            agents: payload?.agents,
-            skills: payload?.skills,
-            delivery: payload?.delivery,
-            resume: payload?.resume ?? true,
-        });
+        recoveringSessions.add(sid);
+        try {
+            await ctx?.session?.prompt?.({
+                sessionID: sid,
+                text: payload?.text ?? CONTINUE_PROMPT,
+                files: payload?.files,
+                agents: payload?.agents,
+                skills: payload?.skills,
+                delivery: payload?.delivery,
+                resume: payload?.resume ?? true,
+            });
+        }
+        finally {
+            recoveringSessions.delete(sid);
+        }
     }
     catch { /* re-prompt is best effort */ }
 }
+const LOG_DIR = join(homedir(), ".local", "share", "opencode", "log");
+const LOG_FILE = join(LOG_DIR, "fallback.log");
 function logLine(msg) {
+    const clean = redact(msg);
+    const line = `${new Date().toISOString()} [subagent-fallback] ${clean}\n`;
     try {
-        console.error(`[subagent-fallback] ${msg}`);
+        appendFileSync(LOG_FILE, line, "utf8");
     }
-    catch { /* never break the sweep */ }
+    catch {
+        try {
+            mkdirSync(LOG_DIR, { recursive: true });
+            appendFileSync(LOG_FILE, line, "utf8");
+        }
+        catch { /* logging must never break the hook or sweep */ }
+    }
+    if (process.env.OPENCODE_FALLBACK_CONSOLE === "1") {
+        try {
+            console.error(`[subagent-fallback] ${clean}`);
+        }
+        catch { /* best effort */ }
+    }
 }
 async function runSweep(ctx, opts) {
     const t = now();
     for (const [sid, l] of [...liveness]) {
+        if (l.pausedUntil !== undefined && t < l.pausedUntil)
+            continue;
         const seenFirstToken = l.firstTokenReceived;
         const silence = t - (seenFirstToken ? l.lastPartAt : l.startedAt);
         const limit = seenFirstToken ? l.stallTimeoutMs : l.firstTokenMs;
@@ -1439,6 +1475,7 @@ async function runSweep(ctx, opts) {
         // Recovery: interrupt, then verify via context before re-prompting.
         // (Single recovery path — l.onStall IS the recovery; do not call recover
         // twice for the same stall.)
+        logLine(`watchdog ${sid}: ${seenFirstToken ? "stall" : "first-token"} timeout (${silence}ms >= ${limit}ms) — interrupting`);
         armOurAbort(sid, t);
         try {
             await ctx?.session?.interrupt?.({ sessionID: sid });
@@ -1476,3 +1513,4 @@ function redact(s) {
     return s.replace(/sk-[A-Za-z0-9_-]+/g, "[REDACTED]").replace(/bearer\s+[A-Za-z0-9._-]+/gi, "bearer [REDACTED]");
 }
 export const __redactForTests = redact;
+export const __runSweepForTests = runSweep;
