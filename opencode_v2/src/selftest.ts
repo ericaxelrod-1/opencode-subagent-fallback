@@ -501,6 +501,26 @@ async function main(): Promise<void> {
     check("runSweep does not interrupt session waiting on active running tool", interrupted === 0 && prompted === 0, JSON.stringify({ interrupted, prompted }))
   }
 
+  console.log("\nmulti-pass cycling (V1 parity):")
+  {
+    __resetStateForTests()
+    const switchesMp: any[] = []
+    // Chain for developer (no fallback.json): a/small -> a/large -> a/mid
+    // With breaker threshold=5, transient 429s exhaust pass 1 and start pass 2.
+    const fbMp = createFallback(mockCtx(switchesMp), {
+      budgets: { fallbackBudgetMs: 600000, maxIterations: 10, compactionRatio: 0.4, charsPerToken: 4, quotaThresholdMs: 600000, maxCooldownSleepMs: 30000 },
+      providerDefaults: { ...STICKY_FAST, breaker: { threshold: 5, cooldownMs: 60000, maxCooldownMs: 300000 } },
+    })
+    await fbMp.onRetry({ sessionID: "ses_mp", agent: "developer", model: { providerID: "a", id: "small" }, error: { statusCode: 429 }, attempt: 0, decision: { retry: false } })
+    await fbMp.onRetry({ sessionID: "ses_mp", agent: "developer", model: { providerID: "a", id: "large" }, error: { statusCode: 429 }, attempt: 1, decision: { retry: false } })
+    await fbMp.onRetry({ sessionID: "ses_mp", agent: "developer", model: { providerID: "a", id: "mid" }, error: { statusCode: 429 }, attempt: 2, decision: { retry: false } })
+    check(
+      "transient failures cycle into a 2nd pass instead of stopping after pass 1",
+      switchesMp.length === 3 && switchesMp[0]?.model?.id === "large" && switchesMp[1]?.model?.id === "mid" && switchesMp[2]?.model?.id === "small",
+      JSON.stringify(switchesMp),
+    )
+  }
+
   console.log("\nselftest result:")
   if (failures === 0) { console.log("  all checks passed\n"); return }
   console.log(`  ${failures} check(s) failed\n`)

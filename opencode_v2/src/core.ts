@@ -662,6 +662,8 @@ interface SessionState {
   seat: string | undefined
   /** Seat + switched fallbacks for this turn — never revisit. */
   tried: Set<string>
+  /** Models permanently excluded for this turn (quota/auth/forbidden/not-found/overflow). */
+  permFailed?: Set<string>
   switched: boolean
   /** Sticky window end for the current seat's transient failures. */
   stickyUntil: number
@@ -738,6 +740,7 @@ function stateFor(ctx: any, sid: string, seat?: string, agent?: string, opts?: F
     chain,
     seat: seat ?? undefined,
     tried: new Set<string>(seat ? [seat] : []),
+    permFailed: new Set<string>(),
     switched: false,
     stickyUntil: 0,
     rateLimitMs: {},
@@ -774,6 +777,7 @@ function resetTurnState(st: SessionState, ctx: any, agent?: string): void {
   const chain = fallbackChainFor(ctx, agent ?? st.agent)
   st.chain = chain.length > 0 ? chain : [HARDCODED_FALLBACK_TARGET]
   st.tried = new Set<string>()
+  st.permFailed = new Set<string>()
   st.switched = false
   st.stickyUntil = 0
   st.preempted = false
@@ -1040,10 +1044,20 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         return
       }
 
-      // P1 #6: a model that just failed is never revisited later in this turn's
-      // failover walk — mark it tried (the switch below drops the switched target
-      // from the chain; the failed seat is covered by the tried set).
+      // P1 #6: a model that just failed is never revisited later in this pass —
+      // mark it tried; non-transient failures (quota/auth/forbidden/not-found/
+      // context_too_large) are also permanently excluded for this turn.
       st.tried.add(failedKey)
+      if (
+        c.cls === "quota" ||
+        c.cls === "auth" ||
+        c.cls === "forbidden" ||
+        c.cls === "model_not_found" ||
+        c.cls === "context_too_large"
+      ) {
+        st.permFailed = st.permFailed ?? new Set<string>()
+        st.permFailed.add(failedKey)
+      }
       let next = nextCandidate(st)
       // R4/F2: validate the candidate against the live model catalog; drop
       // unavailable entries instead of throwing inside the hook.
@@ -1052,6 +1066,18 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         if (limits.size > 0 && !limits.has(next)) {
           st.chain = st.chain.filter((m) => m !== next)
           next = nextCandidate(st)
+        }
+      }
+      // Multi-pass cycling (V1 parity): if the first pass exhausted all
+      // candidates via transient failures and budget/hops remain, reset
+      // `st.tried` (preserving `st.permFailed`) and start a fresh pass.
+      if (!next && st.chain.length > 0) {
+        const retryableInChain = st.chain.filter((m) => !st.permFailed?.has(m))
+        if (retryableInChain.length > 0) {
+          st.tried = new Set<string>(st.permFailed ?? [])
+          if (retryableInChain.length > 1) st.tried.add(failedKey)
+          next = nextCandidate(st)
+          if (next) log(`retry ${e.sessionID}: starting new pass over fallback chain -> ${next}`)
         }
       }
       if (!next) {
@@ -1114,7 +1140,6 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         await ctx?.session?.switchModel({ sessionID: e.sessionID, model: toModelRef(target) })
         st.switched = true
         st.tried.add(target)
-        st.chain = st.chain.filter((m) => m !== target)
         st.stickyUntil = 0
         st.seat = target
       })
