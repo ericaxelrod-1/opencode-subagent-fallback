@@ -611,6 +611,7 @@ function stateFor(ctx, sid, seat, agent, opts) {
         agent: agent ?? "developer",
         deadline: now() + (opts?.budgets?.fallbackBudgetMs ?? opts?.budgetMs ?? DEFAULTS.budgets.fallbackBudgetMs),
         hops: 0,
+        lastAttempt: -1,
     };
     sessions.set(sid, st);
     return st;
@@ -620,6 +621,24 @@ function enqueue(sid, fn) {
     const result = prev.then(fn, fn);
     locks.set(sid, result.catch(() => undefined));
     return result;
+}
+/**
+ * Reset the per-turn failover state: the candidate chain, the tried set, the
+ * sticky window, the wall-clock deadline and the pass counter. Called from the
+ * `prompt` hook (primary turn boundary) and from the retry hook when the
+ * server's attempt counter reveals a turn boundary the prompt hook missed.
+ */
+function resetTurnState(st, ctx, agent) {
+    const chain = fallbackChainFor(ctx, agent ?? st.agent);
+    st.chain = chain.length > 0 ? chain : [HARDCODED_FALLBACK_TARGET];
+    st.tried = new Set();
+    st.switched = false;
+    st.stickyUntil = 0;
+    st.preempted = false;
+    st.originalSeat = st.seat;
+    st.hops = 0;
+    st.outProviders = new Set();
+    st.deadline = now() + (st.opts?.budgets?.fallbackBudgetMs ?? st.opts?.budgetMs ?? DEFAULTS.budgets.fallbackBudgetMs);
 }
 function nextCandidate(st) {
     for (const m of st.chain) {
@@ -749,12 +768,65 @@ export function createFallback(ctx, opts) {
                 log(`retry ${e.sessionID}: fatal — keeping default decision`);
                 return;
             }
-            if (spent) {
+            const existingSt = sessions.get(e.sessionID);
+            const existingBudget = existingSt?.opts?.budgets ?? fbOpts.budgets;
+            const existingMaxIters = existingBudget?.maxIterations ?? fbOpts.maxIterations ?? DEFAULTS.budgets.maxIterations;
+            const canRollover = spent &&
+                !!existingSt &&
+                now() < existingSt.deadline &&
+                existingSt.hops < existingMaxIters &&
+                typeof ctx?.session?.prompt === "function";
+            if (spent && !canRollover) {
                 log(`retry ${e.sessionID}: attempt budget (${MAX_RETRY_ATTEMPTS}) spent — keeping default decision`);
+                unregisterLiveness(e.sessionID);
                 return;
             }
+            const scheduleRolloverIfSpent = () => {
+                if (!canRollover || e?.decision?.retry !== true)
+                    return;
+                const delay = typeof e.decision.delay === "number" && Number.isFinite(e.decision.delay) && e.decision.delay > 0 ? e.decision.delay : 0;
+                e.decision = { retry: false };
+                const sid = e.sessionID;
+                const stCur = sessions.get(sid);
+                if (!stCur)
+                    return;
+                stCur.lastAttempt = -1;
+                deferLiveness(sid, delay + 50);
+                log(`retry ${sid}: attempt budget (${MAX_RETRY_ATTEMPTS}) spent — rolling over to fresh step in ${delay}ms`);
+                const timer = setTimeout(() => {
+                    rolloverTimers.delete(timer);
+                    const payload = stCur.prompt;
+                    recoveringSessions.add(sid);
+                    Promise.resolve(ctx?.session?.prompt?.({
+                        sessionID: sid,
+                        text: payload?.text ?? CONTINUE_PROMPT,
+                        files: payload?.files,
+                        agents: payload?.agents,
+                        skills: payload?.skills,
+                        delivery: payload?.delivery,
+                        resume: payload?.resume ?? true,
+                    })).catch(() => undefined).finally(() => { recoveringSessions.delete(sid); });
+                }, Math.max(50, delay));
+                timer.unref?.();
+                rolloverTimers.add(timer);
+            };
             const failedKey = fmtModel(e?.model);
             const st = stateFor(ctx, e.sessionID, failedKey, e?.agent, fbOpts);
+            // Turn detection (live-test fix): the server's `attempt` counter resets to
+            // 0 on every new turn. A non-increasing attempt therefore means a NEW
+            // turn started. The `prompt` hook is the primary per-turn reset, but it
+            // does not fire for every turn boundary (watchdog re-prompts, server-side
+            // turn restarts, resumed sessions). Without this, `st.deadline` stays
+            // expired from a previous turn and the wall-clock budget immediately
+            // blocks all failover — observed live as "wall-clock budget exhausted"
+            // on the very first retry of every new turn.
+            const attempt = typeof e?.attempt === "number" ? e.attempt : undefined;
+            if (attempt !== undefined && attempt <= st.lastAttempt) {
+                log(`retry ${e.sessionID}: new turn detected (attempt ${attempt} <= ${st.lastAttempt}) — resetting per-turn state`);
+                resetTurnState(st, ctx, st.agent);
+            }
+            if (attempt !== undefined)
+                st.lastAttempt = attempt;
             // D1: transient-class failure opens (or holds open) the sticky window; a
             // rate-limit (429) counts as transient when its retryAfterMs fits the
             // sticky window and the attempt budget is not spent. The window is
@@ -763,7 +835,7 @@ export function createFallback(ctx, opts) {
             const isTransientClass = c.cls === "transient";
             if (isTransientClass) {
                 const windowMs = (fbOpts.providers[providerOf(failedKey)] ?? fbOpts.providerDefaults)?.stickyMs ?? DEFAULTS.providerDefaults.stickyMs;
-                if (now() >= st.stickyUntil)
+                if (st.stickyUntil === 0)
                     st.stickyUntil = now() + windowMs;
             }
             if (isTransientClass && now() < st.stickyUntil) {
@@ -776,6 +848,7 @@ export function createFallback(ctx, opts) {
                     backoffFor(e.attempt ?? 0);
                 e.decision = { retry: true, delay };
                 deferLiveness(e.sessionID, delay);
+                scheduleRolloverIfSpent();
                 return;
             }
             // Wall-clock failover budget (HIGH, requirement: fallbackBudgetMs /
@@ -786,11 +859,15 @@ export function createFallback(ctx, opts) {
             const budgetMs = budget?.fallbackBudgetMs ?? fbOpts.budgetMs ?? DEFAULTS.budgets.fallbackBudgetMs;
             const maxIters = budget?.maxIterations ?? fbOpts.maxIterations ?? DEFAULTS.budgets.maxIterations;
             if (now() >= st.deadline) {
-                log(`retry ${e.sessionID}: wall-clock budget (${budgetMs}ms) exhausted — keeping default decision`);
+                log(`retry ${e.sessionID}: wall-clock budget (${budgetMs}ms) exhausted — stopping retries`);
+                e.decision = { retry: false };
+                unregisterLiveness(e.sessionID);
                 return;
             }
             if (st.hops >= maxIters) {
-                log(`retry ${e.sessionID}: failover pass budget (${maxIters}) spent — keeping default decision`);
+                log(`retry ${e.sessionID}: failover pass budget (${maxIters}) spent — stopping retries`);
+                e.decision = { retry: false };
+                unregisterLiveness(e.sessionID);
                 return;
             }
             // P1 #6: a model that just failed is never revisited later in this turn's
@@ -879,6 +956,7 @@ export function createFallback(ctx, opts) {
             // sticky failover writes one durable model-switched artifact).
             e.decision = { retry: true, delay: nextCooldownMs(target, st) };
             deferLiveness(e.sessionID, e.decision.delay);
+            scheduleRolloverIfSpent();
             log(`retry ${e.sessionID}: switched ${failedKey} -> ${target} (${c.cls}, attempt ${e.attempt})`);
         }
         catch (err) {
@@ -905,16 +983,15 @@ export function createFallback(ctx, opts) {
                 // Reset per-turn state here — NOT on idle (idle does not run after
                 // failure/interrupt). The full fallback chain is restored every turn so
                 // candidates consumed by a previous turn's failover walk do not leak.
-                st.chain = fallbackChainFor(ctx, st.agent).length > 0 ? fallbackChainFor(ctx, st.agent) : [HARDCODED_FALLBACK_TARGET];
-                st.tried = new Set();
-                st.switched = false;
                 st.rePrompts += 1;
-                st.stickyUntil = 0;
-                st.preempted = false;
-                st.originalSeat = st.seat;
-                st.hops = 0;
-                st.outProviders = new Set();
-                st.deadline = now() + (fbOpts.budgets?.fallbackBudgetMs ?? fbOpts.budgetMs ?? DEFAULTS.budgets.fallbackBudgetMs);
+                resetTurnState(st, ctx, st.agent);
+            }
+            else {
+                // A watchdog recovery re-prompt continues the SAME logical failover
+                // walk: keep the chain, the tried set and the wall-clock deadline, but
+                // clear the attempt counter so the retry hook does not mistake the
+                // server's fresh attempt numbering for a new user turn.
+                st.lastAttempt = -1;
             }
             const p = e?.prompt ?? {};
             st.prompt = {
@@ -937,6 +1014,14 @@ export function createFallback(ctx, opts) {
     // ── context hook: per-model semantic options via e.options keyed on e.model (D6) ──
     const onContext = async (e) => {
         try {
+            const sid = e?.sessionID ?? e?.input?.sessionID;
+            const l = sid ? liveness.get(sid) : undefined;
+            if (l) {
+                const t = now();
+                l.startedAt = t;
+                l.lastPartAt = t;
+                l.pausedUntil = undefined;
+            }
             const model = e?.model ?? e?.input?.model;
             const key = fmtModel(model);
             const fbFile = loadFallbackFile(ctx);
@@ -958,7 +1043,6 @@ export function createFallback(ctx, opts) {
             // via the catch-all large-context chain before the request that would
             // overflow. Overflow bypasses the retry hook (blueprint §5.2/O3), so the
             // proactive switch must live here.
-            const sid = e?.sessionID;
             const st = sid ? sessions.get(sid) : undefined;
             if (st && !st.switched && key && key !== "unknown") {
                 st.seat = key;
@@ -994,6 +1078,8 @@ export function createFallback(ctx, opts) {
     const onIdle = async (e) => {
         try {
             const sid = e?.sessionID;
+            if (sid)
+                unregisterLiveness(sid);
             const st = sid ? sessions.get(sid) : undefined;
             if (!st || !st.switched)
                 return;
@@ -1201,6 +1287,9 @@ export function createFallback(ctx, opts) {
                 watchdogTimer = undefined;
             }
             watchdogTimers.clear();
+            for (const t of rolloverTimers)
+                clearTimeout(t);
+            rolloverTimers.clear();
             sessions.clear();
             return;
         },
@@ -1253,15 +1342,19 @@ export function contextTokens(m) {
     const cacheRead = typeof cache?.read === "number" ? cache.read : 0;
     return input + cacheRead;
 }
+function isSkippableTurnMeta(m) {
+    const t = m?.type;
+    if (t === "model-switched" || t === "agent-switched" || t === "idle" || t === "synthetic")
+        return true;
+    return t === "user" && m?.text === CONTINUE_PROMPT;
+}
 /** Last assistant message of the current turn, skipping synthetic continuations / model switches (D3). */
 export function lastAssistantInTurn(msgs) {
     for (let i = msgs.length - 1; i >= 0; i--) {
         const m = msgs[i];
         if (m?.type === "assistant")
             return m;
-        if (m?.type === "model-switched")
-            continue;
-        if (m?.type === "user" && m?.text === CONTINUE_PROMPT)
+        if (isSkippableTurnMeta(m))
             continue;
         break;
     }
@@ -1272,9 +1365,7 @@ export function assistantText(msgs) {
     const parts = [];
     for (let i = msgs.length - 1; i >= 0; i--) {
         const m = msgs[i];
-        if (m?.type === "model-switched")
-            continue;
-        if (m?.type === "user" && m?.text === CONTINUE_PROMPT)
+        if (isSkippableTurnMeta(m))
             continue;
         if (m?.type !== "assistant")
             break;
@@ -1287,6 +1378,16 @@ export function checkCompletion(msgs) {
     const m = lastAssistantInTurn(msgs);
     if (!m)
         return { ok: false, finish: undefined, text: "", tokens: 0, error: undefined, reason: "no-assistant" };
+    let trailingIdleSucceeded = false;
+    for (let i = msgs.length - 1; i >= 0; i--) {
+        const item = msgs[i];
+        if (item === m)
+            break;
+        if (item?.type === "idle" && item?.outcome === "succeeded") {
+            trailingIdleSucceeded = true;
+            break;
+        }
+    }
     const text = assistantText(msgs);
     const content = Array.isArray(m?.content) ? m.content : [];
     const toolParts = content.some((c) => c?.type === "tool");
@@ -1296,12 +1397,13 @@ export function checkCompletion(msgs) {
         !busy &&
         m.finish !== "length" &&
         m.finish !== "error" &&
-        ((text ?? "").trim().length > 0 || toolParts);
+        ((text ?? "").trim().length > 0 || toolParts || trailingIdleSucceeded);
     return { ok, finish: m.finish, text, tokens: contextTokens(m), error: m.error };
 }
 const liveness = new Map();
 const abortStampedAt = new Map();
 const recoveringSessions = new Set();
+const rolloverTimers = new Set();
 const watchdogTimers = new Set();
 function registerLiveness(sid, l) { liveness.set(sid, l); }
 function unregisterLiveness(sid) { liveness.delete(sid); }
@@ -1414,12 +1516,26 @@ async function handleEvent(ctx, ev, opts) {
         }
     }
 }
+function hasActiveToolPart(msgs) {
+    const m = lastAssistantInTurn(msgs);
+    const content = Array.isArray(m?.content) ? m.content : [];
+    return content.some((c) => c?.type === "tool" &&
+        (c?.state?.status === "streaming" || c?.state?.status === "running" || c?.state?.status === "pending"));
+}
+function isTerminalIdleMessage(msgs) {
+    const last = msgs.length > 0 ? msgs[msgs.length - 1] : undefined;
+    return last?.type === "idle" && (last?.outcome === "succeeded" || last?.outcome === "failed");
+}
 async function recover(ctx, sid) {
     try {
         const msgs = await readFlatMessages(ctx, sid);
         const check = checkCompletion(msgs);
-        if (check.ok)
-            return; // turn actually completed while we were away
+        if (check.ok || isTerminalIdleMessage(msgs)) {
+            unregisterLiveness(sid);
+            return; // turn actually completed or terminally failed while we were away
+        }
+        if (hasActiveToolPart(msgs))
+            return; // waiting on an active tool / subagent call
         const st = sessions.get(sid);
         const payload = st?.prompt;
         recoveringSessions.add(sid);
@@ -1472,6 +1588,21 @@ async function runSweep(ctx, opts) {
         const limit = seenFirstToken ? l.stallTimeoutMs : l.firstTokenMs;
         if (silence < limit)
             continue;
+        // Inspect session messages before interrupting: if the turn already reached
+        // a terminal idle state (succeeded/failed) or is actively waiting on a
+        // running tool (e.g. a subagent), do not interrupt it.
+        const msgs = await readFlatMessages(ctx, sid);
+        if (msgs.length > 0) {
+            if (isTerminalIdleMessage(msgs) || checkCompletion(msgs).ok) {
+                unregisterLiveness(sid);
+                continue;
+            }
+            if (hasActiveToolPart(msgs)) {
+                l.startedAt = t;
+                l.lastPartAt = t;
+                continue;
+            }
+        }
         // Recovery: interrupt, then verify via context before re-prompting.
         // (Single recovery path — l.onStall IS the recovery; do not call recover
         // twice for the same stall.)

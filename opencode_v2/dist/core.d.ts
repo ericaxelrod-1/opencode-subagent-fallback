@@ -177,6 +177,8 @@ export declare function lastAssistantInTurn(msgs: any[]): any | undefined;
 /** Assistant text of the turn's last assistant message, concatenating across Ms.Continue splits (D3). */
 export declare function assistantText(msgs: any[]): string;
 export declare function checkCompletion(msgs: any[]): CompletionCheck;
+declare function runSweep(ctx: any, opts: FallbackOptions): Promise<void>;
 declare function redact(s: string): string;
 export declare const __redactForTests: typeof redact;
+export declare const __runSweepForTests: typeof runSweep;
 export {};

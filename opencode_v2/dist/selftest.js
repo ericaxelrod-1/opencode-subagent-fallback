@@ -181,10 +181,10 @@ async function main() {
     {
         const switches = [];
         const fb = createFallback(mockCtx(switches), { budgets: { fallbackBudgetMs: 0, maxIterations: 10, compactionRatio: 0.4, charsPerToken: 4, quotaThresholdMs: 600000, maxCooldownSleepMs: 30000 } });
-        const ev = { sessionID: "ses_budget2", agent: "developer", model: { providerID: "p", id: "m" }, error: { statusCode: 402 }, attempt: 0, decision: { retry: false } };
+        const ev = { sessionID: "ses_budget2", agent: "developer", model: { providerID: "p", id: "m" }, error: { statusCode: 402 }, attempt: 0, decision: { retry: true, delay: 2000 } };
         await fb.onRetry(ev);
         check("exhausted wall-clock budget → no switch", switches.length === 0);
-        check("exhausted wall-clock budget → decision kept", ev.decision.retry === false);
+        check("exhausted wall-clock budget → stops OpenCode retry", ev.decision.retry === false);
     }
     {
         const switches = [];
@@ -325,6 +325,162 @@ async function main() {
         await fbWd.onRetry(evWd);
         await __runSweepForTests(ctxWd, {});
         check("sticky retry defers watchdog during retry sleep", evWd.decision?.retry === true && evWd.decision?.delay === 60000 && interrupted === 0, `interrupted=${interrupted}`);
+    }
+    {
+        __resetStateForTests();
+        const switchesExp = [];
+        const fbExp = createFallback(mockCtx(switchesExp), { providerDefaults: { ...STICKY_FAST, stickyMs: 25, rateLimitMs: 10 } });
+        await fbExp.onPrompt({ sessionID: "ses_exp", agent: "developer", prompt: { text: "go" } });
+        const ev1 = { sessionID: "ses_exp", agent: "developer", model: { providerID: "unorouter-custom", id: "glm-5.3:free" }, error: { message: 'All providers for model "glm-5.3:free" are busy right now' }, attempt: 0, decision: { retry: true, delay: 0 } };
+        await fbExp.onRetry(ev1);
+        check("first transient opens sticky window", switchesExp.length === 0 && ev1.decision?.retry === true);
+        await new Promise((r) => setTimeout(r, 35));
+        const ev2 = { sessionID: "ses_exp", agent: "developer", model: { providerID: "unorouter-custom", id: "glm-5.3:free" }, error: { message: 'All providers for model "glm-5.3:free" are busy right now' }, attempt: 1, decision: { retry: true, delay: 0 } };
+        await fbExp.onRetry(ev2);
+        check("expired sticky window fails over instead of re-arming", switchesExp.length === 1 && switchesExp[0]?.model?.id === "small", JSON.stringify(switchesExp));
+    }
+    console.log("\nturn detection (live-test fix: stale deadline blocked failover):");
+    {
+        __resetStateForTests();
+        const switchesTurn = [];
+        // A short wall-clock budget so the deadline can lapse between turns.
+        const fbTurn = createFallback(mockCtx(switchesTurn), {
+            budgets: { fallbackBudgetMs: 60, maxIterations: 10, compactionRatio: 0.4, charsPerToken: 4, quotaThresholdMs: 600000, maxCooldownSleepMs: 30000 },
+            providerDefaults: { ...STICKY_FAST },
+        });
+        // Turn 1: budget is fresh → failover happens.
+        const evT1 = { sessionID: "ses_turn", agent: "developer", model: { providerID: "a", id: "small" }, error: { statusCode: 402 }, attempt: 0, decision: { retry: false } };
+        await fbTurn.onRetry(evT1);
+        check("turn 1 fails over while the budget is fresh", switchesTurn.length === 1 && switchesTurn[0]?.model?.id === "large", JSON.stringify(switchesTurn));
+        // Let the turn's wall-clock budget lapse.
+        await new Promise((r) => setTimeout(r, 90));
+        // Turn 2: the server's attempt counter resets to 0 → new turn detected →
+        // per-turn state (incl. the deadline) is reset, so failover works again.
+        const evT2 = { sessionID: "ses_turn", agent: "developer", model: { providerID: "a", id: "small" }, error: { statusCode: 402 }, attempt: 0, decision: { retry: false } };
+        await fbTurn.onRetry(evT2);
+        check("new turn (attempt counter reset) restores the failover budget", switchesTurn.length === 2 && switchesTurn[1]?.model?.id === "large", JSON.stringify(switchesTurn));
+    }
+    {
+        __resetStateForTests();
+        const switchesSame = [];
+        const fbSame = createFallback(mockCtx(switchesSame), { providerDefaults: { ...STICKY_FAST } });
+        // Same turn: the attempt counter increases → no turn reset, the chain keeps
+        // advancing (the failed model is never revisited).
+        const evS1 = { sessionID: "ses_same", agent: "developer", model: { providerID: "a", id: "small" }, error: { statusCode: 402 }, attempt: 0, decision: { retry: false } };
+        await fbSame.onRetry(evS1);
+        const evS2 = { sessionID: "ses_same", agent: "developer", model: { providerID: "a", id: "large" }, error: { statusCode: 402 }, attempt: 1, decision: { retry: false } };
+        await fbSame.onRetry(evS2);
+        check("same turn (increasing attempt) keeps walking the chain", switchesSame.length === 2 && switchesSame[1]?.model?.id === "mid", JSON.stringify(switchesSame));
+    }
+    {
+        __resetStateForTests();
+        const switchesRo = [];
+        const promptsRo = [];
+        const ctxRo = {
+            session: {
+                switchModel: async (args) => { switchesRo.push(args); },
+                context: async () => ({ data: [] }),
+                interrupt: async () => ({}),
+                prompt: async (args) => { promptsRo.push(args); return {}; },
+            },
+            event: { subscribe: () => ({ [Symbol.asyncIterator]: async function* () { } }) },
+        };
+        const fbRo = createFallback(ctxRo, { providerDefaults: { ...STICKY_FAST } });
+        await fbRo.onPrompt({ sessionID: "ses_rollover", agent: "developer", prompt: { text: "go" } });
+        await fbRo.onRetry({ sessionID: "ses_rollover", agent: "developer", model: { providerID: "a", id: "small" }, error: { statusCode: 402 }, attempt: 0, decision: { retry: true, delay: 0 } });
+        const evRo = { sessionID: "ses_rollover", agent: "developer", model: { providerID: "a", id: "large" }, error: { statusCode: 402 }, attempt: 10, decision: { retry: true, delay: 0 } };
+        await fbRo.onRetry(evRo);
+        check("attempt 10 in active session switches + ends exhausted step", switchesRo.length === 2 && switchesRo[1]?.model?.id === "mid" && evRo.decision?.retry === false, JSON.stringify({ switchesRo, decision: evRo.decision }));
+        await new Promise((r) => setTimeout(r, 90));
+        check("rollover schedules fresh prompt to reset attempt budget", promptsRo.length === 1 && promptsRo[0]?.text === "go", JSON.stringify(promptsRo));
+        await fbRo.onPrompt({ sessionID: "ses_rollover", agent: "developer", prompt: { text: "go" } });
+        await fbRo.onRetry({ sessionID: "ses_rollover", agent: "developer", model: { providerID: "a", id: "mid" }, error: { statusCode: 402 }, attempt: 0, decision: { retry: true, delay: 0 } });
+        check("rollover preserves tried set across fresh attempt=0 step", switchesRo.length === 2, JSON.stringify(switchesRo));
+    }
+    console.log("\nwatchdog completion / idle cleanup (live-test fix):");
+    {
+        check("checkCompletion skips trailing V2 idle/outcome row", checkCompletion([
+            { type: "user", text: "reply with HELLO" },
+            { type: "assistant", content: [{ type: "text", text: "HELLO" }], time: { completed: 1 }, finish: "stop" },
+            { type: "idle", outcome: "succeeded" },
+        ]).ok);
+        check("checkCompletion accepts reasoning-only assistant when trailing idle succeeded", checkCompletion([
+            { type: "user", text: "continue" },
+            { type: "assistant", content: [{ type: "reasoning", text: "Already answered." }], time: { completed: 1 } },
+            { type: "idle", outcome: "succeeded" },
+        ]).ok);
+    }
+    {
+        __resetStateForTests();
+        let interrupted = 0;
+        let prompted = 0;
+        const ctxIdle = {
+            session: {
+                switchModel: async () => { },
+                context: async () => ({
+                    data: [
+                        { type: "user", text: "reply" },
+                        { type: "assistant", content: [{ type: "text", text: "HELLO" }], time: { completed: 1 }, finish: "stop" },
+                        { type: "idle", outcome: "succeeded" },
+                    ],
+                }),
+                interrupt: async () => { interrupted += 1; return {}; },
+                prompt: async () => { prompted += 1; return {}; },
+            },
+            event: { subscribe: () => ({ [Symbol.asyncIterator]: async function* () { } }) },
+        };
+        const fbIdle = createFallback(ctxIdle, { providerDefaults: { ...STICKY_FAST }, watchdog: { enabled: true, firstTokenMs: 10, stallTimeoutMs: 10, sweepIntervalMs: 5000, debounceMs: 5000, compactionDebounceMs: 120000 } });
+        await fbIdle.onPrompt({ sessionID: "ses_done", agent: "developer", prompt: { text: "reply" } });
+        await fbIdle.onIdle({ sessionID: "ses_done" });
+        await new Promise((r) => setTimeout(r, 25));
+        await __runSweepForTests(ctxIdle, {});
+        check("onIdle unregisters liveness so sweep never interrupts finished session", interrupted === 0 && prompted === 0, JSON.stringify({ interrupted, prompted }));
+        // Even if onIdle was missed, runSweep/recover unregisters liveness on completed turns without interrupting.
+        await fbIdle.onPrompt({ sessionID: "ses_missed_idle", agent: "developer", prompt: { text: "reply" } });
+        await new Promise((r) => setTimeout(r, 25));
+        await __runSweepForTests(ctxIdle, {});
+        await __runSweepForTests(ctxIdle, {});
+        check("runSweep unregisters liveness on completed turn without interrupting", interrupted === 0 && prompted === 0, JSON.stringify({ interrupted, prompted }));
+        // Terminal idle { outcome: "failed" } (e.g. ModelUnavailableError) must not be re-prompted.
+        const ctxFailed = {
+            session: {
+                switchModel: async () => { },
+                context: async () => ({
+                    data: [
+                        { type: "user", text: "spawn" },
+                        { type: "idle", outcome: "failed", error: { type: "provider.no-route", message: "Model unavailable" } },
+                    ],
+                }),
+                interrupt: async () => { interrupted += 1; return {}; },
+                prompt: async () => { prompted += 1; return {}; },
+            },
+            event: { subscribe: () => ({ [Symbol.asyncIterator]: async function* () { } }) },
+        };
+        const fbFailed = createFallback(ctxFailed, { providerDefaults: { ...STICKY_FAST }, watchdog: { enabled: true, firstTokenMs: 10, stallTimeoutMs: 10, sweepIntervalMs: 5000, debounceMs: 5000, compactionDebounceMs: 120000 } });
+        await fbFailed.onPrompt({ sessionID: "ses_failed_idle", agent: "developer", prompt: { text: "spawn" } });
+        await new Promise((r) => setTimeout(r, 25));
+        await __runSweepForTests(ctxFailed, {});
+        check("runSweep unregisters liveness on terminal idle failed without re-prompting", interrupted === 0 && prompted === 0, JSON.stringify({ interrupted, prompted }));
+        // Active running tool (e.g. parent waiting on subagent) must not be interrupted by watchdog.
+        const ctxTool = {
+            session: {
+                switchModel: async () => { },
+                context: async () => ({
+                    data: [
+                        { type: "user", text: "invoke subagent" },
+                        { type: "assistant", content: [{ type: "tool", name: "subagent", state: { status: "running" } }] },
+                    ],
+                }),
+                interrupt: async () => { interrupted += 1; return {}; },
+                prompt: async () => { prompted += 1; return {}; },
+            },
+            event: { subscribe: () => ({ [Symbol.asyncIterator]: async function* () { } }) },
+        };
+        const fbTool = createFallback(ctxTool, { providerDefaults: { ...STICKY_FAST }, watchdog: { enabled: true, firstTokenMs: 10, stallTimeoutMs: 10, sweepIntervalMs: 5000, debounceMs: 5000, compactionDebounceMs: 120000 } });
+        await fbTool.onPrompt({ sessionID: "ses_tool_wait", agent: "developer", prompt: { text: "invoke subagent" } });
+        await new Promise((r) => setTimeout(r, 25));
+        await __runSweepForTests(ctxTool, {});
+        check("runSweep does not interrupt session waiting on active running tool", interrupted === 0 && prompted === 0, JSON.stringify({ interrupted, prompted }));
     }
     console.log("\nselftest result:");
     if (failures === 0) {
