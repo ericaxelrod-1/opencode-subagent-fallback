@@ -846,7 +846,8 @@ export function createFallback(ctx, opts) {
                 const delay = e?.error?.retryAfterMs ??
                     (typeof rateLimitedUntil === "number" && rateLimitedUntil > now() ? rateLimitedUntil - now() : undefined) ??
                     (typeof pcfg?.rateLimitMs === "number" ? pcfg.rateLimitMs : undefined) ??
-                    (typeof fbOpts.interceptor?.defaultRateLimitMs === "number" ? fbOpts.interceptor.defaultRateLimitMs : undefined) ??
+                    (typeof pcfg?.retryDelayMs === "number" ? pcfg.retryDelayMs : undefined) ??
+                    (typeof fbOpts.interceptor?.fastRetryMs === "number" ? fbOpts.interceptor.fastRetryMs : undefined) ??
                     backoffFor(e.attempt ?? 0);
                 e.decision = { retry: true, delay };
                 deferLiveness(e.sessionID, delay);

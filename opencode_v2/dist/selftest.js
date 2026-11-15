@@ -106,6 +106,10 @@ async function main() {
         check("sticky retry forces retry on same model", ev.decision.retry === true);
         check("sticky retry honors retryAfterMs as delay", ev.decision.delay === 60000);
         check("sticky retry does not switch", switches.length === 0);
+        const fbFastSticky = createFallback(mockCtx(switches), { providerDefaults: { ...STICKY_FAST, stickyMs: 60000, retryDelayMs: 5000 } });
+        const evFast = { sessionID: "ses_sticky_fast", agent: "developer", model: { providerID: "zai", id: "glm-4.7-flash" }, error: { statusCode: 429 }, attempt: 0, decision: { retry: false } };
+        await fbFastSticky.onRetry(evFast);
+        check("sticky retry without retryAfterMs/rateLimitMs uses retryDelayMs (not 60s defaultRateLimitMs)", evFast.decision.retry === true && evFast.decision.delay === 5000, JSON.stringify(evFast.decision));
     }
     // 3. Quota (402) → failover to hardcoded target + forced retry.
     {
