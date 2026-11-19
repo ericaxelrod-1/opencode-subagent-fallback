@@ -4,7 +4,7 @@
  *   cd <repo>/opencode_v2 && npx tsc && node dist/selftest.js
  */
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { createFallback, classifyError, checkCompletion, contextTokens, lastAssistantInTurn, assistantText, __resetStateForTests, __setModelLimitsForTests, __setKnownModelsForTests, __runSweepForTests, isModelAvailable, markModelUnavailable, Breaker, CONTINUE_PROMPT, parseQuotaBlockedUntil } from "./core.js";
+import { createFallback, classifyError, checkCompletion, contextTokens, lastAssistantInTurn, assistantText, __resetStateForTests, __setModelLimitsForTests, __setKnownModelsForTests, __runSweepForTests, isModelAvailable, markModelUnavailable, isModelHealthyNow, Breaker, CONTINUE_PROMPT, parseQuotaBlockedUntil } from "./core.js";
 let failures = 0;
 function check(name, cond, extra) {
     if (cond)
@@ -368,6 +368,22 @@ async function main() {
     }
     {
         __resetStateForTests();
+        const switchesLong = [];
+        const fbLong = createFallback(mockCtx(switchesLong), {
+            budgets: { fallbackBudgetMs: 50, maxIterations: 10, compactionRatio: 0.4, charsPerToken: 4, quotaThresholdMs: 600000, maxCooldownSleepMs: 30000 },
+            providerDefaults: { ...STICKY_FAST },
+        });
+        // Session is created and runs for longer than fallbackBudgetMs without failures
+        await fbLong.onPrompt({ sessionID: "ses_long", agent: "developer", prompt: { text: "start long task" } });
+        await new Promise((r) => setTimeout(r, 80));
+        // First failure occurs 80ms later with OpenCode initial attempt=2 (hop 0):
+        // Failover budget must NOT be treated as expired from the prompt time!
+        const evLong = { sessionID: "ses_long", agent: "developer", model: { providerID: "a", id: "small" }, error: { statusCode: 402 }, attempt: 2, decision: { retry: false } };
+        await fbLong.onRetry(evLong);
+        check("first failure after long execution (> budgetMs) initializes fresh budget and switches", switchesLong.length === 1 && switchesLong[0]?.model?.id === "large", JSON.stringify(switchesLong));
+    }
+    {
+        __resetStateForTests();
         const switchesSame = [];
         const fbSame = createFallback(mockCtx(switchesSame), { providerDefaults: { ...STICKY_FAST } });
         // Same turn: the attempt counter increases → no turn reset, the chain keeps
@@ -511,8 +527,10 @@ async function main() {
         check("isModelAvailable is case insensitive", isModelAvailable("OpenRouter/Google/Gemini-2.5-Flash"));
         check("isModelAvailable matches short id", isModelAvailable("claude-3-7-sonnet"));
         check("isModelAvailable rejects dead model", !isModelAvailable("openrouter/xingchen-agi/xing4.0-29b-a4b:free"));
+        check("isModelHealthyNow returns true for available unblocked model", isModelHealthyNow("openrouter/google/gemini-2.5-flash"));
         markModelUnavailable("anthropic/claude-3-7-sonnet");
         check("markModelUnavailable removes from catalog", !isModelAvailable("anthropic/claude-3-7-sonnet"));
+        check("isModelHealthyNow returns false for unavailable model", !isModelHealthyNow("anthropic/claude-3-7-sonnet"));
         __setKnownModelsForTests(undefined);
     }
     console.log("\ninstallAgents catalog durability:");

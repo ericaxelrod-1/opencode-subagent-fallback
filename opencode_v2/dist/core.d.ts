@@ -150,6 +150,7 @@ export declare function __setKnownModelsForTests(models: string[] | undefined): 
 export declare function initCatalog(ctx: any): Promise<void>;
 export declare function isModelAvailable(model: any): boolean;
 export declare function markModelUnavailable(model: any): void;
+export declare function isModelHealthyNow(model: any): boolean;
 export interface Fallback {
     ctx: any;
     opts: FallbackOptions;
@@ -169,6 +170,7 @@ export interface Fallback {
     classifyError: typeof classifyError;
     isModelAvailable: typeof isModelAvailable;
     markModelUnavailable: typeof markModelUnavailable;
+    isModelHealthyNow: typeof isModelHealthyNow;
 }
 export declare function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallback;
 export interface CompletionCheck {

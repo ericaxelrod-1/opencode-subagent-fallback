@@ -561,9 +561,13 @@ const MAX_RETRY_ATTEMPTS = 10;
 /** Step 1 of the port: a single hardcoded fallback target. Full per-agent chains land in sequencing step 2. */
 const HARDCODED_FALLBACK_TARGET = "opencode/beam-free";
 function pickDefaultAvailableModel() {
-    if (isModelAvailable(HARDCODED_FALLBACK_TARGET))
+    if (isModelHealthyNow(HARDCODED_FALLBACK_TARGET))
         return HARDCODED_FALLBACK_TARGET;
     if (knownModelsCache && knownModelsCache.size > 0) {
+        for (const m of knownModelsCache) {
+            if (m.includes("/") && isModelHealthyNow(m))
+                return m;
+        }
         for (const m of knownModelsCache) {
             if (m.includes("/"))
                 return m;
@@ -683,6 +687,18 @@ export function markModelUnavailable(model) {
     }
     logLine(`model marked unavailable: ${key}`);
 }
+export function isModelHealthyNow(model) {
+    if (!isModelAvailable(model))
+        return false;
+    const key = fmtModel(model);
+    const blockedUntil = blockedUntilByModel.get(key);
+    if (blockedUntil !== undefined && blockedUntil > now())
+        return false;
+    const b = breakersByModel.get(key);
+    if (b?.isOpen)
+        return false;
+    return true;
+}
 function fallbackChainFor(ctx, agent) {
     const fbFile = loadFallbackFile(ctx);
     const list = [];
@@ -750,6 +766,7 @@ function resetTurnState(st, ctx, agent) {
     st.preempted = false;
     st.originalSeat = st.seat;
     st.hops = 0;
+    st.lastAttempt = -1;
     st.outProviders = new Set();
     st.deadline = now() + (st.opts?.budgets?.fallbackBudgetMs ?? st.opts?.budgetMs ?? DEFAULTS.budgets.fallbackBudgetMs);
 }
@@ -888,7 +905,7 @@ export function createFallback(ctx, opts) {
             const existingMaxIters = existingBudget?.maxIterations ?? fbOpts.maxIterations ?? DEFAULTS.budgets.maxIterations;
             const canRollover = spent &&
                 !!existingSt &&
-                now() < existingSt.deadline &&
+                (existingSt.hops === 0 || now() < existingSt.deadline) &&
                 existingSt.hops < existingMaxIters &&
                 typeof ctx?.session?.prompt === "function";
             if (spent && !canRollover) {
@@ -927,6 +944,9 @@ export function createFallback(ctx, opts) {
             };
             const failedKey = fmtModel(e?.model);
             const st = stateFor(ctx, e.sessionID, failedKey, e?.agent, fbOpts);
+            const budget = st.opts?.budgets ?? fbOpts.budgets;
+            const budgetMs = budget?.fallbackBudgetMs ?? fbOpts.budgetMs ?? DEFAULTS.budgets.fallbackBudgetMs;
+            const maxIters = budget?.maxIterations ?? fbOpts.maxIterations ?? DEFAULTS.budgets.maxIterations;
             // Turn detection (live-test fix): the server's `attempt` counter resets to
             // 0 on every new turn. A non-increasing attempt therefore means a NEW
             // turn started. The `prompt` hook is the primary per-turn reset, but it
@@ -936,12 +956,20 @@ export function createFallback(ctx, opts) {
             // blocks all failover — observed live as "wall-clock budget exhausted"
             // on the very first retry of every new turn.
             const attempt = typeof e?.attempt === "number" ? e.attempt : undefined;
-            if (attempt !== undefined && attempt <= st.lastAttempt) {
-                log(`retry ${e.sessionID}: new turn detected (attempt ${attempt} <= ${st.lastAttempt}) — resetting per-turn state`);
-                resetTurnState(st, ctx, st.agent);
+            if (attempt !== undefined && (st.lastAttempt === -1 || attempt <= st.lastAttempt)) {
+                if (st.lastAttempt !== -1) {
+                    log(`retry ${e.sessionID}: new turn detected (attempt ${attempt} <= ${st.lastAttempt}) — resetting per-turn state`);
+                    resetTurnState(st, ctx, st.agent);
+                }
             }
             if (attempt !== undefined)
                 st.lastAttempt = attempt;
+            // Fresh failure sequence: if no failover hops have occurred yet (st.hops === 0),
+            // ensure the wall-clock deadline starts from THIS failure sequence rather than
+            // an expired timestamp from session creation or earlier execution.
+            if (st.hops === 0) {
+                st.deadline = now() + budgetMs;
+            }
             // D1: transient-class failure opens (or holds open) the sticky window; a
             // rate-limit (429) counts as transient when its retryAfterMs fits the
             // sticky window and the attempt budget is not spent. The window is
@@ -971,9 +999,6 @@ export function createFallback(ctx, opts) {
             // maxIterations): ceiling for this turn's failover walk plus a cap on the
             // number of full passes over the chain. Checked before spending another
             // attempt on a candidate.
-            const budget = st.opts?.budgets ?? fbOpts.budgets;
-            const budgetMs = budget?.fallbackBudgetMs ?? fbOpts.budgetMs ?? DEFAULTS.budgets.fallbackBudgetMs;
-            const maxIters = budget?.maxIterations ?? fbOpts.maxIterations ?? DEFAULTS.budgets.maxIterations;
             if (now() >= st.deadline) {
                 log(`retry ${e.sessionID}: wall-clock budget (${budgetMs}ms) exhausted — stopping retries`);
                 e.decision = { retry: false };
@@ -1243,6 +1268,10 @@ export function createFallback(ctx, opts) {
             if (sid)
                 unregisterLiveness(sid);
             const st = sid ? sessions.get(sid) : undefined;
+            if (st) {
+                st.hops = 0;
+                st.lastAttempt = -1;
+            }
             if (!st || !st.switched)
                 return;
             if (fbOpts.restoreOnSuccess !== true)
@@ -1435,7 +1464,7 @@ export function createFallback(ctx, opts) {
                 }
                 catch { /* best effort */ }
             }
-            const parentHealthy = parentModelKey ? isModelAvailable(parentModelKey) : false;
+            const parentHealthy = parentModelKey ? isModelHealthyNow(parentModelKey) : false;
             // Find first healthy fallback model for the agent
             const agentFb = targetAgentId ? fbFile?.agents?.[targetAgentId] : undefined;
             const fallbacks = [
@@ -1445,7 +1474,7 @@ export function createFallback(ctx, opts) {
             ];
             const healthyFallback = fallbacks
                 .map((item) => (typeof item === "string" ? item : item.model))
-                .find((m) => m && isModelAvailable(m)) ?? pickDefaultAvailableModel();
+                .find((m) => m && isModelHealthyNow(m)) ?? pickDefaultAvailableModel();
             if (!input.model) {
                 const chosenModel = parentHealthy && parentModelKey ? parentModelKey : healthyFallback;
                 input.model = toModelRef(chosenModel);
@@ -1538,6 +1567,7 @@ export function createFallback(ctx, opts) {
         classifyError,
         isModelAvailable,
         markModelUnavailable,
+        isModelHealthyNow,
     };
     startWatchdog();
     return fb;
