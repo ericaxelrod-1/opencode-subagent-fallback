@@ -145,21 +145,30 @@ export declare const CONTINUE_PROMPT = "The previous response was interrupted. C
 export declare function __resetStateForTests(): void;
 /** Test seam: inject model context limits (providerID/id -> context window). */
 export declare function __setModelLimitsForTests(limits: Record<string, number>): void;
+/** Test seam: inject known models for catalog validation tests. */
+export declare function __setKnownModelsForTests(models: string[] | undefined): void;
+export declare function initCatalog(ctx: any): Promise<void>;
+export declare function isModelAvailable(model: any): boolean;
+export declare function markModelUnavailable(model: any): void;
 export interface Fallback {
     ctx: any;
     opts: FallbackOptions;
+    initCatalog: (ctx?: any) => Promise<void>;
     onRetry: (e: any) => Promise<void>;
     onPrompt: (e: any) => Promise<void>;
     onContext: (e: any) => Promise<void>;
     onIdle: (e?: any) => Promise<void>;
     installTools: (editor: any) => void;
     installAgents: (editor: any) => Promise<void> | void;
+    onToolExecuteBefore: (e: any) => Promise<void>;
     consumeEvents: (ctx: any, signal?: AbortSignal) => Promise<void>;
     onModelRequest: (e: any) => Promise<void>;
     onHttpRequest: (e: any) => Promise<void>;
     onHttpResponse: (e: any) => Promise<void>;
     dispose: () => Promise<void> | void;
     classifyError: typeof classifyError;
+    isModelAvailable: typeof isModelAvailable;
+    markModelUnavailable: typeof markModelUnavailable;
 }
 export declare function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallback;
 export interface CompletionCheck {

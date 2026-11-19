@@ -4,7 +4,7 @@
  *   cd <repo>/opencode_v2 && npx tsc && node dist/selftest.js
  */
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { createFallback, classifyError, checkCompletion, contextTokens, lastAssistantInTurn, assistantText, __resetStateForTests, __setModelLimitsForTests, __runSweepForTests, Breaker, CONTINUE_PROMPT, parseQuotaBlockedUntil } from "./core.js";
+import { createFallback, classifyError, checkCompletion, contextTokens, lastAssistantInTurn, assistantText, __resetStateForTests, __setModelLimitsForTests, __setKnownModelsForTests, __runSweepForTests, isModelAvailable, markModelUnavailable, Breaker, CONTINUE_PROMPT, parseQuotaBlockedUntil } from "./core.js";
 let failures = 0;
 function check(name, cond, extra) {
     if (cond)
@@ -64,6 +64,8 @@ async function main() {
     t("500", { statusCode: 500 }, "provider_level");
     t("watchdog abort", { name: "WatchdogAbort" }, "transient");
     t("unexpected 418", { statusCode: 418 }, "fatal");
+    t("ModelUnavailableError -> model_not_found", { name: "ModelUnavailableError", message: "Model unavailable: openrouter/xingchen-agi/xing4.0-29b-a4b:free" }, "model_not_found");
+    t("model unavailable in message -> model_not_found", { message: "Model unavailable: some/dead-model" }, "model_not_found");
     t("V2 error.type provider.quota", { error: { type: "provider.quota", message: "quota exceeded" } }, "quota");
     t("V2 error.type context_overflow", { error: { type: "context_overflow", message: "context too large" } }, "context_too_large");
     t("V2 error.type provider.auth", { error: { type: "provider.auth" }, statusCode: 401 }, "auth");
@@ -500,6 +502,85 @@ async function main() {
         await fbMp.onRetry({ sessionID: "ses_mp", agent: "developer", model: { providerID: "a", id: "large" }, error: { statusCode: 429 }, attempt: 1, decision: { retry: false } });
         await fbMp.onRetry({ sessionID: "ses_mp", agent: "developer", model: { providerID: "a", id: "mid" }, error: { statusCode: 429 }, attempt: 2, decision: { retry: false } });
         check("transient failures cycle into a 2nd pass instead of stopping after pass 1", switchesMp.length === 3 && switchesMp[0]?.model?.id === "large" && switchesMp[1]?.model?.id === "mid" && switchesMp[2]?.model?.id === "small", JSON.stringify(switchesMp));
+    }
+    console.log("\ncatalog validation & durability:");
+    {
+        __resetStateForTests();
+        __setKnownModelsForTests(["openrouter/google/gemini-2.5-flash", "anthropic/claude-3-7-sonnet"]);
+        check("isModelAvailable matches full key", isModelAvailable("openrouter/google/gemini-2.5-flash"));
+        check("isModelAvailable is case insensitive", isModelAvailable("OpenRouter/Google/Gemini-2.5-Flash"));
+        check("isModelAvailable matches short id", isModelAvailable("claude-3-7-sonnet"));
+        check("isModelAvailable rejects dead model", !isModelAvailable("openrouter/xingchen-agi/xing4.0-29b-a4b:free"));
+        markModelUnavailable("anthropic/claude-3-7-sonnet");
+        check("markModelUnavailable removes from catalog", !isModelAvailable("anthropic/claude-3-7-sonnet"));
+        __setKnownModelsForTests(undefined);
+    }
+    console.log("\ninstallAgents catalog durability:");
+    {
+        __resetStateForTests();
+        __setKnownModelsForTests(["openrouter/google/gemini-2.5-flash", "a/arch1"]);
+        const savedAgents = new Map();
+        savedAgents.set("healthy-agent", { id: "healthy-agent", model: "openrouter/google/gemini-2.5-flash" });
+        savedAgents.set("dead-agent", { id: "dead-agent", model: "openrouter/xingchen-agi/xing4.0-29b-a4b:free" });
+        const mockEditor = {
+            list: () => Array.from(savedAgents.values()),
+            get: (id) => savedAgents.get(id),
+            update: (id, fn) => {
+                const cur = savedAgents.get(id) ?? { id };
+                const next = fn(cur) ?? cur;
+                savedAgents.set(id, next);
+            },
+        };
+        const fb = createFallback(mockCtx([]));
+        fb.installAgents(mockEditor);
+        check("installAgents preserves healthy agent model", savedAgents.get("healthy-agent")?.model === "openrouter/google/gemini-2.5-flash");
+        check("installAgents replaces dead agent model with healthy fallback", isModelAvailable(savedAgents.get("dead-agent")?.model) &&
+            !String(savedAgents.get("dead-agent")?.model?.id ?? "").includes("xing4.0"), JSON.stringify(savedAgents.get("dead-agent")));
+        __setKnownModelsForTests(undefined);
+    }
+    console.log("\nonToolExecuteBefore subagent routing & inheritance:");
+    {
+        __resetStateForTests();
+        __setKnownModelsForTests(["openrouter/google/gemini-2.5-flash", "anthropic/claude-3-7-sonnet", "openrouter/meta-llama/llama-3.3-70b-instruct"]);
+        const fb = createFallback(mockCtx([]));
+        // Parent session with healthy model
+        await fb.onPrompt({ sessionID: "ses_parent_1", agent: "orchestrator", prompt: { text: "evaluate election" } });
+        const stParent = fb.ctx; // state
+        // Simulate parent seat set to claude-3-7-sonnet
+        const fakeEv = { sessionID: "ses_parent_1", agent: "orchestrator", model: { providerID: "anthropic", id: "claude-3-7-sonnet" }, error: { statusCode: 429 }, attempt: 0, decision: { retry: false } };
+        // Call onRetry or directly test tool hook with parent session
+        const hookPayload1 = {
+            tool: "subagent",
+            sessionID: "ses_parent_1",
+            input: { agent: "developer", description: "do task" },
+        };
+        // Set parent state seat
+        await fb.onContext({ sessionID: "ses_parent_1", model: "anthropic/claude-3-7-sonnet" });
+        await fb.onToolExecuteBefore(hookPayload1);
+        check("subagent inherits healthy parent model", hookPayload1.input.model?.id === "claude-3-7-sonnet", JSON.stringify(hookPayload1.input.model));
+        // Caller passes dead model explicitly
+        const hookPayload2 = {
+            tool: "subagent",
+            sessionID: "ses_parent_2",
+            input: { agent: "developer", model: "openrouter/xingchen-agi/xing4.0-29b-a4b:free", description: "do task" },
+        };
+        await fb.onToolExecuteBefore(hookPayload2);
+        check("subagent replaces explicit dead model with healthy fallback", hookPayload2.input.model?.id !== "xing4.0-29b-a4b:free" && isModelAvailable(hookPayload2.input.model), JSON.stringify(hookPayload2.input.model));
+        __setKnownModelsForTests(undefined);
+    }
+    console.log("\nonRetry skipping dead models in chain:");
+    {
+        __resetStateForTests();
+        __setKnownModelsForTests(["a/small", "a/mid"]); // a/large is dead/unavailable
+        const switchesSkip = [];
+        const fbSkip = createFallback(mockCtx(switchesSkip), {
+            budgets: { fallbackBudgetMs: 600000, maxIterations: 10, compactionRatio: 0.4, charsPerToken: 4, quotaThresholdMs: 600000, maxCooldownSleepMs: 30000 },
+            providerDefaults: { ...STICKY_FAST, stickyMs: 0 },
+        });
+        // Failed on a/small (quota -> should fail over)
+        await fbSkip.onRetry({ sessionID: "ses_skip", agent: "developer", model: { providerID: "a", id: "small" }, error: { statusCode: 402 }, attempt: 0, decision: { retry: false } });
+        check("onRetry skips unavailable a/large and switches to a/mid", switchesSkip.length === 1 && switchesSkip[0]?.model?.id === "mid", JSON.stringify(switchesSkip));
+        __setKnownModelsForTests(undefined);
     }
     console.log("\nselftest result:");
     if (failures === 0) {

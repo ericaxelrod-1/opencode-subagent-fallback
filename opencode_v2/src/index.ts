@@ -29,6 +29,7 @@ const SubagentFallbackOpenCodePlugin = {
 
   async setup(ctx: any) {
     const fb = createFallback(ctx)
+    await fb.initCatalog(ctx)
 
     const disposals: Array<() => Promise<void> | void> = []
     const register = (r: any): (() => Promise<void> | void) => {
@@ -50,6 +51,9 @@ const SubagentFallbackOpenCodePlugin = {
     register(await ctx?.session?.hook?.("http.request", (e: any) => fb.onHttpRequest(e)))
     register(await ctx?.session?.hook?.("http.response", (e: any) => fb.onHttpResponse(e)))
 
+    if (typeof ctx?.tool?.hook === "function") {
+      register(await ctx.tool.hook("execute.before", (e: any) => fb.onToolExecuteBefore(e)))
+    }
     if (typeof ctx?.tool?.transform === "function") {
       register(await ctx.tool.transform((editor: any) => fb.installTools(editor)))
     }

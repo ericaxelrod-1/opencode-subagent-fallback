@@ -26,6 +26,7 @@ const SubagentFallbackOpenCodePlugin = {
     id: "subagent-fallback",
     async setup(ctx) {
         const fb = createFallback(ctx);
+        await fb.initCatalog(ctx);
         const disposals = [];
         const register = (r) => {
             const dispose = async () => {
@@ -45,6 +46,9 @@ const SubagentFallbackOpenCodePlugin = {
         register(await ctx?.session?.hook?.("model.request", (e) => fb.onModelRequest(e)));
         register(await ctx?.session?.hook?.("http.request", (e) => fb.onHttpRequest(e)));
         register(await ctx?.session?.hook?.("http.response", (e) => fb.onHttpResponse(e)));
+        if (typeof ctx?.tool?.hook === "function") {
+            register(await ctx.tool.hook("execute.before", (e) => fb.onToolExecuteBefore(e)));
+        }
         if (typeof ctx?.tool?.transform === "function") {
             register(await ctx.tool.transform((editor) => fb.installTools(editor)));
         }

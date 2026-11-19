@@ -119,7 +119,7 @@ function errTypeOf(err: any, status?: number): string {
   if (msg.includes("transport") || msg.includes("econnreset") || msg.includes("fetch failed") || msg.includes("socket hang up") || msg.includes("503") || msg.includes("502") || msg.includes("unavailable") || msg.includes("bad gateway")) return "provider.transport"
   if (msg.includes("timeout") || msg.includes("timed out")) return "provider.timeout"
   if (name === "ProviderAuthError") return "provider.auth"
-  if (msg.includes("model not found") || msg.includes("unknown model")) return "provider.not-found"
+  if (msg.includes("model not found") || msg.includes("unknown model") || msg.includes("model unavailable") || name === "ModelUnavailableError") return "provider.not-found"
   return "provider.internal"
 }
 
@@ -149,7 +149,17 @@ export function classifyError(err: any): Classified {
   if (type === "provider.forbidden" || type === "forbidden" || status === 403) return { cls: "forbidden", retryAfterMs, detail: "forbidden" }
   // Blueprint §5.2: cross-provider failover is required on HTTP 402 (quota).
   if (type === "provider.quota" || type === "quota" || status === 402) return { cls: "quota", retryAfterMs, detail: "quota" }
-  if (type === "provider.not-found" || type === "not-found" || status === 404 || msg.includes("model not found")) return { cls: "model_not_found", retryAfterMs, detail: "not found" }
+  if (
+    type === "provider.not-found" ||
+    type === "not-found" ||
+    status === 404 ||
+    msg.includes("model not found") ||
+    msg.includes("unknown model") ||
+    msg.includes("model unavailable") ||
+    name === "ModelUnavailableError"
+  ) {
+    return { cls: "model_not_found", retryAfterMs, detail: "not found" }
+  }
 
   if (
     type === "context_overflow" ||
@@ -648,6 +658,18 @@ const MAX_RETRY_ATTEMPTS = 10
 /** Step 1 of the port: a single hardcoded fallback target. Full per-agent chains land in sequencing step 2. */
 const HARDCODED_FALLBACK_TARGET = "opencode/beam-free"
 
+function pickDefaultAvailableModel(): string {
+  if (isModelAvailable(HARDCODED_FALLBACK_TARGET)) return HARDCODED_FALLBACK_TARGET
+  if (knownModelsCache && knownModelsCache.size > 0) {
+    for (const m of knownModelsCache) {
+      if (m.includes("/")) return m
+    }
+    const first = knownModelsCache.values().next().value
+    if (first) return first
+  }
+  return HARDCODED_FALLBACK_TARGET
+}
+
 /** Synthetic continuation injected by the server on mid-stream failure (D3). */
 export const CONTINUE_PROMPT =
   "The previous response was interrupted. Continue from where you left off without repeating completed content."
@@ -703,16 +725,102 @@ const breakersByModel = new Map<string, Breaker>()
 const blockedUntilByModel = new Map<string, number>()
 const MAX_SESSIONS = 256
 
+let modelLimitsCache: Map<string, number> | undefined
+let knownModelsCache: Set<string> | undefined
+
 export function __resetStateForTests(): void {
   sessions.clear()
   breakersByModel.clear()
   blockedUntilByModel.clear()
   modelLimitsCache = undefined
+  knownModelsCache = undefined
 }
 
 /** Test seam: inject model context limits (providerID/id -> context window). */
 export function __setModelLimitsForTests(limits: Record<string, number>): void {
   modelLimitsCache = new Map(Object.entries(limits))
+}
+
+/** Test seam: inject known models for catalog validation tests. */
+export function __setKnownModelsForTests(models: string[] | undefined): void {
+  if (!models) {
+    knownModelsCache = undefined
+    return
+  }
+  const s = new Set<string>()
+  for (const m of models) {
+    s.add(m)
+    s.add(m.toLowerCase())
+    const slash = m.indexOf("/")
+    if (slash !== -1) {
+      const id = m.slice(slash + 1)
+      s.add(id)
+      s.add(id.toLowerCase())
+    }
+  }
+  knownModelsCache = s
+}
+
+export async function initCatalog(ctx: any): Promise<void> {
+  try {
+    const res = await ctx?.model?.list?.()
+    const data = res?.data ?? res?.models ?? (Array.isArray(res) ? res : [])
+    const models = new Set<string>()
+    const limits = new Map<string, number>()
+    for (const info of Array.isArray(data) ? data : []) {
+      const p = String(info?.providerID ?? "").trim()
+      const id = String(info?.id ?? info?.modelID ?? "").trim()
+      if (p && id) {
+        const full = `${p}/${id}`
+        models.add(full)
+        models.add(full.toLowerCase())
+        models.add(id)
+        models.add(id.toLowerCase())
+        const ctx0 = info?.limit?.context
+        if (typeof ctx0 === "number") limits.set(full, ctx0)
+      } else if (id) {
+        models.add(id)
+        models.add(id.toLowerCase())
+      }
+    }
+    if (models.size > 0) {
+      knownModelsCache = models
+      modelLimitsCache = limits
+      logLine(`catalog initialized: ${models.size / 2} model variants indexed`)
+    }
+  } catch (err: any) {
+    logLine(`catalog initialization failed: ${String(err)}`)
+  }
+}
+
+export function isModelAvailable(model: any): boolean {
+  if (!model) return false
+  const key = fmtModel(model)
+  if (!key || key === "unknown" || key === "undefined") return false
+  if (!knownModelsCache || knownModelsCache.size === 0) return true
+  if (knownModelsCache.has(key) || knownModelsCache.has(key.toLowerCase())) return true
+  const slash = key.indexOf("/")
+  if (slash !== -1) {
+    const id = key.slice(slash + 1)
+    if (knownModelsCache.has(id) || knownModelsCache.has(id.toLowerCase())) return true
+  }
+  return false
+}
+
+export function markModelUnavailable(model: any): void {
+  const key = fmtModel(model)
+  if (!key) return
+  if (knownModelsCache) {
+    knownModelsCache.delete(key)
+    knownModelsCache.delete(key.toLowerCase())
+    const slash = key.indexOf("/")
+    if (slash !== -1) {
+      const id = key.slice(slash + 1)
+      knownModelsCache.delete(id)
+      knownModelsCache.delete(id.toLowerCase())
+    }
+  }
+  logLine(`model marked unavailable: ${key}`)
 }
 
 function fallbackChainFor(ctx: any, agent?: string): string[] {
@@ -879,6 +987,7 @@ async function pickLargeContext(ctx: any, st: SessionState, agent: string | unde
     if (b?.isOpen) continue
     const bt = blockedUntilByModel.get(m)
     if (bt !== undefined && bt > now()) continue
+    if (!isModelAvailable(m)) continue
     const fits = await contextFits(ctx, st, m)
     if (!fits) continue
     return m
@@ -891,18 +1000,22 @@ async function pickLargeContext(ctx: any, st: SessionState, agent: string | unde
 export interface Fallback {
   ctx: any
   opts: FallbackOptions
+  initCatalog: (ctx?: any) => Promise<void>
   onRetry: (e: any) => Promise<void>
   onPrompt: (e: any) => Promise<void>
   onContext: (e: any) => Promise<void>
   onIdle: (e?: any) => Promise<void>
   installTools: (editor: any) => void
   installAgents: (editor: any) => Promise<void> | void
+  onToolExecuteBefore: (e: any) => Promise<void>
   consumeEvents: (ctx: any, signal?: AbortSignal) => Promise<void>
   onModelRequest: (e: any) => Promise<void>
   onHttpRequest: (e: any) => Promise<void>
   onHttpResponse: (e: any) => Promise<void>
   dispose: () => Promise<void> | void
   classifyError: typeof classifyError
+  isModelAvailable: typeof isModelAvailable
+  markModelUnavailable: typeof markModelUnavailable
 }
 
 export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallback {
@@ -1059,15 +1172,16 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         st.permFailed = st.permFailed ?? new Set<string>()
         st.permFailed.add(failedKey)
       }
+      if (c.cls === "model_not_found") {
+        markModelUnavailable(failedKey)
+      }
+
       let next = nextCandidate(st)
-      // R4/F2: validate the candidate against the live model catalog; drop
-      // unavailable entries instead of throwing inside the hook.
-      if (next) {
-        const limits = await getModelLimits(ctx)
-        if (limits.size > 0 && !limits.has(next)) {
-          st.chain = st.chain.filter((m) => m !== next)
-          next = nextCandidate(st)
-        }
+      // R4/F2: validate candidate against catalog; skip unavailable models
+      while (next && !isModelAvailable(next)) {
+        st.chain = st.chain.filter((m) => m !== next)
+        st.tried.add(next)
+        next = nextCandidate(st)
       }
       // Multi-pass cycling (V1 parity): if the first pass exhausted all
       // candidates via transient failures and budget/hops remain, reset
@@ -1135,15 +1249,39 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
       }
 
       // O6: switchModel may throw (model unavailable / provider unauthenticated);
-      // the hook must never propagate — fall through with the default decision.
-      await enqueue(e.sessionID, async () => {
-        if (!st.switched) st.originalSeat = st.seat
-        await ctx?.session?.switchModel({ sessionID: e.sessionID, model: toModelRef(target) })
-        st.switched = true
-        st.tried.add(target)
-        st.stickyUntil = 0
-        st.seat = target
-      })
+      // the hook must never propagate — try next candidates if switch fails.
+      let switchSucceeded = false
+      while (target && !switchSucceeded) {
+        const candidate = target
+        try {
+          await enqueue(e.sessionID, async () => {
+            if (!st.switched) st.originalSeat = st.seat
+            await ctx?.session?.switchModel({ sessionID: e.sessionID, model: toModelRef(candidate) })
+            st.switched = true
+            st.tried.add(candidate)
+            st.stickyUntil = 0
+            st.seat = candidate
+          })
+          switchSucceeded = true
+        } catch (switchErr: any) {
+          log(`switchModel to ${candidate} failed: ${String(switchErr)} — marking unavailable`)
+          markModelUnavailable(candidate)
+          st.tried.add(candidate)
+          target = undefined
+          let alt = nextCandidate(st)
+          while (alt && !isModelAvailable(alt)) {
+            st.chain = st.chain.filter((m) => m !== alt)
+            st.tried.add(alt)
+            alt = nextCandidate(st)
+          }
+          if (alt) target = alt
+        }
+      }
+
+      if (!switchSucceeded || !target) {
+        log(`retry ${e.sessionID}: switchModel failed and no fallback candidate left — keeping default decision`)
+        return
+      }
       st.hops += 1
 
       // Always re-decide after switching: the failed model's Retry-After is
@@ -1333,7 +1471,7 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
   }
 
   // ── agents: upsert missing fallback agents via AgentEditor.update (F1, R9) ──
-  const installAgents = async (editor: any): Promise<void> => {
+  const installAgents = (editor: any): void => {
     try {
       const apply = editor?.update ?? editor?.modify
       if (typeof apply !== "function") return
@@ -1348,24 +1486,52 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         "tester",
         "orchestrator",
       ]
-      for (const id of [...new Set(wanted)]) {
+
+      const existingList = typeof editor?.list === "function" ? editor.list() : []
+      const existingMap = new Map<string, any>()
+      if (Array.isArray(existingList)) {
+        for (const ag of existingList) {
+          const id = ag?.id ?? ag?.name
+          if (id) existingMap.set(id, ag)
+        }
+      }
+
+      const allIds = [...new Set([...wanted, ...existingMap.keys()])]
+
+      for (const id of allIds) {
         const agentFb = fbFile?.agents?.[id]
         const fallbacks = [
           ...((agentFb?.fallback ?? []) as Array<FallbackEntry | string>),
           ...((agentFb?.largeContextFallback ?? []) as Array<FallbackEntry | string>),
           ...((fbFile?.defaultFallback ?? []) as Array<FallbackEntry | string>),
         ]
-        const model = fallbacks.map((e) => (typeof e === "string" ? e : e.model)).find((m) => m) ?? HARDCODED_FALLBACK_TARGET
-        // Guard: never clobber an agent the operator configured with its own model.
-        const existing = typeof editor?.get === "function" ? editor.get(id) : undefined
+        const fallbackCandidates = fallbacks
+          .map((e) => (typeof e === "string" ? e : e.model))
+          .filter((m): m is string => typeof m === "string" && m.length > 0)
+        const healthyFallback = fallbackCandidates.find((m) => isModelAvailable(m)) ?? pickDefaultAvailableModel()
+
+        const existing = existingMap.get(id) ?? (typeof editor?.get === "function" ? editor.get(id) : undefined)
         const existingObj = existing && typeof existing === "object" ? existing : undefined
-        if (existingObj && (existingObj as any).model) continue
+
+        const currentModelKey = existingObj?.model ? fmtModel(existingObj.model) : undefined
+        const currentModelHealthy = currentModelKey ? isModelAvailable(currentModelKey) : false
+
+        // Guard: if operator configured an agent with an available, working model, leave it alone.
+        if (existingObj && currentModelKey && currentModelHealthy) {
+          continue
+        }
+
+        if (existingObj && currentModelKey && !currentModelHealthy) {
+          log(`agent '${id}' model '${currentModelKey}' is unavailable in catalog — replacing with healthy fallback '${healthyFallback}'`)
+        }
+
         const agent: any = {
           name: id,
-          description: `Fallback agent registered by opencode-subagent-fallback (${id})`,
-          mode: id === "compaction" ? "primary" : "subagent",
-          model: toModelRef(model),
+          description: existingObj?.description ?? `Fallback agent registered by opencode-subagent-fallback (${id})`,
+          mode: id === "compaction" ? "primary" : (existingObj?.mode ?? "subagent"),
+          model: toModelRef(healthyFallback),
         }
+
         // V2 AgentEditor contract: `update(id, fn)` is an upsert that receives a
         // mutable draft (creating the agent when absent) and ignores the return.
         // Preserve existing built-in fields (especially `mode` on `build`!).
@@ -1380,12 +1546,73 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
             if (!d.description) d.description = agent.description
             if (!d.mode) d.mode = agent.mode
           }
-          if (!d.model) d.model = agent.model
+          d.model = agent.model
           return d
         })
       }
     } catch (err: any) {
       log(`agent transform failed: ${String(err)}`)
+    }
+  }
+
+  // ── tool hook: execute.before for subagent / task model inheritance ─────────
+  const onToolExecuteBefore = async (e: any): Promise<void> => {
+    try {
+      const toolName = String(e?.tool ?? "").toLowerCase()
+      if (toolName !== "subagent" && toolName !== "task") return
+
+      const input = e?.input
+      if (!input || typeof input !== "object") return
+
+      const targetAgentId = String(input.agent ?? "").trim()
+      const fbFile = loadFallbackFile(ctx)
+
+      // 1. If caller explicitly passed an unavailable model, remove it
+      if (input.model) {
+        const mKey = fmtModel(input.model)
+        if (!isModelAvailable(mKey)) {
+          log(`subagent tool called with unavailable model ${mKey} — removing`)
+          delete input.model
+        }
+      }
+
+      // 2. OpenCode resolution order: ee = Z ?? X.model ?? F.model
+      // If input.model (Z) is not set:
+      // If parent has a healthy model, setting input.model ensures the subagent
+      // respects the model selected by the parent agent!
+      let parentModelKey: string | undefined
+      const parentSt = e?.sessionID ? sessions.get(e.sessionID) : undefined
+      if (parentSt?.seat && parentSt.seat !== "unknown") {
+        parentModelKey = parentSt.seat
+      } else if (parentSt?.originalSeat && parentSt.originalSeat !== "unknown") {
+        parentModelKey = parentSt.originalSeat
+      } else if (e?.sessionID && typeof ctx?.session?.get === "function") {
+        try {
+          const sess = await ctx.session.get({ sessionID: e.sessionID })
+          if (sess?.model) parentModelKey = fmtModel(sess.model)
+        } catch { /* best effort */ }
+      }
+
+      const parentHealthy = parentModelKey ? isModelAvailable(parentModelKey) : false
+
+      // Find first healthy fallback model for the agent
+      const agentFb = targetAgentId ? fbFile?.agents?.[targetAgentId] : undefined
+      const fallbacks = [
+        ...((agentFb?.fallback ?? []) as Array<FallbackEntry | string>),
+        ...((agentFb?.largeContextFallback ?? []) as Array<FallbackEntry | string>),
+        ...((fbFile?.defaultFallback ?? []) as Array<FallbackEntry | string>),
+      ]
+      const healthyFallback = fallbacks
+        .map((item) => (typeof item === "string" ? item : item.model))
+        .find((m) => m && isModelAvailable(m)) ?? pickDefaultAvailableModel()
+
+      if (!input.model) {
+        const chosenModel = parentHealthy && parentModelKey ? parentModelKey : healthyFallback
+        input.model = toModelRef(chosenModel)
+        log(`subagent tool: assigned model ${chosenModel} to '${targetAgentId}' (parent: ${parentModelKey ?? "none"}, parentHealthy: ${parentHealthy})`)
+      }
+    } catch (err: any) {
+      log(`tool execute.before hook error: ${String(err)}`)
     }
   }
 
@@ -1421,12 +1648,14 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
   const fb: Fallback = {
     ctx,
     opts: fbOpts,
+    initCatalog: async (ctxIn?: any) => initCatalog(ctxIn ?? ctx),
     onRetry,
     onPrompt,
     onContext,
     onIdle,
     installTools,
     installAgents,
+    onToolExecuteBefore,
     onModelRequest,
     onHttpRequest,
     onHttpResponse,
@@ -1453,6 +1682,8 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
       return
     },
     classifyError,
+    isModelAvailable,
+    markModelUnavailable,
   }
 
   startWatchdog()
@@ -1807,8 +2038,6 @@ async function loadModelLimits(ctx: any): Promise<Map<string, number>> {
     return new Map<string, number>()
   }
 }
-
-let modelLimitsCache: Map<string, number> | undefined
 
 async function getModelLimits(ctx: any): Promise<Map<string, number>> {
   if (!modelLimitsCache) modelLimitsCache = await loadModelLimits(ctx)

@@ -116,7 +116,7 @@ function errTypeOf(err, status) {
         return "provider.timeout";
     if (name === "ProviderAuthError")
         return "provider.auth";
-    if (msg.includes("model not found") || msg.includes("unknown model"))
+    if (msg.includes("model not found") || msg.includes("unknown model") || msg.includes("model unavailable") || name === "ModelUnavailableError")
         return "provider.not-found";
     return "provider.internal";
 }
@@ -147,8 +147,15 @@ export function classifyError(err) {
     // Blueprint §5.2: cross-provider failover is required on HTTP 402 (quota).
     if (type === "provider.quota" || type === "quota" || status === 402)
         return { cls: "quota", retryAfterMs, detail: "quota" };
-    if (type === "provider.not-found" || type === "not-found" || status === 404 || msg.includes("model not found"))
+    if (type === "provider.not-found" ||
+        type === "not-found" ||
+        status === 404 ||
+        msg.includes("model not found") ||
+        msg.includes("unknown model") ||
+        msg.includes("model unavailable") ||
+        name === "ModelUnavailableError") {
         return { cls: "model_not_found", retryAfterMs, detail: "not found" };
+    }
     if (type === "context_overflow" ||
         type === "context" ||
         status === 413 ||
@@ -553,6 +560,20 @@ export class Breaker {
 const MAX_RETRY_ATTEMPTS = 10;
 /** Step 1 of the port: a single hardcoded fallback target. Full per-agent chains land in sequencing step 2. */
 const HARDCODED_FALLBACK_TARGET = "opencode/beam-free";
+function pickDefaultAvailableModel() {
+    if (isModelAvailable(HARDCODED_FALLBACK_TARGET))
+        return HARDCODED_FALLBACK_TARGET;
+    if (knownModelsCache && knownModelsCache.size > 0) {
+        for (const m of knownModelsCache) {
+            if (m.includes("/"))
+                return m;
+        }
+        const first = knownModelsCache.values().next().value;
+        if (first)
+            return first;
+    }
+    return HARDCODED_FALLBACK_TARGET;
+}
 /** Synthetic continuation injected by the server on mid-stream failure (D3). */
 export const CONTINUE_PROMPT = "The previous response was interrupted. Continue from where you left off without repeating completed content.";
 const sessions = new Map();
@@ -562,15 +583,105 @@ const locks = new Map();
 const breakersByModel = new Map();
 const blockedUntilByModel = new Map();
 const MAX_SESSIONS = 256;
+let modelLimitsCache;
+let knownModelsCache;
 export function __resetStateForTests() {
     sessions.clear();
     breakersByModel.clear();
     blockedUntilByModel.clear();
     modelLimitsCache = undefined;
+    knownModelsCache = undefined;
 }
 /** Test seam: inject model context limits (providerID/id -> context window). */
 export function __setModelLimitsForTests(limits) {
     modelLimitsCache = new Map(Object.entries(limits));
+}
+/** Test seam: inject known models for catalog validation tests. */
+export function __setKnownModelsForTests(models) {
+    if (!models) {
+        knownModelsCache = undefined;
+        return;
+    }
+    const s = new Set();
+    for (const m of models) {
+        s.add(m);
+        s.add(m.toLowerCase());
+        const slash = m.indexOf("/");
+        if (slash !== -1) {
+            const id = m.slice(slash + 1);
+            s.add(id);
+            s.add(id.toLowerCase());
+        }
+    }
+    knownModelsCache = s;
+}
+export async function initCatalog(ctx) {
+    try {
+        const res = await ctx?.model?.list?.();
+        const data = res?.data ?? res?.models ?? (Array.isArray(res) ? res : []);
+        const models = new Set();
+        const limits = new Map();
+        for (const info of Array.isArray(data) ? data : []) {
+            const p = String(info?.providerID ?? "").trim();
+            const id = String(info?.id ?? info?.modelID ?? "").trim();
+            if (p && id) {
+                const full = `${p}/${id}`;
+                models.add(full);
+                models.add(full.toLowerCase());
+                models.add(id);
+                models.add(id.toLowerCase());
+                const ctx0 = info?.limit?.context;
+                if (typeof ctx0 === "number")
+                    limits.set(full, ctx0);
+            }
+            else if (id) {
+                models.add(id);
+                models.add(id.toLowerCase());
+            }
+        }
+        if (models.size > 0) {
+            knownModelsCache = models;
+            modelLimitsCache = limits;
+            logLine(`catalog initialized: ${models.size / 2} model variants indexed`);
+        }
+    }
+    catch (err) {
+        logLine(`catalog initialization failed: ${String(err)}`);
+    }
+}
+export function isModelAvailable(model) {
+    if (!model)
+        return false;
+    const key = fmtModel(model);
+    if (!key || key === "unknown" || key === "undefined")
+        return false;
+    if (!knownModelsCache || knownModelsCache.size === 0)
+        return true;
+    if (knownModelsCache.has(key) || knownModelsCache.has(key.toLowerCase()))
+        return true;
+    const slash = key.indexOf("/");
+    if (slash !== -1) {
+        const id = key.slice(slash + 1);
+        if (knownModelsCache.has(id) || knownModelsCache.has(id.toLowerCase()))
+            return true;
+    }
+    return false;
+}
+export function markModelUnavailable(model) {
+    const key = fmtModel(model);
+    if (!key)
+        return;
+    if (knownModelsCache) {
+        knownModelsCache.delete(key);
+        knownModelsCache.delete(key.toLowerCase());
+        const slash = key.indexOf("/");
+        if (slash !== -1) {
+            const id = key.slice(slash + 1);
+            knownModelsCache.delete(id);
+            knownModelsCache.delete(id.toLowerCase());
+        }
+    }
+    logLine(`model marked unavailable: ${key}`);
 }
 function fallbackChainFor(ctx, agent) {
     const fbFile = loadFallbackFile(ctx);
@@ -741,6 +852,8 @@ async function pickLargeContext(ctx, st, agent, anchorKey) {
         const bt = blockedUntilByModel.get(m);
         if (bt !== undefined && bt > now())
             continue;
+        if (!isModelAvailable(m))
+            continue;
         const fits = await contextFits(ctx, st, m);
         if (!fits)
             continue;
@@ -885,15 +998,15 @@ export function createFallback(ctx, opts) {
                 st.permFailed = st.permFailed ?? new Set();
                 st.permFailed.add(failedKey);
             }
+            if (c.cls === "model_not_found") {
+                markModelUnavailable(failedKey);
+            }
             let next = nextCandidate(st);
-            // R4/F2: validate the candidate against the live model catalog; drop
-            // unavailable entries instead of throwing inside the hook.
-            if (next) {
-                const limits = await getModelLimits(ctx);
-                if (limits.size > 0 && !limits.has(next)) {
-                    st.chain = st.chain.filter((m) => m !== next);
-                    next = nextCandidate(st);
-                }
+            // R4/F2: validate candidate against catalog; skip unavailable models
+            while (next && !isModelAvailable(next)) {
+                st.chain = st.chain.filter((m) => m !== next);
+                st.tried.add(next);
+                next = nextCandidate(st);
             }
             // Multi-pass cycling (V1 parity): if the first pass exhausted all
             // candidates via transient failures and budget/hops remain, reset
@@ -963,16 +1076,41 @@ export function createFallback(ctx, opts) {
                 st.outProviders.add(providerOf(failedKey));
             }
             // O6: switchModel may throw (model unavailable / provider unauthenticated);
-            // the hook must never propagate — fall through with the default decision.
-            await enqueue(e.sessionID, async () => {
-                if (!st.switched)
-                    st.originalSeat = st.seat;
-                await ctx?.session?.switchModel({ sessionID: e.sessionID, model: toModelRef(target) });
-                st.switched = true;
-                st.tried.add(target);
-                st.stickyUntil = 0;
-                st.seat = target;
-            });
+            // the hook must never propagate — try next candidates if switch fails.
+            let switchSucceeded = false;
+            while (target && !switchSucceeded) {
+                const candidate = target;
+                try {
+                    await enqueue(e.sessionID, async () => {
+                        if (!st.switched)
+                            st.originalSeat = st.seat;
+                        await ctx?.session?.switchModel({ sessionID: e.sessionID, model: toModelRef(candidate) });
+                        st.switched = true;
+                        st.tried.add(candidate);
+                        st.stickyUntil = 0;
+                        st.seat = candidate;
+                    });
+                    switchSucceeded = true;
+                }
+                catch (switchErr) {
+                    log(`switchModel to ${candidate} failed: ${String(switchErr)} — marking unavailable`);
+                    markModelUnavailable(candidate);
+                    st.tried.add(candidate);
+                    target = undefined;
+                    let alt = nextCandidate(st);
+                    while (alt && !isModelAvailable(alt)) {
+                        st.chain = st.chain.filter((m) => m !== alt);
+                        st.tried.add(alt);
+                        alt = nextCandidate(st);
+                    }
+                    if (alt)
+                        target = alt;
+                }
+            }
+            if (!switchSucceeded || !target) {
+                log(`retry ${e.sessionID}: switchModel failed and no fallback candidate left — keeping default decision`);
+                return;
+            }
             st.hops += 1;
             // Always re-decide after switching: the failed model's Retry-After is
             // meaningless once we have moved to a different model. Sleep only the
@@ -1177,7 +1315,7 @@ export function createFallback(ctx, opts) {
         }
     };
     // ── agents: upsert missing fallback agents via AgentEditor.update (F1, R9) ──
-    const installAgents = async (editor) => {
+    const installAgents = (editor) => {
         try {
             const apply = editor?.update ?? editor?.modify;
             if (typeof apply !== "function")
@@ -1193,24 +1331,43 @@ export function createFallback(ctx, opts) {
                 "tester",
                 "orchestrator",
             ];
-            for (const id of [...new Set(wanted)]) {
+            const existingList = typeof editor?.list === "function" ? editor.list() : [];
+            const existingMap = new Map();
+            if (Array.isArray(existingList)) {
+                for (const ag of existingList) {
+                    const id = ag?.id ?? ag?.name;
+                    if (id)
+                        existingMap.set(id, ag);
+                }
+            }
+            const allIds = [...new Set([...wanted, ...existingMap.keys()])];
+            for (const id of allIds) {
                 const agentFb = fbFile?.agents?.[id];
                 const fallbacks = [
                     ...(agentFb?.fallback ?? []),
                     ...(agentFb?.largeContextFallback ?? []),
                     ...(fbFile?.defaultFallback ?? []),
                 ];
-                const model = fallbacks.map((e) => (typeof e === "string" ? e : e.model)).find((m) => m) ?? HARDCODED_FALLBACK_TARGET;
-                // Guard: never clobber an agent the operator configured with its own model.
-                const existing = typeof editor?.get === "function" ? editor.get(id) : undefined;
+                const fallbackCandidates = fallbacks
+                    .map((e) => (typeof e === "string" ? e : e.model))
+                    .filter((m) => typeof m === "string" && m.length > 0);
+                const healthyFallback = fallbackCandidates.find((m) => isModelAvailable(m)) ?? pickDefaultAvailableModel();
+                const existing = existingMap.get(id) ?? (typeof editor?.get === "function" ? editor.get(id) : undefined);
                 const existingObj = existing && typeof existing === "object" ? existing : undefined;
-                if (existingObj && existingObj.model)
+                const currentModelKey = existingObj?.model ? fmtModel(existingObj.model) : undefined;
+                const currentModelHealthy = currentModelKey ? isModelAvailable(currentModelKey) : false;
+                // Guard: if operator configured an agent with an available, working model, leave it alone.
+                if (existingObj && currentModelKey && currentModelHealthy) {
                     continue;
+                }
+                if (existingObj && currentModelKey && !currentModelHealthy) {
+                    log(`agent '${id}' model '${currentModelKey}' is unavailable in catalog — replacing with healthy fallback '${healthyFallback}'`);
+                }
                 const agent = {
                     name: id,
-                    description: `Fallback agent registered by opencode-subagent-fallback (${id})`,
-                    mode: id === "compaction" ? "primary" : "subagent",
-                    model: toModelRef(model),
+                    description: existingObj?.description ?? `Fallback agent registered by opencode-subagent-fallback (${id})`,
+                    mode: id === "compaction" ? "primary" : (existingObj?.mode ?? "subagent"),
+                    model: toModelRef(healthyFallback),
                 };
                 // V2 AgentEditor contract: `update(id, fn)` is an upsert that receives a
                 // mutable draft (creating the agent when absent) and ignores the return.
@@ -1230,14 +1387,73 @@ export function createFallback(ctx, opts) {
                         if (!d.mode)
                             d.mode = agent.mode;
                     }
-                    if (!d.model)
-                        d.model = agent.model;
+                    d.model = agent.model;
                     return d;
                 });
             }
         }
         catch (err) {
             log(`agent transform failed: ${String(err)}`);
+        }
+    };
+    // ── tool hook: execute.before for subagent / task model inheritance ─────────
+    const onToolExecuteBefore = async (e) => {
+        try {
+            const toolName = String(e?.tool ?? "").toLowerCase();
+            if (toolName !== "subagent" && toolName !== "task")
+                return;
+            const input = e?.input;
+            if (!input || typeof input !== "object")
+                return;
+            const targetAgentId = String(input.agent ?? "").trim();
+            const fbFile = loadFallbackFile(ctx);
+            // 1. If caller explicitly passed an unavailable model, remove it
+            if (input.model) {
+                const mKey = fmtModel(input.model);
+                if (!isModelAvailable(mKey)) {
+                    log(`subagent tool called with unavailable model ${mKey} — removing`);
+                    delete input.model;
+                }
+            }
+            // 2. OpenCode resolution order: ee = Z ?? X.model ?? F.model
+            // If input.model (Z) is not set:
+            // If parent has a healthy model, setting input.model ensures the subagent
+            // respects the model selected by the parent agent!
+            let parentModelKey;
+            const parentSt = e?.sessionID ? sessions.get(e.sessionID) : undefined;
+            if (parentSt?.seat && parentSt.seat !== "unknown") {
+                parentModelKey = parentSt.seat;
+            }
+            else if (parentSt?.originalSeat && parentSt.originalSeat !== "unknown") {
+                parentModelKey = parentSt.originalSeat;
+            }
+            else if (e?.sessionID && typeof ctx?.session?.get === "function") {
+                try {
+                    const sess = await ctx.session.get({ sessionID: e.sessionID });
+                    if (sess?.model)
+                        parentModelKey = fmtModel(sess.model);
+                }
+                catch { /* best effort */ }
+            }
+            const parentHealthy = parentModelKey ? isModelAvailable(parentModelKey) : false;
+            // Find first healthy fallback model for the agent
+            const agentFb = targetAgentId ? fbFile?.agents?.[targetAgentId] : undefined;
+            const fallbacks = [
+                ...(agentFb?.fallback ?? []),
+                ...(agentFb?.largeContextFallback ?? []),
+                ...(fbFile?.defaultFallback ?? []),
+            ];
+            const healthyFallback = fallbacks
+                .map((item) => (typeof item === "string" ? item : item.model))
+                .find((m) => m && isModelAvailable(m)) ?? pickDefaultAvailableModel();
+            if (!input.model) {
+                const chosenModel = parentHealthy && parentModelKey ? parentModelKey : healthyFallback;
+                input.model = toModelRef(chosenModel);
+                log(`subagent tool: assigned model ${chosenModel} to '${targetAgentId}' (parent: ${parentModelKey ?? "none"}, parentHealthy: ${parentHealthy})`);
+            }
+        }
+        catch (err) {
+            log(`tool execute.before hook error: ${String(err)}`);
         }
     };
     // ── transport hooks (D6 / blueprint §5.9): model.request carries baseURL+headers ──
@@ -1278,12 +1494,14 @@ export function createFallback(ctx, opts) {
     const fb = {
         ctx,
         opts: fbOpts,
+        initCatalog: async (ctxIn) => initCatalog(ctxIn ?? ctx),
         onRetry,
         onPrompt,
         onContext,
         onIdle,
         installTools,
         installAgents,
+        onToolExecuteBefore,
         onModelRequest,
         onHttpRequest,
         onHttpResponse,
@@ -1318,6 +1536,8 @@ export function createFallback(ctx, opts) {
             return;
         },
         classifyError,
+        isModelAvailable,
+        markModelUnavailable,
     };
     startWatchdog();
     return fb;
@@ -1657,7 +1877,6 @@ async function loadModelLimits(ctx) {
         return new Map();
     }
 }
-let modelLimitsCache;
 async function getModelLimits(ctx) {
     if (!modelLimitsCache)
         modelLimitsCache = await loadModelLimits(ctx);
