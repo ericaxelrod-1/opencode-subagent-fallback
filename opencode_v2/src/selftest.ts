@@ -679,7 +679,7 @@ async function main(): Promise<void> {
     check("contextFits hydrates tokens and skips models that cannot hold conversation", switchesHydrate.length === 1 && switchesHydrate[0]?.model?.id !== "small", JSON.stringify(switchesHydrate))
   }
 
-  console.log("\nprovider tier & free quota lockouts:")
+  console.log("\nper-model quota isolation (V1 parity):")
   {
     __resetStateForTests()
     __setKnownModelsForTests([
@@ -695,17 +695,17 @@ async function main(): Promise<void> {
 
     check("all models healthy initially", isModelHealthyNow(nemotron) && isModelHealthyNow(llamaFree) && isModelHealthyNow(claudePaid))
 
-    // Classify free tier per-day quota error
+    // Classify quota error
     const err = { message: "Rate limit exceeded: free-models-per-day-high-balance", statusCode: 429 }
     const classified = classifyError(err)
-    check("classifyError identifies tier_free quota", classified.cls === "quota" && classified.quotaScope === "tier_free", JSON.stringify(classified))
+    check("classifyError identifies quota", classified.cls === "quota", JSON.stringify(classified))
 
-    // Record failure
+    // Record failure on nemotron
     recordModelFailure(nemotron, classified, fbTier.opts)
 
-    // Verify nemotron AND sibling free model are locked out, but paid claude is NOT locked out
+    // Verify nemotron is locked out, but sibling free model and paid model are NOT locked out (V1 pure per-model isolation)
     check("nemotron is locked out", !isModelHealthyNow(nemotron))
-    check("sibling free model is locked out via provider tier", !isModelHealthyNow(llamaFree))
+    check("sibling free model is NOT locked out (per-model isolation)", isModelHealthyNow(llamaFree))
     check("paid model on same provider remains healthy", isModelHealthyNow(claudePaid))
 
     __setKnownModelsForTests(undefined)

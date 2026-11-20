@@ -32,7 +32,6 @@ export interface Classified {
     detail: string;
     /** An abort WE initiated (watchdog/timer) — never a provider-health signal. */
     ours?: boolean;
-    quotaScope?: "tier_free" | "provider" | "model";
 }
 /** Error emitted when OUR watchdog aborted an attempt, so classification can tell ours from the provider's. */
 export declare const WatchdogAbort: any;
@@ -131,6 +130,8 @@ export interface FallbackOptions {
     providerDefaults: ProviderConfig;
     providers: Record<string, ProviderConfig>;
 }
+export declare function loadState(dir: string): void;
+export declare function saveState(): void;
 export declare class Breaker {
     private cfg;
     failures: number;

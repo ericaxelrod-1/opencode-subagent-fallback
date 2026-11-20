@@ -26,7 +26,7 @@
  *   7. cleanup, telemetry, redaction
  */
 
-import { appendFileSync, mkdirSync, readFileSync, statSync } from "node:fs"
+import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { homedir } from "node:os"
 
@@ -48,7 +48,6 @@ export interface Classified {
   detail: string
   /** An abort WE initiated (watchdog/timer) — never a provider-health signal. */
   ours?: boolean
-  quotaScope?: "tier_free" | "provider" | "model"
 }
 
 const QUOTA_THRESHOLD_MS = 600000 // 10 min: beyond this a rate limit is a quota, not a blip
@@ -149,25 +148,7 @@ export function classifyError(err: any): Classified {
   if (type === "provider.auth" || type === "auth" || name === "ProviderAuthError" || status === 401) return { cls: "auth", retryAfterMs, detail: "auth" }
   if (type === "provider.forbidden" || type === "forbidden" || status === 403) return { cls: "forbidden", retryAfterMs, detail: "forbidden" }
   // Blueprint §5.2: cross-provider failover is required on HTTP 402 (quota).
-  const isFreeTierQuota =
-    msg.includes("free-models-per-day") ||
-    msg.includes("openrouter_free_tier_daily") ||
-    msg.includes("free usage limit") ||
-    msg.includes("free usage exceeded")
-  const isProviderQuota =
-    msg.includes("insufficient_quota") ||
-    msg.includes("billing") ||
-    msg.includes("credit") ||
-    msg.includes("subscribe to go") ||
-    msg.includes("per-day") ||
-    msg.includes("daily")
-  const quotaScope: "tier_free" | "provider" | "model" = isFreeTierQuota
-    ? "tier_free"
-    : isProviderQuota
-    ? "provider"
-    : "model"
-
-  if (type === "provider.quota" || type === "quota" || status === 402) return { cls: "quota", retryAfterMs, detail: "quota", quotaScope }
+  if (type === "provider.quota" || type === "quota" || status === 402) return { cls: "quota", retryAfterMs, detail: "quota" }
   if (
     type === "provider.not-found" ||
     type === "not-found" ||
@@ -232,7 +213,7 @@ export function classifyError(err: any): Classified {
   const longReset = retryAfterMs !== undefined && retryAfterMs > QUOTA_THRESHOLD_MS
 
   if (is429 || quotaWords) {
-    if (quotaWords || longReset) return { cls: "quota", retryAfterMs, detail: "quota", quotaScope }
+    if (quotaWords || longReset) return { cls: "quota", retryAfterMs, detail: "quota" }
     return { cls: "transient", retryAfterMs, detail: "rate limited" }
   }
 
@@ -577,10 +558,41 @@ function configDir(ctx: any): string {
   return join(homedir(), ".config", "opencode")
 }
 
+let currentConfigDir = ""
+
+export function loadState(dir: string): void {
+  try {
+    const file = join(dir, "fallback-state.json")
+    const raw = JSON.parse(readFileSync(file, "utf8"))
+    const t = now()
+    if (raw.blockedUntil && typeof raw.blockedUntil === "object") {
+      for (const [m, until] of Object.entries<any>(raw.blockedUntil)) {
+        if (typeof until === "number" && until > t) blockedUntilByModel.set(m, until)
+      }
+    }
+  } catch {}
+}
+
+export function saveState(): void {
+  const dir = currentConfigDir || configDir(undefined)
+  if (!dir) return
+  try {
+    const file = join(dir, "fallback-state.json")
+    const t = now()
+    const activeBlocks: Record<string, number> = {}
+    for (const [m, until] of blockedUntilByModel.entries()) {
+      if (until > t) activeBlocks[m] = until
+    }
+    writeFileSync(file, JSON.stringify({ blockedUntil: activeBlocks, savedAt: t }, null, 2), "utf8")
+  } catch {}
+}
+
 let fallbackCache: { dir: string; mtime: number; data: FallbackFile } | null = null
 
 function loadFallbackFile(ctx: any): FallbackFile {
   const dir = configDir(ctx)
+  currentConfigDir = dir
+  loadState(dir)
   try {
     const file = join(dir, "fallback.json")
     const stat = statSync(file)
@@ -746,8 +758,6 @@ const locks = new Map<string, Promise<unknown>>()
 // dead for every session, not just the one that tripped it.
 const breakersByModel = new Map<string, Breaker>()
 const blockedUntilByModel = new Map<string, number>()
-const blockedUntilByProvider = new Map<string, number>()
-const blockedUntilByProviderTier = new Map<string, number>()
 const lastCompactAt = new Map<string, number>()
 const MAX_SESSIONS = 256
 
@@ -758,11 +768,15 @@ export function __resetStateForTests(): void {
   sessions.clear()
   breakersByModel.clear()
   blockedUntilByModel.clear()
-  blockedUntilByProvider.clear()
-  blockedUntilByProviderTier.clear()
   lastCompactAt.clear()
   modelLimitsCache = undefined
   knownModelsCache = undefined
+  const dir = currentConfigDir || (process.env.OPENCODE_CONFIG_DIR ?? "")
+  if (dir) {
+    try {
+      rmSync(join(dir, "fallback-state.json"), { force: true })
+    } catch {}
+  }
 }
 
 /** Test seam: inject model context limits (providerID/id -> context window). */
@@ -872,15 +886,6 @@ export function isModelHealthyNow(model: any): boolean {
   const key = fmtModel(model)
   const blockedUntil = blockedUntilByModel.get(key)
   if (blockedUntil !== undefined && blockedUntil > now()) return false
-  const p = providerOf(key)
-  if (p) {
-    const pBlocked = blockedUntilByProvider.get(p)
-    if (pBlocked !== undefined && pBlocked > now()) return false
-    if (key.includes(":free") || key.includes("-free") || key.endsWith("/free")) {
-      const tierBlocked = blockedUntilByProviderTier.get(`${p}:free`)
-      if (tierBlocked !== undefined && tierBlocked > now()) return false
-    }
-  }
   const b = breakersByModel.get(key)
   if (b?.isOpen) return false
   return true
@@ -1055,11 +1060,7 @@ export function recordModelFailure(failedKey: string, c: Classified, fbOpts: Fal
     const until = now() + reset
     blockedUntilByModel.set(failedKey, until)
     if (st) st.rateLimitMs[failedKey] = until
-    if (c.quotaScope === "tier_free" && p) {
-      blockedUntilByProviderTier.set(`${p}:free`, until)
-    } else if (c.quotaScope === "provider" && p) {
-      blockedUntilByProvider.set(p, until)
-    }
+    saveState()
   } else if (c.cls === "transient") {
     const pcfg = st?.opts?.providers?.[p] ?? fbOpts.providers?.[p] ?? fbOpts.providerDefaults ?? DEFAULTS.providerDefaults
     const dur = c.retryAfterMs ?? pcfg?.rateLimitMs ?? fbOpts.interceptor?.defaultRateLimitMs ?? DEFAULTS.interceptor.defaultRateLimitMs

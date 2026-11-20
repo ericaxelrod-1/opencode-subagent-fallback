@@ -25,7 +25,7 @@
  *   6. compaction/overflow pre-emption
  *   7. cleanup, telemetry, redaction
  */
-import { appendFileSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 const QUOTA_THRESHOLD_MS = 600000; // 10 min: beyond this a rate limit is a quota, not a blip
@@ -145,23 +145,8 @@ export function classifyError(err) {
     if (type === "provider.forbidden" || type === "forbidden" || status === 403)
         return { cls: "forbidden", retryAfterMs, detail: "forbidden" };
     // Blueprint §5.2: cross-provider failover is required on HTTP 402 (quota).
-    const isFreeTierQuota = msg.includes("free-models-per-day") ||
-        msg.includes("openrouter_free_tier_daily") ||
-        msg.includes("free usage limit") ||
-        msg.includes("free usage exceeded");
-    const isProviderQuota = msg.includes("insufficient_quota") ||
-        msg.includes("billing") ||
-        msg.includes("credit") ||
-        msg.includes("subscribe to go") ||
-        msg.includes("per-day") ||
-        msg.includes("daily");
-    const quotaScope = isFreeTierQuota
-        ? "tier_free"
-        : isProviderQuota
-            ? "provider"
-            : "model";
     if (type === "provider.quota" || type === "quota" || status === 402)
-        return { cls: "quota", retryAfterMs, detail: "quota", quotaScope };
+        return { cls: "quota", retryAfterMs, detail: "quota" };
     if (type === "provider.not-found" ||
         type === "not-found" ||
         status === 404 ||
@@ -215,7 +200,7 @@ export function classifyError(err) {
     const longReset = retryAfterMs !== undefined && retryAfterMs > QUOTA_THRESHOLD_MS;
     if (is429 || quotaWords) {
         if (quotaWords || longReset)
-            return { cls: "quota", retryAfterMs, detail: "quota", quotaScope };
+            return { cls: "quota", retryAfterMs, detail: "quota" };
         return { cls: "transient", retryAfterMs, detail: "rate limited" };
     }
     if ((status !== undefined && status >= 500) || (type === "provider.internal" && status === undefined))
@@ -473,9 +458,42 @@ function configDir(ctx) {
         return envDir;
     return join(homedir(), ".config", "opencode");
 }
+let currentConfigDir = "";
+export function loadState(dir) {
+    try {
+        const file = join(dir, "fallback-state.json");
+        const raw = JSON.parse(readFileSync(file, "utf8"));
+        const t = now();
+        if (raw.blockedUntil && typeof raw.blockedUntil === "object") {
+            for (const [m, until] of Object.entries(raw.blockedUntil)) {
+                if (typeof until === "number" && until > t)
+                    blockedUntilByModel.set(m, until);
+            }
+        }
+    }
+    catch { }
+}
+export function saveState() {
+    const dir = currentConfigDir || configDir(undefined);
+    if (!dir)
+        return;
+    try {
+        const file = join(dir, "fallback-state.json");
+        const t = now();
+        const activeBlocks = {};
+        for (const [m, until] of blockedUntilByModel.entries()) {
+            if (until > t)
+                activeBlocks[m] = until;
+        }
+        writeFileSync(file, JSON.stringify({ blockedUntil: activeBlocks, savedAt: t }, null, 2), "utf8");
+    }
+    catch { }
+}
 let fallbackCache = null;
 function loadFallbackFile(ctx) {
     const dir = configDir(ctx);
+    currentConfigDir = dir;
+    loadState(dir);
     try {
         const file = join(dir, "fallback.json");
         const stat = statSync(file);
@@ -601,8 +619,6 @@ const locks = new Map();
 // dead for every session, not just the one that tripped it.
 const breakersByModel = new Map();
 const blockedUntilByModel = new Map();
-const blockedUntilByProvider = new Map();
-const blockedUntilByProviderTier = new Map();
 const lastCompactAt = new Map();
 const MAX_SESSIONS = 256;
 let modelLimitsCache;
@@ -611,11 +627,16 @@ export function __resetStateForTests() {
     sessions.clear();
     breakersByModel.clear();
     blockedUntilByModel.clear();
-    blockedUntilByProvider.clear();
-    blockedUntilByProviderTier.clear();
     lastCompactAt.clear();
     modelLimitsCache = undefined;
     knownModelsCache = undefined;
+    const dir = currentConfigDir || (process.env.OPENCODE_CONFIG_DIR ?? "");
+    if (dir) {
+        try {
+            rmSync(join(dir, "fallback-state.json"), { force: true });
+        }
+        catch { }
+    }
 }
 /** Test seam: inject model context limits (providerID/id -> context window). */
 export function __setModelLimitsForTests(limits) {
@@ -730,17 +751,6 @@ export function isModelHealthyNow(model) {
     const blockedUntil = blockedUntilByModel.get(key);
     if (blockedUntil !== undefined && blockedUntil > now())
         return false;
-    const p = providerOf(key);
-    if (p) {
-        const pBlocked = blockedUntilByProvider.get(p);
-        if (pBlocked !== undefined && pBlocked > now())
-            return false;
-        if (key.includes(":free") || key.includes("-free") || key.endsWith("/free")) {
-            const tierBlocked = blockedUntilByProviderTier.get(`${p}:free`);
-            if (tierBlocked !== undefined && tierBlocked > now())
-                return false;
-        }
-    }
     const b = breakersByModel.get(key);
     if (b?.isOpen)
         return false;
@@ -917,12 +927,7 @@ export function recordModelFailure(failedKey, c, fbOpts, st) {
         blockedUntilByModel.set(failedKey, until);
         if (st)
             st.rateLimitMs[failedKey] = until;
-        if (c.quotaScope === "tier_free" && p) {
-            blockedUntilByProviderTier.set(`${p}:free`, until);
-        }
-        else if (c.quotaScope === "provider" && p) {
-            blockedUntilByProvider.set(p, until);
-        }
+        saveState();
     }
     else if (c.cls === "transient") {
         const pcfg = st?.opts?.providers?.[p] ?? fbOpts.providers?.[p] ?? fbOpts.providerDefaults ?? DEFAULTS.providerDefaults;
