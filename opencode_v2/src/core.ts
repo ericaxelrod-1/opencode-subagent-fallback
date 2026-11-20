@@ -26,7 +26,7 @@
  *   7. cleanup, telemetry, redaction
  */
 
-import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync, rmSync } from "node:fs"
+import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { homedir } from "node:os"
 
@@ -438,7 +438,7 @@ function resolveOpts(opts?: Partial<FallbackOptions>): FallbackOptions {
   const watchdog: WatchdogConfig = { ...DEFAULTS.watchdog, ...(o.watchdog ?? {}) }
   const parentWatchdog: WatchdogConfig = { ...DEFAULTS.parentWatchdog, ...(o.parentWatchdog ?? {}) }
   const providerDefaults: ProviderConfig = { ...DEFAULTS.providerDefaults, ...(o.providerDefaults ?? {}) }
-  return {
+  const out: any = {
     budgetMs: typeof o.budgetMs === "number" ? o.budgetMs : budgets.fallbackBudgetMs,
     maxIterations: budgets.maxIterations,
     compactionRatio: budgets.compactionRatio,
@@ -449,6 +449,12 @@ function resolveOpts(opts?: Partial<FallbackOptions>): FallbackOptions {
     providerDefaults,
     providers: { ...DEFAULTS.providers, ...(o.providers ?? {}) },
   }
+  if ((o as any).agents) out.agents = (o as any).agents
+  if ((o as any).defaultLargeContextModel) out.defaultLargeContextModel = (o as any).defaultLargeContextModel
+  if ((o as any).defaultLargeContextFallback) out.defaultLargeContextFallback = (o as any).defaultLargeContextFallback
+  if ((o as any).largeContextModel) out.largeContextModel = (o as any).largeContextModel
+  if ((o as any).largeContextFallback) out.largeContextFallback = (o as any).largeContextFallback
+  return out as FallbackOptions
 }
 
 /** Merge a raw provider config over a base (base keys win on undefined). */
@@ -876,6 +882,86 @@ export async function initCatalog(ctx: any): Promise<void> {
       modelLimitsCache = limits
       logLine(`catalog initialized: ${models.size / 2} model variants indexed`)
     }
+
+    // Also index custom providers and models configured in opencode.json
+    try {
+      const dir = configDir(ctx)
+      const opencodeJsonPath = join(dir, "opencode.json")
+      if (existsSync(opencodeJsonPath)) {
+        const opencodeCfg = parseJsonWithComments(readFileSync(opencodeJsonPath, "utf8"))
+        if (opencodeCfg && typeof opencodeCfg === "object" && opencodeCfg.provider) {
+          const mCache = knownModelsCache ?? new Set<string>()
+          const lCache = modelLimitsCache ?? new Map<string, number>()
+          for (const [pName, pVal] of Object.entries(opencodeCfg.provider)) {
+            const pObj: any = pVal
+            if (pObj?.models && typeof pObj.models === "object") {
+              for (const [mName, mVal] of Object.entries(pObj.models)) {
+                const mObj: any = mVal
+                const full = `${pName}/${mName}`
+                mCache.add(full)
+                mCache.add(full.toLowerCase())
+                mCache.add(mName)
+                mCache.add(mName.toLowerCase())
+                const ctxLim = mObj?.limit?.context
+                if (typeof ctxLim === "number" && ctxLim > 0) {
+                  const usable = Math.max(1, ctxLim - (mObj?.limit?.output ?? 0))
+                  lCache.set(full, usable)
+                  lCache.set(full.toLowerCase(), usable)
+                  lCache.set(mName, usable)
+                  lCache.set(mName.toLowerCase(), usable)
+                }
+              }
+            }
+          }
+          knownModelsCache = mCache
+          modelLimitsCache = lCache
+        }
+      }
+    } catch (err: any) {
+      logLine(`catalog: indexing opencode.json models failed: ${String(err)}`)
+    }
+
+    // Also index all declared fallback targets in fallback.json
+    try {
+      const fbFile = loadFallbackFile(ctx)
+      const fbModels: string[] = []
+      if (fbFile?.defaultLargeContextModel) fbModels.push(fbFile.defaultLargeContextModel)
+      if (fbFile?.defaultFallback) {
+        for (const e of fbFile.defaultFallback) fbModels.push(typeof e === "string" ? e : e.model)
+      }
+      if (fbFile?.defaultLargeContextFallback) {
+        for (const e of fbFile.defaultLargeContextFallback) fbModels.push(typeof e === "string" ? e : e.model)
+      }
+      if (fbFile?.agents) {
+        for (const ag of Object.values(fbFile.agents)) {
+          if (ag?.largeContextModel) fbModels.push(ag.largeContextModel)
+          if (ag?.fallback) {
+            for (const e of ag.fallback) fbModels.push(typeof e === "string" ? e : e.model)
+          }
+          if (ag?.largeContextFallback) {
+            for (const e of ag.largeContextFallback) fbModels.push(typeof e === "string" ? e : e.model)
+          }
+        }
+      }
+      if (fbModels.length > 0) {
+        const mCache = knownModelsCache ?? new Set<string>()
+        for (const m of fbModels) {
+          if (!m || typeof m !== "string") continue
+          const full = fmtModel(m)
+          mCache.add(full)
+          mCache.add(full.toLowerCase())
+          const slash = full.indexOf("/")
+          if (slash !== -1) {
+            const id = full.slice(slash + 1)
+            mCache.add(id)
+            mCache.add(id.toLowerCase())
+          }
+        }
+        knownModelsCache = mCache
+      }
+    } catch (err: any) {
+      logLine(`catalog: indexing fallback.json models failed: ${String(err)}`)
+    }
   } catch (err: any) {
     logLine(`catalog initialization failed: ${String(err)}`)
   }
@@ -1176,6 +1262,35 @@ export interface Fallback {
   recordModelFailure: typeof recordModelFailure
 }
 
+function isCompactionModel(modelKey: string, ctx?: any, opts?: any): boolean {
+  if (!modelKey) return false
+  const norm = fmtModel(modelKey).toLowerCase()
+  const candidates: string[] = []
+  const fbFile = loadFallbackFile(ctx)
+  for (const src of [opts, fbFile]) {
+    if (!src) continue
+    if (src.agents?.compaction?.largeContextModel) candidates.push(src.agents.compaction.largeContextModel)
+    if (src.agents?.compaction?.largeContextFallback) {
+      for (const f of src.agents.compaction.largeContextFallback) {
+        candidates.push(typeof f === "string" ? f : f.model)
+      }
+    }
+    if (src.defaultLargeContextModel) candidates.push(src.defaultLargeContextModel)
+    if (src.defaultLargeContextFallback) {
+      for (const f of src.defaultLargeContextFallback) {
+        candidates.push(typeof f === "string" ? f : f.model)
+      }
+    }
+    if (src.largeContextModel) candidates.push(src.largeContextModel)
+    if (src.largeContextFallback) {
+      for (const f of src.largeContextFallback) {
+        candidates.push(typeof f === "string" ? f : f.model)
+      }
+    }
+  }
+  return candidates.some((c) => c && fmtModel(c).toLowerCase() === norm)
+}
+
 export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallback {
   const fbOpts = resolveOpts(opts ?? loadRoot(ctx))
 
@@ -1184,12 +1299,30 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
   // ── retry hook: classify → sticky / failover / force retry (step 1 + step 2) ──
   const onRetry = async (e: any): Promise<void> => {
     try {
-      // F3: auxiliary calls (compaction) arrive with agent "compaction" and resolve
-      // their own model before entering the retry loop — never switch for them.
+      const c = classifyError(e?.error)
+      const failedKey = fmtModel(e?.model)
+
+      // F3: auxiliary calls (compaction) arrive with agent "compaction", type "compaction",
+      // or using the configured compaction model — resolve their own model before entering
+      // the retry loop — never switch for them.
       // However, record failures, trip breakers/quotas, reload agents, and abort non-transient retries.
-      if (e?.agent === "compaction") {
-        const c = classifyError(e?.error)
-        const failedKey = fmtModel(e?.model)
+      let isCompaction =
+        e?.agent === "compaction" ||
+        e?.type === "compaction" ||
+        e?.action === "compaction" ||
+        isCompactionModel(failedKey, ctx, fbOpts)
+
+      if (!isCompaction && ctx?.session?.messages && e?.sessionID) {
+        try {
+          const msgs = await readFlatMessages(ctx, e.sessionID)
+          const lastMsg = msgs[msgs.length - 1]
+          if (lastMsg?.type === "compaction" || lastMsg?.compaction === true) {
+            isCompaction = true
+          }
+        } catch {}
+      }
+
+      if (isCompaction) {
         log(`retry ${e.sessionID}: agent=compaction model=${failedKey} -> ${c.cls} (${c.detail})`)
         recordModelFailure(failedKey, c, fbOpts, sessions.get(e.sessionID))
         if (c.cls === "model_not_found") markModelUnavailable(failedKey)
@@ -1200,9 +1333,8 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         return
       }
 
-      const c = classifyError(e?.error)
       log(
-        `retry ${e.sessionID}: ${fmtModel(e?.model)} attempt=${e?.attempt} -> ${c.cls}${c.detail ? ` (${c.detail})` : ""}${
+        `retry ${e.sessionID}: ${failedKey} attempt=${e?.attempt} -> ${c.cls}${c.detail ? ` (${c.detail})` : ""}${
           c.retryAfterMs !== undefined ? ` retryAfterMs=${c.retryAfterMs}` : ""
         }`,
       )
@@ -1259,7 +1391,6 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         rolloverTimers.add(timer)
       }
 
-      const failedKey = fmtModel(e?.model)
       const st = stateFor(ctx, e.sessionID, failedKey, e?.agent, fbOpts)
 
       const budget = st.opts?.budgets ?? fbOpts.budgets
@@ -1358,6 +1489,17 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         markModelUnavailable(failedKey)
       }
 
+      // Breaker & quota enforcement: record failure before selecting candidate
+      recordModelFailure(failedKey, c, fbOpts, st)
+
+      // P1 #11: auth / forbidden / provider-level failures invalidate the whole
+      // provider for this turn's failover walk (a dead credential or sick gateway
+      // behind provider A invalidates every sibling fallback on A).
+      if (c.cls === "auth" || c.cls === "forbidden" || c.cls === "provider_level") {
+        st.outProviders = st.outProviders ?? new Set<string>()
+        st.outProviders.add(providerOf(failedKey))
+      }
+
       let next = nextCandidate(st)
       // R4/F2: validate candidate against catalog; skip unavailable models
       while (next && !isModelAvailable(next)) {
@@ -1378,7 +1520,10 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         }
       }
       if (!next) {
-        log(`retry ${e.sessionID}: no fallback candidate left for ${failedKey} — keeping default decision`)
+        log(`retry ${e.sessionID}: no fallback candidate left for ${failedKey} — stopping retries`)
+        if (c.cls !== "transient") {
+          e.decision = { retry: false }
+        }
         return
       }
 
@@ -1396,19 +1541,11 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         if (!fits) target = await pickLargeContext(ctx, st, agentLocked, failedKey)
       }
       if (!target) {
-        log(`retry ${e.sessionID}: no fallback candidate left for ${failedKey} — keeping default decision`)
+        log(`retry ${e.sessionID}: no fallback candidate left for ${failedKey} — stopping retries`)
+        if (c.cls !== "transient") {
+          e.decision = { retry: false }
+        }
         return
-      }
-
-      // Breaker & quota enforcement: record failure before advancing.
-      recordModelFailure(failedKey, c, fbOpts, st)
-
-      // P1 #11: auth / forbidden / provider-level failures invalidate the whole
-      // provider for this turn's failover walk (a dead credential or sick gateway
-      // behind provider A invalidates every sibling fallback on A).
-      if (c.cls === "auth" || c.cls === "forbidden" || c.cls === "provider_level") {
-        st.outProviders = st.outProviders ?? new Set<string>()
-        st.outProviders.add(providerOf(failedKey))
       }
 
       // O6: switchModel may throw (model unavailable / provider unauthenticated);

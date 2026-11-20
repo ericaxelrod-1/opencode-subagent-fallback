@@ -828,6 +828,74 @@ async function main(): Promise<void> {
     check("proactive compaction does NOT trigger at 26.6k tokens on 136k model (curve + no double counting)", compactCalls === 0)
   }
 
+  console.log("\ncandidate exhaustion loop termination & compaction retry detection:")
+  {
+    // 1. When candidates are exhausted on non-transient error, retry must be terminated (decision.retry = false)
+    __resetStateForTests()
+    const switches: any[] = []
+    const fbExhaust = createFallback(mockCtx(switches), {
+      budgets: { fallbackBudgetMs: 600000, maxIterations: 10, compactionRatio: 0.4, charsPerToken: 4, quotaThresholdMs: 600000, maxCooldownSleepMs: 30000 },
+      providerDefaults: { ...STICKY_FAST },
+    } as any)
+    const ev1: any = { sessionID: "ses_exhaust", agent: "developer", model: { providerID: "a", id: "small" }, error: { statusCode: 402 }, attempt: 0, decision: { retry: true } }
+    await fbExhaust.onRetry(ev1)
+    const ev2: any = { sessionID: "ses_exhaust", agent: "developer", model: { providerID: "a", id: "large" }, error: { statusCode: 402 }, attempt: 1, decision: { retry: true } }
+    await fbExhaust.onRetry(ev2)
+    const ev3: any = { sessionID: "ses_exhaust", agent: "developer", model: { providerID: "a", id: "mid" }, error: { statusCode: 402 }, attempt: 2, decision: { retry: true } }
+    await fbExhaust.onRetry(ev3)
+    check("exhausted candidates on quota sets decision.retry = false", ev3.decision.retry === false, JSON.stringify(ev3.decision))
+    check("exhausted candidates records failed model health", !isModelHealthyNow("a/mid"))
+
+    // 2. Compaction retry detected via e.type === 'compaction' even without agent: 'compaction'
+    let reloadCalled = 0
+    const ctxCompactionTest = {
+      ...mockCtx([]),
+      agent: {
+        reload: async () => { reloadCalled++ },
+      },
+    }
+    const fbCompType = createFallback(ctxCompactionTest, {
+      defaultLargeContextModel: "a/huge",
+    } as any)
+    const evCompType: any = {
+      sessionID: "ses_comp_type",
+      type: "compaction",
+      model: { providerID: "openrouter", id: "nvidia/nemotron:free" },
+      error: { statusCode: 429, message: "Rate limit exceeded: free-models-per-day-high-balance" },
+      attempt: 0,
+      decision: { retry: true, delay: 0 },
+    }
+    await fbCompType.onRetry(evCompType)
+    check("compaction retry via e.type requests agent reload", reloadCalled === 1)
+    check("compaction retry via e.type stops non-transient spin", evCompType.decision.retry === false)
+
+    // 3. Compaction retry detected via configured compaction model
+    let reloadCalled2 = 0
+    const ctxCompactionTest2 = {
+      ...mockCtx([]),
+      agent: {
+        reload: async () => { reloadCalled2++ },
+      },
+    }
+    const fbCompModel = createFallback(ctxCompactionTest2, {
+      agents: {
+        compaction: {
+          largeContextModel: "a/custom-compaction",
+        },
+      },
+    } as any)
+    const evCompModel: any = {
+      sessionID: "ses_comp_model",
+      model: { providerID: "a", id: "custom-compaction" },
+      error: { statusCode: 429, message: "Rate limit exceeded: free-models-per-day-high-balance" },
+      attempt: 0,
+      decision: { retry: true, delay: 0 },
+    }
+    await fbCompModel.onRetry(evCompModel)
+    check("compaction retry via matching compaction model requests agent reload", reloadCalled2 === 1)
+    check("compaction retry via matching compaction model stops non-transient spin", evCompModel.decision.retry === false)
+  }
+
   console.log("\nselftest result:")
   if (failures === 0) { console.log("  all checks passed\n"); return }
   console.log(`  ${failures} check(s) failed\n`)
