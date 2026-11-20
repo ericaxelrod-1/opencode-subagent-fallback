@@ -169,6 +169,7 @@ interface SessionState {
         delivery?: any;
         resume?: boolean | null;
     } | undefined;
+    promptPending?: boolean;
     breakers: Map<string, Breaker>;
     blockedUntil: Map<string, number>;
     /** Last observed context size (input + cache read) for this session's turn. */
@@ -198,6 +199,17 @@ export declare function __setModelLimitsForTests(limits: Record<string, number>)
 /** Test seam: inject known models for catalog validation tests. */
 export declare function __setKnownModelsForTests(models: string[] | undefined): void;
 export declare function usableContextLimit(info: any): number | undefined;
+/**
+ * Dynamic compaction ratio on a logarithmic curve (Option 2):
+ * Smaller context windows get a higher threshold (smaller margin, up to 85%),
+ * while 1M+ windows scale down to baseRatio (default 0.40 = 40%, 60% margin).
+ *
+ * Formula:
+ *   W <= 32k: 0.85
+ *   W >= 1M:  baseRatio (default 0.40)
+ *   In between: linear interpolation on log2 scale between 32k (0.85) and 1M (baseRatio).
+ */
+export declare function dynamicCompactionRatio(limit: number, baseRatio?: number): number;
 export declare function initCatalog(ctx: any): Promise<void>;
 export declare function isModelAvailable(model: any): boolean;
 export declare function markModelUnavailable(model: any): void;

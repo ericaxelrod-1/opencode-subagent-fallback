@@ -9,7 +9,7 @@ When an active model hits rate limits, transient server overloads, quota exhaust
 - **In-flight failover:** Handles rate limits (HTTP 429), quota exhaustion (HTTP 402 / daily limits), auth/forbidden errors, missing models, 5xx provider failures, and context-length overflows.
 - **Per-agent fallback chains:** Supports dedicated fallback lists and semantic model options (`temperature`, `reasoningEffort`, `thinking`) per agent, plus global defaults.
 - **Sticky retries, cooldowns & circuit breakers:** Absorbs brief transient blips with fast sticky retries, respects `Retry-After` and quota reset windows, and benches unhealthy models via per-model circuit breakers.
-- **Context-overflow pre-emption:** Routes oversized conversations to large-context fallback models before a request overflows.
+- **Context-overflow pre-emption & dynamic compaction curve:** Dynamically triggers proactive self-compaction along a logarithmic scale (85% on <=32k models down to 40% on 1M+ models) and routes oversized conversations to large-context fallback models before requests overflow.
 - **Liveness watchdog:** Detects hung streams and stalled turns while protecting active tool/subagent waits and retry sleeps.
 
 ## Repository Structure

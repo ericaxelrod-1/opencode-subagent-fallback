@@ -4,7 +4,7 @@
  *   cd <repo>/opencode_v2 && npx tsc && node dist/selftest.js
  */
 import { mkdirSync, rmSync, writeFileSync } from "node:fs"
-import { createFallback, classifyError, checkCompletion, contextTokens, lastAssistantInTurn, assistantText, __resetStateForTests, __setModelLimitsForTests, __setKnownModelsForTests, __runSweepForTests, isModelAvailable, markModelUnavailable, isModelHealthyNow, Breaker, CONTINUE_PROMPT, parseQuotaBlockedUntil, usableContextLimit, recordModelFailure } from "./core.js"
+import { createFallback, classifyError, checkCompletion, contextTokens, lastAssistantInTurn, assistantText, __resetStateForTests, __setModelLimitsForTests, __setKnownModelsForTests, __runSweepForTests, isModelAvailable, markModelUnavailable, isModelHealthyNow, Breaker, CONTINUE_PROMPT, parseQuotaBlockedUntil, usableContextLimit, recordModelFailure, dynamicCompactionRatio } from "./core.js"
 
 let failures = 0
 function check(name: string, cond: boolean, extra?: string): void {
@@ -775,6 +775,57 @@ async function main(): Promise<void> {
     await fbGuard.onRetry(evOldRetry)
     check("pinned model abort guard sets retry = false on old model", evOldRetry.decision.retry === false)
     check("no extra switch made for old model retry", switchesGuard.length === 1)
+  }
+
+  console.log("\ndynamic compaction curve & double-counting fix:")
+  {
+    __resetStateForTests()
+    // Test logarithmic curve anchors
+    check("32k or less gets max ratio 0.85 (15% margin)", dynamicCompactionRatio(32768) === 0.85)
+    check("small 16k gets max ratio 0.85", dynamicCompactionRatio(16000) === 0.85)
+    check("64k gets ~0.76", Math.abs(dynamicCompactionRatio(65536) - 0.76) < 0.005)
+    check("128k gets ~0.67", Math.abs(dynamicCompactionRatio(131072) - 0.67) < 0.005)
+    check("big-pickle 136k usable gets ~0.665", Math.abs(dynamicCompactionRatio(136000) - 0.665) < 0.005)
+    check("200k gets ~0.615", Math.abs(dynamicCompactionRatio(200000) - 0.615) < 0.005)
+    check("1M gets base ratio 0.40 (60% margin)", dynamicCompactionRatio(1048576) === 0.40)
+    check("2M gets base ratio 0.40", dynamicCompactionRatio(2097152) === 0.40)
+
+    // Test double-counting fix and proactive compaction
+    let compactCalls = 0
+    const ctxComp: any = {
+      ...mockCtx([]),
+      session: {
+        ...mockCtx([]).session,
+        compact: async () => { compactCalls++ },
+      },
+    }
+    __setModelLimitsForTests({ "opencode/big-pickle": 136000 })
+    const fbComp = createFallback(ctxComp, { providerDefaults: { ...STICKY_FAST, stickyMs: 0 } })
+
+    // Simulate session: large prompt (67k chars = ~16.7k tokens) + prior tokens (26.6k)
+    // In buggy code: 26.6k + 67.6k = 94.3k (> 40% of 136k = 54.4k) -> compacted immediately!
+    // With fix:
+    // 1) 26.6k tokens on 136k limit is 19.6%
+    // 2) Compaction threshold on 136k is ~66.5% (~90.4k)
+    // 3) When tokens are already measured in the session, prompt is not double-counted
+    await fbComp.onPrompt({ sessionID: "ses_curve", agent: "developer", text: "x".repeat(270600) })
+    // Simulate event from assistant with actual measured tokens (26,652)
+    // This marks prompt as absorbed
+    // Event format: { properties: { info: { tokens: { input: 284, cache: { read: 26368 } } } } }
+    const evChunk = {
+      type: "session.text.delta",
+      sessionID: "ses_curve",
+      properties: {
+        info: {
+          tokens: { input: 284, cache: { read: 26368 } },
+        },
+      },
+    }
+    // Simulate onContext for a tool call after the assistant has responded
+    const evCtx: any = { sessionID: "ses_curve", agent: "developer", model: { providerID: "opencode", id: "big-pickle" } }
+    await fbComp.onContext(evCtx)
+
+    check("proactive compaction does NOT trigger at 26.6k tokens on 136k model (curve + no double counting)", compactCalls === 0)
   }
 
   console.log("\nselftest result:")

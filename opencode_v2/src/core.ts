@@ -728,6 +728,7 @@ interface SessionState {
   opts: FallbackOptions
   originalSeat?: string
   prompt: { text?: string; files?: any; agents?: string[]; skills?: string[]; delivery?: any; resume?: boolean | null } | undefined
+  promptPending?: boolean
   breakers: Map<string, Breaker>
   blockedUntil: Map<string, number>
   /** Last observed context size (input + cache read) for this session's turn. */
@@ -812,6 +813,35 @@ export function usableContextLimit(info: any): number | undefined {
   if (typeof raw !== "number" || raw <= 0) return undefined
   const reserve = Math.max(Math.floor(raw * 0.15), raw >= 40000 ? 20000 : 0)
   return Math.max(0, raw - reserve)
+}
+
+/**
+ * Dynamic compaction ratio on a logarithmic curve (Option 2):
+ * Smaller context windows get a higher threshold (smaller margin, up to 85%),
+ * while 1M+ windows scale down to baseRatio (default 0.40 = 40%, 60% margin).
+ *
+ * Formula:
+ *   W <= 32k: 0.85
+ *   W >= 1M:  baseRatio (default 0.40)
+ *   In between: linear interpolation on log2 scale between 32k (0.85) and 1M (baseRatio).
+ */
+export function dynamicCompactionRatio(limit: number, baseRatio: number = DEFAULTS.compactionRatio): number {
+  if (typeof limit !== "number" || !Number.isFinite(limit) || limit <= 0) return baseRatio
+  const W_MIN = 32768   // 32k (2^15)
+  const W_MAX = 1048576 // 1M (2^20)
+  const MAX_RATIO = 0.85
+  const MIN_RATIO = Math.min(baseRatio, MAX_RATIO)
+
+  if (limit <= W_MIN) return MAX_RATIO
+  if (limit >= W_MAX) return MIN_RATIO
+
+  const logMin = Math.log2(W_MIN)
+  const logMax = Math.log2(W_MAX)
+  const logW = Math.log2(limit)
+
+  const factor = (logMax - logW) / (logMax - logMin)
+  const ratio = MIN_RATIO + (MAX_RATIO - MIN_RATIO) * factor
+  return Math.round(ratio * 1000) / 1000
 }
 
 export async function initCatalog(ctx: any): Promise<void> {
@@ -923,6 +953,7 @@ function stateFor(ctx: any, sid: string, seat?: string, agent?: string, opts?: F
     rePrompts: 0,
     opts: opts ?? DEFAULTS,
     prompt: undefined,
+    promptPending: false,
     breakers: new Map<string, Breaker>(),
     blockedUntil: new Map<string, number>(),
     tokens: 0,
@@ -995,13 +1026,19 @@ function breakerFor(st: SessionState, key: string): Breaker {
   return b
 }
 
-/** Rough conversation-size estimate: accumulated context tokens + current prompt. */
+/** Rough conversation-size estimate: accumulated context tokens + pending prompt (if not yet in tokens). */
 function conversationTokens(st: SessionState): number {
   const text = typeof st?.prompt?.text === "string" ? st.prompt.text : ""
   const ratio = st?.opts?.budgets?.charsPerToken ?? DEFAULTS.budgets.charsPerToken
   const r = ratio > 0 ? ratio : 4
   const promptTokens = Math.ceil(text.length / r)
-  return (st?.tokens ?? 0) + promptTokens
+  if (st?.tokens && st.tokens > 0) {
+    if (st.promptPending && promptTokens > 0) {
+      return st.tokens + promptTokens
+    }
+    return st.tokens
+  }
+  return promptTokens
 }
 
 function lastTokenCount(msgs: any[]): number {
@@ -1023,6 +1060,9 @@ async function hydrateSessionTokens(ctx: any, st: SessionState): Promise<number>
     const tok = lastTokenCount(msgs)
     if (tok > 0) {
       st.tokens = tok
+      if (!st.prompt?.text) {
+        st.promptPending = false
+      }
     }
   } catch { /* best effort */ }
   return conversationTokens(st)
@@ -1458,6 +1498,7 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         delivery: p?.delivery ?? e?.delivery ?? e?.input?.delivery,
         resume: p?.resume ?? e?.resume ?? e?.input?.resume ?? true,
       }
+      st.promptPending = true
       // Register liveness for this session so pre-token stalls are watched
       // even before the first streaming event lands (P1 #9).
       if (sid) ensureLiveness(ctx, sid, fbOpts)
@@ -1503,13 +1544,14 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         const limits = await getModelLimits(ctx)
         const limit = limits.get(key)
         const curTokens = st ? conversationTokens(st) : 0
-        const compactionRatio = fbOpts.budgets?.compactionRatio ?? fbOpts.compactionRatio ?? DEFAULTS.compactionRatio
+        const baseCompactionRatio = fbOpts.budgets?.compactionRatio ?? fbOpts.compactionRatio ?? DEFAULTS.compactionRatio
+        const compactionRatio = typeof limit === "number" && limit > 0 ? dynamicCompactionRatio(limit, baseCompactionRatio) : baseCompactionRatio
         const debounceMs = fbOpts.parentWatchdog?.compactionDebounceMs ?? fbOpts.watchdog?.compactionDebounceMs ?? 120000
         if (typeof limit === "number" && limit > 0 && curTokens >= limit * compactionRatio) {
           const last = lastCompactAt.get(sid) ?? 0
           if (now() - last >= debounceMs) {
             lastCompactAt.set(sid, now())
-            log(`context ${sid}: ${Math.round((curTokens / limit) * 100)}% of ${key} (${curTokens}/${limit}) — triggering proactive self-compaction at ${compactionRatio * 100}%`)
+            log(`context ${sid}: ${Math.round((curTokens / limit) * 100)}% of ${key} (${curTokens}/${limit}) — triggering proactive self-compaction at ${Math.round(compactionRatio * 100)}%`)
             void Promise.resolve(ctx?.session?.compact?.({ sessionID: sid })).catch((err: any) => {
               log(`context ${sid}: proactive self-compaction failed: ${String(err)}`)
             })
@@ -2078,21 +2120,28 @@ async function handleEvent(ctx: any, ev: any, opts: FallbackOptions): Promise<vo
       if (tok !== undefined && l) {
         l.firstTokenReceived = true
         const st = sessions.get(sid)
-        if (st) st.tokens = tok
-        else stateFor(ctx, sid).tokens = tok
+        if (st) {
+          st.tokens = tok
+          st.promptPending = false
+        } else {
+          const s = stateFor(ctx, sid)
+          s.tokens = tok
+          s.promptPending = false
+        }
 
         if (sid) {
           const seat = sessions.get(sid)?.seat
           if (seat && seat !== "unknown") {
             const limits = modelLimitsCache
             const limit = limits?.get(seat)
-            const compactionRatio = opts.budgets?.compactionRatio ?? opts.compactionRatio ?? DEFAULTS.compactionRatio
+            const baseCompactionRatio = opts.budgets?.compactionRatio ?? opts.compactionRatio ?? DEFAULTS.compactionRatio
+            const compactionRatio = typeof limit === "number" && limit > 0 ? dynamicCompactionRatio(limit, baseCompactionRatio) : baseCompactionRatio
             const debounceMs = opts.parentWatchdog?.compactionDebounceMs ?? opts.watchdog?.compactionDebounceMs ?? 120000
             if (typeof limit === "number" && limit > 0 && tok >= limit * compactionRatio) {
               const last = lastCompactAt.get(sid) ?? 0
               if (now() - last >= debounceMs) {
                 lastCompactAt.set(sid, now())
-                logLine(`event ${sid}: ${Math.round((tok / limit) * 100)}% of ${seat} (${tok}/${limit}) — triggering proactive self-compaction at ${compactionRatio * 100}%`)
+                logLine(`event ${sid}: ${Math.round((tok / limit) * 100)}% of ${seat} (${tok}/${limit}) — triggering proactive self-compaction at ${Math.round(compactionRatio * 100)}%`)
                 void Promise.resolve(ctx?.session?.compact?.({ sessionID: sid })).catch((err: any) => {
                   logLine(`event ${sid}: proactive self-compaction failed: ${String(err)}`)
                 })
