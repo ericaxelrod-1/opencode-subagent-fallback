@@ -4,7 +4,7 @@
  *   cd <repo>/opencode_v2 && npx tsc && node dist/selftest.js
  */
 import { mkdirSync, rmSync, writeFileSync } from "node:fs"
-import { createFallback, classifyError, checkCompletion, contextTokens, lastAssistantInTurn, assistantText, __resetStateForTests, __setModelLimitsForTests, __setKnownModelsForTests, __runSweepForTests, isModelAvailable, markModelUnavailable, isModelHealthyNow, Breaker, CONTINUE_PROMPT, parseQuotaBlockedUntil } from "./core.js"
+import { createFallback, classifyError, checkCompletion, contextTokens, lastAssistantInTurn, assistantText, __resetStateForTests, __setModelLimitsForTests, __setKnownModelsForTests, __runSweepForTests, isModelAvailable, markModelUnavailable, isModelHealthyNow, Breaker, CONTINUE_PROMPT, parseQuotaBlockedUntil, usableContextLimit, recordModelFailure } from "./core.js"
 
 let failures = 0
 function check(name: string, cond: boolean, extra?: string): void {
@@ -639,6 +639,142 @@ async function main(): Promise<void> {
 
     check("onRetry skips unavailable a/large and switches to a/mid", switchesSkip.length === 1 && switchesSkip[0]?.model?.id === "mid", JSON.stringify(switchesSkip))
     __setKnownModelsForTests(undefined)
+  }
+
+  console.log("\nusableContextLimit & token hydration:")
+  {
+    // Test 1: input vs context limit and reserve calculation
+    // Big pickle: context 200k, input 160k -> raw 160k. Reserve = max(160k * 0.15 = 24k, 20k) = 24k -> usable = 136k
+    const bpUsable = usableContextLimit({ limit: { context: 200000, input: 160000 } })
+    check("usableContextLimit applies min(input, context) and reserve", bpUsable === 136000, String(bpUsable))
+
+    // Small model without input limit: context 32k -> raw 32k. Reserve = max(32k * 0.15 = 4.8k, 0) = 4800 -> usable = 27200
+    const smUsable = usableContextLimit({ limit: { context: 32000 } })
+    check("usableContextLimit handles single limit", smUsable === 27200, String(smUsable))
+
+    // Test 2: contextFits hydrates tokens from flat messages
+    __resetStateForTests()
+    __setModelLimitsForTests({ "a/small": 50000, "a/huge": 500000 })
+    const switchesHydrate: any[] = []
+    const ctxHydrate: any = {
+      session: {
+        switchModel: async (args: any) => { switchesHydrate.push(args) },
+        context: async () => ({
+          data: [
+            { type: "user", text: "question" },
+            { type: "assistant", tokens: { input: 60000, output: 1000 }, content: [{ type: "text", text: "answer" }], finish: "stop" },
+          ],
+        }),
+      },
+      event: { subscribe: () => ({ [Symbol.asyncIterator]: async function* () {} }) },
+    }
+    const fbHydrate = createFallback(ctxHydrate, {
+      budgets: { fallbackBudgetMs: 600000, maxIterations: 10, compactionRatio: 0.4, charsPerToken: 4, quotaThresholdMs: 600000, maxCooldownSleepMs: 30000 },
+      providerDefaults: { ...STICKY_FAST, stickyMs: 0 },
+    })
+    // Session starts with 0 cached tokens in st.tokens. Failed on a/small (quota).
+    // The candidate a/small has 50k limit, but session context has 60k tokens!
+    // contextFits must hydrate 60k tokens from context and reject a/small, routing to huge.
+    await fbHydrate.onRetry({ sessionID: "ses_hydr", agent: "developer", model: { providerID: "a", id: "small" }, error: { statusCode: 402 }, attempt: 0, decision: { retry: false } })
+    check("contextFits hydrates tokens and skips models that cannot hold conversation", switchesHydrate.length === 1 && switchesHydrate[0]?.model?.id !== "small", JSON.stringify(switchesHydrate))
+  }
+
+  console.log("\nprovider tier & free quota lockouts:")
+  {
+    __resetStateForTests()
+    __setKnownModelsForTests([
+      "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+      "openrouter/meta-llama/llama-3.3-70b-instruct:free",
+      "openrouter/anthropic/claude-3-7-sonnet",
+      "opencode/big-pickle",
+    ])
+    const fbTier = createFallback(mockCtx([]))
+    const nemotron = "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
+    const llamaFree = "openrouter/meta-llama/llama-3.3-70b-instruct:free"
+    const claudePaid = "openrouter/anthropic/claude-3-7-sonnet"
+
+    check("all models healthy initially", isModelHealthyNow(nemotron) && isModelHealthyNow(llamaFree) && isModelHealthyNow(claudePaid))
+
+    // Classify free tier per-day quota error
+    const err = { message: "Rate limit exceeded: free-models-per-day-high-balance", statusCode: 429 }
+    const classified = classifyError(err)
+    check("classifyError identifies tier_free quota", classified.cls === "quota" && classified.quotaScope === "tier_free", JSON.stringify(classified))
+
+    // Record failure
+    recordModelFailure(nemotron, classified, fbTier.opts)
+
+    // Verify nemotron AND sibling free model are locked out, but paid claude is NOT locked out
+    check("nemotron is locked out", !isModelHealthyNow(nemotron))
+    check("sibling free model is locked out via provider tier", !isModelHealthyNow(llamaFree))
+    check("paid model on same provider remains healthy", isModelHealthyNow(claudePaid))
+
+    __setKnownModelsForTests(undefined)
+  }
+
+  console.log("\ncompaction agent error recovery & dynamic health:")
+  {
+    __resetStateForTests()
+    __setKnownModelsForTests(["openrouter/nvidia/nemotron:free", "a/huge", "a/small"])
+    let agentReloadCalled = 0
+    const ctxAgent: any = {
+      ...mockCtx([]),
+      agent: { reload: async () => { agentReloadCalled++ } },
+    }
+    const fbCompaction = createFallback(ctxAgent)
+
+    // Agent "compaction" fails with non-transient quota error
+    const evCompaction: any = {
+      sessionID: "ses_compact",
+      agent: "compaction",
+      model: { providerID: "openrouter", id: "nvidia/nemotron:free" },
+      error: { message: "Rate limit exceeded: free-models-per-day-high-balance", statusCode: 429 },
+      decision: { retry: true },
+    }
+    await fbCompaction.onRetry(evCompaction)
+
+    check("compaction retry requests agent reload", agentReloadCalled === 1)
+    check("compaction retry stops non-transient spin (decision.retry = false)", evCompaction.decision.retry === false)
+    check("compaction failed model marked unhealthy", !isModelHealthyNow("openrouter/nvidia/nemotron:free"))
+
+    // installAgents selects healthy large-context model for agent "compaction"
+    const savedAgents = new Map<string, any>()
+    savedAgents.set("compaction", { id: "compaction", model: "openrouter/nvidia/nemotron:free" })
+    const mockEditor = {
+      list: () => Array.from(savedAgents.values()),
+      get: (id: string) => savedAgents.get(id),
+      update: (id: string, fn: any) => {
+        const cur = savedAgents.get(id) ?? { id }
+        const next = fn(cur) ?? cur
+        savedAgents.set(id, next)
+      },
+    }
+    fbCompaction.installAgents(mockEditor)
+    check(
+      "installAgents dynamically replaces unhealthy compaction model with healthy fallback",
+      savedAgents.get("compaction")?.model?.id !== "nvidia/nemotron:free" && isModelHealthyNow(savedAgents.get("compaction")?.model),
+      JSON.stringify(savedAgents.get("compaction")),
+    )
+
+    __setKnownModelsForTests(undefined)
+  }
+
+  console.log("\npinned model retry abort guard:")
+  {
+    __resetStateForTests()
+    __setModelLimitsForTests({ "a/small": 1000, "a/large": 1000000, "a/mid": 400000 })
+    const switchesGuard: any[] = []
+    const fbGuard = createFallback(mockCtx(switchesGuard), { providerDefaults: { ...STICKY_FAST, stickyMs: 0 } })
+
+    // Step 1: fails on a/small and switches to a/large
+    const evG1: any = { sessionID: "ses_guard", agent: "developer", model: { providerID: "a", id: "small" }, error: { statusCode: 402 }, attempt: 0, decision: { retry: false } }
+    await fbGuard.onRetry(evG1)
+    check("session switches from a/small to a/large", switchesGuard.length === 1 && switchesGuard[0]?.model?.id === "large")
+
+    // Step 2: OpenCode erroneously fires retry for old model a/small within the same turn
+    const evOldRetry: any = { sessionID: "ses_guard", agent: "developer", model: { providerID: "a", id: "small" }, error: { statusCode: 429 }, attempt: 1, decision: { retry: true } }
+    await fbGuard.onRetry(evOldRetry)
+    check("pinned model abort guard sets retry = false on old model", evOldRetry.decision.retry === false)
+    check("no extra switch made for old model retry", switchesGuard.length === 1)
   }
 
   console.log("\nselftest result:")

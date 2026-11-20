@@ -32,6 +32,7 @@ export interface Classified {
     detail: string;
     /** An abort WE initiated (watchdog/timer) — never a provider-health signal. */
     ours?: boolean;
+    quotaScope?: "tier_free" | "provider" | "model";
 }
 /** Error emitted when OUR watchdog aborted an attempt, so classification can tell ours from the provider's. */
 export declare const WatchdogAbort: any;
@@ -142,15 +143,65 @@ export declare class Breaker {
 }
 /** Synthetic continuation injected by the server on mid-stream failure (D3). */
 export declare const CONTINUE_PROMPT = "The previous response was interrupted. Continue from where you left off without repeating completed content.";
+interface SessionState {
+    sid: string;
+    /** Fallback candidates still worth trying this turn (tried/switched ones are removed). */
+    chain: string[];
+    /** Model currently in the seat this turn. */
+    seat: string | undefined;
+    /** Seat + switched fallbacks for this turn — never revisit. */
+    tried: Set<string>;
+    /** Models permanently excluded for this turn (quota/auth/forbidden/not-found/overflow). */
+    permFailed?: Set<string>;
+    switched: boolean;
+    /** Sticky window end for the current seat's transient failures. */
+    stickyUntil: number;
+    rateLimitMs: Record<string, number>;
+    rePrompts: number;
+    opts: FallbackOptions;
+    originalSeat?: string;
+    prompt: {
+        text?: string;
+        files?: any;
+        agents?: string[];
+        skills?: string[];
+        delivery?: any;
+        resume?: boolean | null;
+    } | undefined;
+    breakers: Map<string, Breaker>;
+    blockedUntil: Map<string, number>;
+    /** Last observed context size (input + cache read) for this session's turn. */
+    tokens: number;
+    /** True once WE preemptively switched for context overflow this turn (step 6). */
+    preempted: boolean;
+    /** Agent locked at session start; only explicit user choice updates it (README). */
+    agent?: string;
+    /** Wall-clock ceiling for this turn's failover walk (fallbackBudgetMs). */
+    deadline: number;
+    /** Full passes over the chain used this turn (maxIterations). */
+    hops: number;
+    /** Providers skipped for this turn after auth/forbidden/provider-level failures. */
+    outProviders?: Set<string>;
+    /**
+     * Last `attempt` value observed by the retry hook. The server's attempt
+     * counter resets on every new turn, so a non-increasing value means a new
+     * turn started — the signal used to reset per-turn state when the `prompt`
+     * hook does not fire (watchdog re-prompts, server-side turn restarts).
+     */
+    lastAttempt: number;
+    lastSwitchedFrom?: string;
+}
 export declare function __resetStateForTests(): void;
 /** Test seam: inject model context limits (providerID/id -> context window). */
 export declare function __setModelLimitsForTests(limits: Record<string, number>): void;
 /** Test seam: inject known models for catalog validation tests. */
 export declare function __setKnownModelsForTests(models: string[] | undefined): void;
+export declare function usableContextLimit(info: any): number | undefined;
 export declare function initCatalog(ctx: any): Promise<void>;
 export declare function isModelAvailable(model: any): boolean;
 export declare function markModelUnavailable(model: any): void;
 export declare function isModelHealthyNow(model: any): boolean;
+export declare function recordModelFailure(failedKey: string, c: Classified, fbOpts: FallbackOptions, st?: SessionState): void;
 export interface Fallback {
     ctx: any;
     opts: FallbackOptions;
@@ -171,6 +222,7 @@ export interface Fallback {
     isModelAvailable: typeof isModelAvailable;
     markModelUnavailable: typeof markModelUnavailable;
     isModelHealthyNow: typeof isModelHealthyNow;
+    recordModelFailure: typeof recordModelFailure;
 }
 export declare function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallback;
 export interface CompletionCheck {

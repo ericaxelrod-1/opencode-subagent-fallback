@@ -48,6 +48,7 @@ export interface Classified {
   detail: string
   /** An abort WE initiated (watchdog/timer) — never a provider-health signal. */
   ours?: boolean
+  quotaScope?: "tier_free" | "provider" | "model"
 }
 
 const QUOTA_THRESHOLD_MS = 600000 // 10 min: beyond this a rate limit is a quota, not a blip
@@ -148,7 +149,25 @@ export function classifyError(err: any): Classified {
   if (type === "provider.auth" || type === "auth" || name === "ProviderAuthError" || status === 401) return { cls: "auth", retryAfterMs, detail: "auth" }
   if (type === "provider.forbidden" || type === "forbidden" || status === 403) return { cls: "forbidden", retryAfterMs, detail: "forbidden" }
   // Blueprint §5.2: cross-provider failover is required on HTTP 402 (quota).
-  if (type === "provider.quota" || type === "quota" || status === 402) return { cls: "quota", retryAfterMs, detail: "quota" }
+  const isFreeTierQuota =
+    msg.includes("free-models-per-day") ||
+    msg.includes("openrouter_free_tier_daily") ||
+    msg.includes("free usage limit") ||
+    msg.includes("free usage exceeded")
+  const isProviderQuota =
+    msg.includes("insufficient_quota") ||
+    msg.includes("billing") ||
+    msg.includes("credit") ||
+    msg.includes("subscribe to go") ||
+    msg.includes("per-day") ||
+    msg.includes("daily")
+  const quotaScope: "tier_free" | "provider" | "model" = isFreeTierQuota
+    ? "tier_free"
+    : isProviderQuota
+    ? "provider"
+    : "model"
+
+  if (type === "provider.quota" || type === "quota" || status === 402) return { cls: "quota", retryAfterMs, detail: "quota", quotaScope }
   if (
     type === "provider.not-found" ||
     type === "not-found" ||
@@ -213,7 +232,7 @@ export function classifyError(err: any): Classified {
   const longReset = retryAfterMs !== undefined && retryAfterMs > QUOTA_THRESHOLD_MS
 
   if (is429 || quotaWords) {
-    if (quotaWords || longReset) return { cls: "quota", retryAfterMs, detail: "quota" }
+    if (quotaWords || longReset) return { cls: "quota", retryAfterMs, detail: "quota", quotaScope }
     return { cls: "transient", retryAfterMs, detail: "rate limited" }
   }
 
@@ -718,6 +737,7 @@ interface SessionState {
    * hook does not fire (watchdog re-prompts, server-side turn restarts).
    */
   lastAttempt: number
+  lastSwitchedFrom?: string
 }
 
 const sessions = new Map<string, SessionState>()
@@ -726,6 +746,9 @@ const locks = new Map<string, Promise<unknown>>()
 // dead for every session, not just the one that tripped it.
 const breakersByModel = new Map<string, Breaker>()
 const blockedUntilByModel = new Map<string, number>()
+const blockedUntilByProvider = new Map<string, number>()
+const blockedUntilByProviderTier = new Map<string, number>()
+const lastCompactAt = new Map<string, number>()
 const MAX_SESSIONS = 256
 
 let modelLimitsCache: Map<string, number> | undefined
@@ -735,6 +758,9 @@ export function __resetStateForTests(): void {
   sessions.clear()
   breakersByModel.clear()
   blockedUntilByModel.clear()
+  blockedUntilByProvider.clear()
+  blockedUntilByProviderTier.clear()
+  lastCompactAt.clear()
   modelLimitsCache = undefined
   knownModelsCache = undefined
 }
@@ -764,6 +790,16 @@ export function __setKnownModelsForTests(models: string[] | undefined): void {
   knownModelsCache = s
 }
 
+export function usableContextLimit(info: any): number | undefined {
+  const ctx0 = info?.limit?.context
+  const inp0 = info?.limit?.input
+  if (typeof ctx0 !== "number" && typeof inp0 !== "number") return undefined
+  const raw = (inp0 !== undefined && inp0 > 0 && ctx0 !== undefined && ctx0 > 0) ? Math.min(inp0, ctx0) : (inp0 || ctx0)
+  if (typeof raw !== "number" || raw <= 0) return undefined
+  const reserve = Math.max(Math.floor(raw * 0.15), raw >= 40000 ? 20000 : 0)
+  return Math.max(0, raw - reserve)
+}
+
 export async function initCatalog(ctx: any): Promise<void> {
   try {
     const res = await ctx?.model?.list?.()
@@ -779,8 +815,13 @@ export async function initCatalog(ctx: any): Promise<void> {
         models.add(full.toLowerCase())
         models.add(id)
         models.add(id.toLowerCase())
-        const ctx0 = info?.limit?.context
-        if (typeof ctx0 === "number") limits.set(full, ctx0)
+        const usable = usableContextLimit(info)
+        if (typeof usable === "number") {
+          limits.set(full, usable)
+          limits.set(full.toLowerCase(), usable)
+          limits.set(id, usable)
+          limits.set(id.toLowerCase(), usable)
+        }
       } else if (id) {
         models.add(id)
         models.add(id.toLowerCase())
@@ -831,6 +872,15 @@ export function isModelHealthyNow(model: any): boolean {
   const key = fmtModel(model)
   const blockedUntil = blockedUntilByModel.get(key)
   if (blockedUntil !== undefined && blockedUntil > now()) return false
+  const p = providerOf(key)
+  if (p) {
+    const pBlocked = blockedUntilByProvider.get(p)
+    if (pBlocked !== undefined && pBlocked > now()) return false
+    if (key.includes(":free") || key.includes("-free") || key.endsWith("/free")) {
+      const tierBlocked = blockedUntilByProviderTier.get(`${p}:free`)
+      if (tierBlocked !== undefined && tierBlocked > now()) return false
+    }
+  }
   const b = breakersByModel.get(key)
   if (b?.isOpen) return false
   return true
@@ -900,6 +950,7 @@ function resetTurnState(st: SessionState, ctx: any, agent?: string): void {
   st.tried = new Set<string>()
   st.permFailed = new Set<string>()
   st.switched = false
+  st.lastSwitchedFrom = undefined
   st.stickyUntil = 0
   st.preempted = false
   st.originalSeat = st.seat
@@ -913,10 +964,7 @@ function nextCandidate(st: SessionState): string | undefined {
   for (const m of st.chain) {
     if (st.tried.has(m)) continue
     if (st.outProviders?.has?.(providerOf(m))) continue
-    const b = breakersByModel.get(m)
-    const bt = blockedUntilByModel.get(m)
-    if (b?.isOpen) continue
-    if (bt !== undefined && bt > now()) continue
+    if (!isModelHealthyNow(m)) continue
     return m
   }
   return undefined
@@ -951,16 +999,73 @@ function conversationTokens(st: SessionState): number {
   return (st?.tokens ?? 0) + promptTokens
 }
 
+function lastTokenCount(msgs: any[]): number {
+  const m = lastAssistantInTurn(msgs)
+  const tok = contextTokens(m)
+  if (tok > 0) return tok
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const t = contextTokens(msgs[i])
+    if (t > 0) return t
+  }
+  return 0
+}
+
+async function hydrateSessionTokens(ctx: any, st: SessionState): Promise<number> {
+  if (st.tokens > 0) return conversationTokens(st)
+  if (!st.sid) return conversationTokens(st)
+  try {
+    const msgs = await readFlatMessages(ctx, st.sid)
+    const tok = lastTokenCount(msgs)
+    if (tok > 0) {
+      st.tokens = tok
+    }
+  } catch { /* best effort */ }
+  return conversationTokens(st)
+}
+
 /**
  * Context pre-filter (HIGH): can this candidate hold the conversation?
- * `Model.Info.limit.context` from the live catalog; unknown limits pass.
+ * Uses usable context limit from the live catalog; unknown limits pass.
  */
 async function contextFits(ctx: any, st: SessionState, key: string): Promise<boolean> {
   const limits = await getModelLimits(ctx)
   const limit = limits.get(key)
   if (limit === undefined) return true
+  if (st.tokens === 0) {
+    await hydrateSessionTokens(ctx, st)
+  }
   const est = conversationTokens(st)
   return est <= limit
+}
+
+export function recordModelFailure(failedKey: string, c: Classified, fbOpts: FallbackOptions, st?: SessionState): void {
+  const p = providerOf(failedKey)
+  if (c.cls === "transient" || c.cls === "provider_level") {
+    let b = breakersByModel.get(failedKey)
+    if (!b) {
+      const pcfg = st?.opts?.providers?.[p] ?? fbOpts.providers?.[p] ?? fbOpts.providerDefaults ?? DEFAULTS.providerDefaults
+      b = new Breaker(pcfg?.breaker ?? DEFAULTS.providerDefaults.breaker)
+      breakersByModel.set(failedKey, b)
+    }
+    b.recordFailure()
+  }
+
+  if (c.cls === "quota") {
+    const reset = c.retryAfterMs ?? fbOpts.budgets?.quotaThresholdMs ?? QUOTA_THRESHOLD_MS
+    const until = now() + reset
+    blockedUntilByModel.set(failedKey, until)
+    if (st) st.rateLimitMs[failedKey] = until
+    if (c.quotaScope === "tier_free" && p) {
+      blockedUntilByProviderTier.set(`${p}:free`, until)
+    } else if (c.quotaScope === "provider" && p) {
+      blockedUntilByProvider.set(p, until)
+    }
+  } else if (c.cls === "transient") {
+    const pcfg = st?.opts?.providers?.[p] ?? fbOpts.providers?.[p] ?? fbOpts.providerDefaults ?? DEFAULTS.providerDefaults
+    const dur = c.retryAfterMs ?? pcfg?.rateLimitMs ?? fbOpts.interceptor?.defaultRateLimitMs ?? DEFAULTS.interceptor.defaultRateLimitMs
+    const ms = typeof dur === "number" && Number.isFinite(dur) && dur > 0 ? dur : DEFAULTS.interceptor.defaultRateLimitMs
+    if (st) st.rateLimitMs[failedKey] = now() + ms
+  }
 }
 
 /**
@@ -997,11 +1102,7 @@ async function pickLargeContext(ctx: any, st: SessionState, agent: string | unde
   for (const m of chain) {
     if (st.tried?.has?.(m)) continue
     if (st.outProviders?.has?.(providerOf(m))) continue
-    const b = breakersByModel.get(m)
-    if (b?.isOpen) continue
-    const bt = blockedUntilByModel.get(m)
-    if (bt !== undefined && bt > now()) continue
-    if (!isModelAvailable(m)) continue
+    if (!isModelHealthyNow(m)) continue
     const fits = await contextFits(ctx, st, m)
     if (!fits) continue
     return m
@@ -1031,6 +1132,7 @@ export interface Fallback {
   isModelAvailable: typeof isModelAvailable
   markModelUnavailable: typeof markModelUnavailable
   isModelHealthyNow: typeof isModelHealthyNow
+  recordModelFailure: typeof recordModelFailure
 }
 
 export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallback {
@@ -1041,11 +1143,19 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
   // ── retry hook: classify → sticky / failover / force retry (step 1 + step 2) ──
   const onRetry = async (e: any): Promise<void> => {
     try {
-      // F3: the retry hook carries no `kind`; auxiliary calls (compaction)
-      // arrive with agent "compaction" and resolve their own model before
-      // entering the retry loop — never switch for them.
+      // F3: auxiliary calls (compaction) arrive with agent "compaction" and resolve
+      // their own model before entering the retry loop — never switch for them.
+      // However, record failures, trip breakers/quotas, reload agents, and abort non-transient retries.
       if (e?.agent === "compaction") {
-        log(`retry ${e.sessionID}: agent=${e.agent} — skipping (auxiliary)`)
+        const c = classifyError(e?.error)
+        const failedKey = fmtModel(e?.model)
+        log(`retry ${e.sessionID}: agent=compaction model=${failedKey} -> ${c.cls} (${c.detail})`)
+        recordModelFailure(failedKey, c, fbOpts, sessions.get(e.sessionID))
+        if (c.cls === "model_not_found") markModelUnavailable(failedKey)
+        void Promise.resolve(ctx?.agent?.reload?.()).catch(() => undefined)
+        if (c.cls !== "transient") {
+          e.decision = { retry: false }
+        }
         return
       }
 
@@ -1131,6 +1241,12 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         }
       }
       if (attempt !== undefined) st.lastAttempt = attempt
+
+      if (st.switched && st.seat && failedKey !== st.seat && failedKey === st.lastSwitchedFrom) {
+        log(`retry ${e.sessionID}: received retry for previously switched model ${failedKey} while seat is ${st.seat} — aborting retry for old model`)
+        e.decision = { retry: false }
+        return
+      }
 
       // Fresh failure sequence: if no failover hops have occurred yet (st.hops === 0),
       // ensure the wall-clock deadline starts from THIS failure sequence rather than
@@ -1243,27 +1359,8 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         return
       }
 
-      // Breaker enforcement (HIGH, requirement: smart_task walks chain with
-      // breaker): before advancing past the failed model, record the failure.
-      // Transient-advance / provider-level failures trip the breaker (threshold
-      // consecutive failures, doubling cooldown ladder under the maxCooldownMs
-      // ceiling); quota failures stamp blockedUntil instead. Auth / forbidden /
-      // not-found never bench (V1 semantics).
-      if (c.cls === "transient" || c.cls === "provider_level") breakerFor(st, failedKey).recordFailure()
-      if (c.cls === "quota") {
-        const reset = c.retryAfterMs ?? fbOpts.budgets?.quotaThresholdMs ?? QUOTA_THRESHOLD_MS
-        const until = now() + reset
-        blockedUntilByModel.set(failedKey, until)
-        st.rateLimitMs[failedKey] = until
-      } else if (c.cls === "transient") {
-        // P1 #8: stamp the failed model's rate-limit window. `retryAfterMs` is a
-        // duration; without one, fall back to the provider override then the
-        // interceptor default (e.g. UnoRouter's 60s free-tier cooldown).
-        const pcfg = st.opts?.providers?.[providerOf(failedKey)] ?? st.opts?.providerDefaults ?? DEFAULTS.providerDefaults
-        const dur = c.retryAfterMs ?? pcfg?.rateLimitMs ?? st.opts?.interceptor?.defaultRateLimitMs ?? DEFAULTS.interceptor.defaultRateLimitMs
-        const ms = typeof dur === "number" && Number.isFinite(dur) && dur > 0 ? dur : DEFAULTS.interceptor.defaultRateLimitMs
-        st.rateLimitMs[failedKey] = now() + ms
-      }
+      // Breaker & quota enforcement: record failure before advancing.
+      recordModelFailure(failedKey, c, fbOpts, st)
 
       // P1 #11: auth / forbidden / provider-level failures invalidate the whole
       // provider for this turn's failover walk (a dead credential or sick gateway
@@ -1281,6 +1378,7 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         try {
           await enqueue(e.sessionID, async () => {
             if (!st.switched) st.originalSeat = st.seat
+            st.lastSwitchedFrom = failedKey
             await ctx?.session?.switchModel({ sessionID: e.sessionID, model: toModelRef(candidate) })
             st.switched = true
             st.tried.add(candidate)
@@ -1391,20 +1489,37 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
       e.options = options
       if (e?.input && typeof e.input === "object") e.input = { ...e.input, options }
 
-      // P1 #10: proactive context-overflow pre-emption — before dispatch, watch
-      // the conversation size against the seat model's context limit and switch
-      // via the catch-all large-context chain before the request that would
-      // overflow. Overflow bypasses the retry hook (blueprint §5.2/O3), so the
-      // proactive switch must live here.
+      // P1 #10: proactive context-overflow pre-emption & proactive self-compaction (V1 parity)
       const st = sid ? sessions.get(sid) : undefined
       if (st && !st.switched && key && key !== "unknown") {
         st.seat = key
         st.originalSeat = key
       }
+      if (st && st.tokens === 0) {
+        await hydrateSessionTokens(ctx, st)
+      }
+      if (sid && key && key !== "unknown") {
+        const limits = await getModelLimits(ctx)
+        const limit = limits.get(key)
+        const curTokens = st ? conversationTokens(st) : 0
+        const compactionRatio = fbOpts.budgets?.compactionRatio ?? fbOpts.compactionRatio ?? DEFAULTS.compactionRatio
+        const debounceMs = fbOpts.parentWatchdog?.compactionDebounceMs ?? fbOpts.watchdog?.compactionDebounceMs ?? 120000
+        if (typeof limit === "number" && limit > 0 && curTokens >= limit * compactionRatio) {
+          const last = lastCompactAt.get(sid) ?? 0
+          if (now() - last >= debounceMs) {
+            lastCompactAt.set(sid, now())
+            log(`context ${sid}: ${Math.round((curTokens / limit) * 100)}% of ${key} (${curTokens}/${limit}) — triggering proactive self-compaction at ${compactionRatio * 100}%`)
+            void Promise.resolve(ctx?.session?.compact?.({ sessionID: sid })).catch((err: any) => {
+              log(`context ${sid}: proactive self-compaction failed: ${String(err)}`)
+            })
+          }
+        }
+      }
       if (st && !st.preempted) {
         const limits = await getModelLimits(ctx)
         const limit = limits.get(key)
-        if (limit !== undefined && conversationTokens(st) > limit) {
+        const curTokens = conversationTokens(st)
+        if (limit !== undefined && curTokens > limit) {
           st.preempted = true
           const agentLocked = st.agent ?? e?.agent ?? "developer"
           const next = await pickLargeContext(ctx, st, agentLocked, key)
@@ -1416,7 +1531,7 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
               st.tried.add(next)
               st.chain = st.chain.filter((m) => m !== next)
               st.stickyUntil = 0
-              log(`context ${sid}: ~${conversationTokens(st)} tokens > ${limit} limit on ${key} — preemptively switched -> ${next}`)
+              log(`context ${sid}: ~${curTokens} tokens > ${limit} limit on ${key} — preemptively switched -> ${next}`)
             } catch { /* best effort */ }
           }
         }
@@ -1529,21 +1644,33 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
 
       for (const id of allIds) {
         const agentFb = fbFile?.agents?.[id]
-        const fallbacks = [
-          ...((agentFb?.fallback ?? []) as Array<FallbackEntry | string>),
-          ...((agentFb?.largeContextFallback ?? []) as Array<FallbackEntry | string>),
-          ...((fbFile?.defaultFallback ?? []) as Array<FallbackEntry | string>),
-        ]
+        const fallbacks = id === "compaction"
+          ? [
+              ...(agentFb?.largeContextModel ? [agentFb.largeContextModel] : []),
+              ...((agentFb?.largeContextFallback ?? []) as Array<FallbackEntry | string>),
+              ...(fbFile?.defaultLargeContextModel ? [fbFile.defaultLargeContextModel] : []),
+              ...((fbFile?.defaultLargeContextFallback ?? []) as Array<FallbackEntry | string>),
+              ...((agentFb?.fallback ?? []) as Array<FallbackEntry | string>),
+              ...((fbFile?.defaultFallback ?? []) as Array<FallbackEntry | string>),
+            ]
+          : [
+              ...((agentFb?.fallback ?? []) as Array<FallbackEntry | string>),
+              ...((agentFb?.largeContextFallback ?? []) as Array<FallbackEntry | string>),
+              ...((fbFile?.defaultFallback ?? []) as Array<FallbackEntry | string>),
+            ]
         const fallbackCandidates = fallbacks
           .map((e) => (typeof e === "string" ? e : e.model))
           .filter((m): m is string => typeof m === "string" && m.length > 0)
-        const healthyFallback = fallbackCandidates.find((m) => isModelAvailable(m)) ?? pickDefaultAvailableModel()
+        const healthyFallback =
+          fallbackCandidates.find((m) => isModelHealthyNow(m)) ??
+          fallbackCandidates.find((m) => isModelAvailable(m)) ??
+          pickDefaultAvailableModel()
 
         const existing = existingMap.get(id) ?? (typeof editor?.get === "function" ? editor.get(id) : undefined)
         const existingObj = existing && typeof existing === "object" ? existing : undefined
 
         const currentModelKey = existingObj?.model ? fmtModel(existingObj.model) : undefined
-        const currentModelHealthy = currentModelKey ? isModelAvailable(currentModelKey) : false
+        const currentModelHealthy = currentModelKey ? isModelHealthyNow(currentModelKey) : false
 
         // Guard: if operator configured an agent with an available, working model, leave it alone.
         if (existingObj && currentModelKey && currentModelHealthy) {
@@ -1551,7 +1678,7 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         }
 
         if (existingObj && currentModelKey && !currentModelHealthy) {
-          log(`agent '${id}' model '${currentModelKey}' is unavailable in catalog — replacing with healthy fallback '${healthyFallback}'`)
+          log(`agent '${id}' model '${currentModelKey}' is unhealthy/unavailable — replacing with healthy fallback '${healthyFallback}'`)
         }
 
         const agent: any = {
@@ -1714,6 +1841,7 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
     isModelAvailable,
     markModelUnavailable,
     isModelHealthyNow,
+    recordModelFailure,
   }
 
   startWatchdog()
@@ -1770,8 +1898,8 @@ export interface CompletionCheck {
 
 /** Token estimate for context headroom: input + cache read, null-safe. */
 export function contextTokens(m: any): number {
-  if (!m?.tokens) return 0
-  const t = m.tokens
+  const t = m?.tokens ?? m?.info?.tokens
+  if (!t) return 0
   const input = typeof t.input === "number" ? t.input : 0
   const cache = t.cache ?? {}
   const cacheRead = typeof cache?.read === "number" ? cache.read : 0
@@ -1951,6 +2079,26 @@ async function handleEvent(ctx: any, ev: any, opts: FallbackOptions): Promise<vo
         const st = sessions.get(sid)
         if (st) st.tokens = tok
         else stateFor(ctx, sid).tokens = tok
+
+        if (sid) {
+          const seat = sessions.get(sid)?.seat
+          if (seat && seat !== "unknown") {
+            const limits = modelLimitsCache
+            const limit = limits?.get(seat)
+            const compactionRatio = opts.budgets?.compactionRatio ?? opts.compactionRatio ?? DEFAULTS.compactionRatio
+            const debounceMs = opts.parentWatchdog?.compactionDebounceMs ?? opts.watchdog?.compactionDebounceMs ?? 120000
+            if (typeof limit === "number" && limit > 0 && tok >= limit * compactionRatio) {
+              const last = lastCompactAt.get(sid) ?? 0
+              if (now() - last >= debounceMs) {
+                lastCompactAt.set(sid, now())
+                logLine(`event ${sid}: ${Math.round((tok / limit) * 100)}% of ${seat} (${tok}/${limit}) — triggering proactive self-compaction at ${compactionRatio * 100}%`)
+                void Promise.resolve(ctx?.session?.compact?.({ sessionID: sid })).catch((err: any) => {
+                  logLine(`event ${sid}: proactive self-compaction failed: ${String(err)}`)
+                })
+              }
+            }
+          }
+        }
       }
     }
   }
@@ -2060,8 +2208,12 @@ async function loadModelLimits(ctx: any): Promise<Map<string, number>> {
     const data = res?.data ?? res?.models ?? []
     const m = new Map<string, number>()
     for (const info of Array.isArray(data) ? data : []) {
-      const ctx0 = info?.limit?.context
-      if (typeof ctx0 === "number") m.set(`${info?.providerID}/${info?.id}`, ctx0)
+      const full = `${info?.providerID}/${info?.id}`
+      const usable = usableContextLimit(info)
+      if (typeof usable === "number") {
+        m.set(full, usable)
+        m.set(full.toLowerCase(), usable)
+      }
     }
     return m
   } catch {
