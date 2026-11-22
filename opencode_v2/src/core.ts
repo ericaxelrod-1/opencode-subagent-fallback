@@ -380,6 +380,21 @@ export interface FallbackOptions {
   budgetMs: number
   maxIterations: number
   compactionRatio: number
+  /**
+   * consoleLogging: Master toggle for echoing fallback, retry, and breaker events to console (stderr/stdout).
+   * DEFAULT: false (silent console / clean boundary isolation).
+   *
+   * Architectural Rationale (Silent Resilience):
+   * In multi-agent systems, leaf worker stdout/stderr is monitored by parent orchestrator LLMs.
+   * When orchestrators observe intermediate provider failure signals (HTTP 429, 503, quota exhaustion, circuit breaker trips),
+   * their RLHF'd troubleshooting reflexes trigger, leading to panicked, counterproductive manual workarounds
+   * (e.g. launching rogue retries with hallucinated flags or aborting healthy batches) while the fallback
+   * plugin is already resolving the issue underneath.
+   *
+   * Set to true via config ("consoleLogging": true) or environment variable (OPENCODE_FALLBACK_CONSOLE=1)
+   * strictly for local human terminal debugging.
+   */
+  consoleLogging?: boolean
   budgets: BudgetsConfig
   interceptor: InterceptorConfig
   watchdog: WatchdogConfig
@@ -392,6 +407,9 @@ const DEFAULTS: FallbackOptions = {
   budgetMs: 600000,
   maxIterations: 10,
   compactionRatio: 0.4,
+  // consoleLogging: Suppresses all fallback, retry, and breaker output to stdout/stderr when false (default: false).
+  // Silent resilience: hides internal model failover traces from parent orchestrator agents to prevent panic.
+  consoleLogging: false,
   budgets: {
     fallbackBudgetMs: 600000,
     maxIterations: 10,
@@ -442,6 +460,7 @@ function resolveOpts(opts?: Partial<FallbackOptions>): FallbackOptions {
     budgetMs: typeof o.budgetMs === "number" ? o.budgetMs : budgets.fallbackBudgetMs,
     maxIterations: budgets.maxIterations,
     compactionRatio: budgets.compactionRatio,
+    consoleLogging: typeof o.consoleLogging === "boolean" ? o.consoleLogging : DEFAULTS.consoleLogging,
     budgets,
     interceptor,
     watchdog,
@@ -653,10 +672,20 @@ function loadRoot(ctx: any): FallbackOptions {
   const maxIterations = budgets.maxIterations
   const compactionRatio = budgets.compactionRatio
 
+  // Console output suppression (Silent Resilience):
+  // Suppress stderr/stdout fallback traces by default to keep orchestrator agents calm.
+  const consoleLogging =
+    typeof raw.consoleLogging === "boolean"
+      ? raw.consoleLogging
+      : typeof defaults.consoleLogging === "boolean"
+        ? defaults.consoleLogging
+        : DEFAULTS.consoleLogging
+
   return {
     budgetMs: fallbackBudgetMs,
     maxIterations,
     compactionRatio,
+    consoleLogging,
     budgets,
     interceptor,
     watchdog,
@@ -1293,8 +1322,9 @@ function isCompactionModel(modelKey: string, ctx?: any, opts?: any): boolean {
 
 export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallback {
   const fbOpts = resolveOpts(opts ?? loadRoot(ctx))
+  setGlobalConsoleLogging(fbOpts.consoleLogging ?? false)
 
-  const log = logLine
+  const log = (msg: string) => logLine(msg, fbOpts)
 
   // ── retry hook: classify → sticky / failover / force retry (step 1 + step 2) ──
   const onRetry = async (e: any): Promise<void> => {
@@ -2278,9 +2308,9 @@ async function handleEvent(ctx: any, ev: any, opts: FallbackOptions): Promise<vo
               const last = lastCompactAt.get(sid) ?? 0
               if (now() - last >= debounceMs) {
                 lastCompactAt.set(sid, now())
-                logLine(`event ${sid}: ${Math.round((tok / limit) * 100)}% of ${seat} (${tok}/${limit}) — triggering proactive self-compaction at ${Math.round(compactionRatio * 100)}%`)
+                logLine(`event ${sid}: ${Math.round((tok / limit) * 100)}% of ${seat} (${tok}/${limit}) — triggering proactive self-compaction at ${Math.round(compactionRatio * 100)}%`, opts)
                 void Promise.resolve(ctx?.session?.compact?.({ sessionID: sid })).catch((err: any) => {
-                  logLine(`event ${sid}: proactive self-compaction failed: ${String(err)}`)
+                  logLine(`event ${sid}: proactive self-compaction failed: ${String(err)}`, opts)
                 })
               }
             }
@@ -2337,7 +2367,13 @@ async function recover(ctx: any, sid: string): Promise<void> {
 const LOG_DIR = join(homedir(), ".local", "share", "opencode", "log")
 const LOG_FILE = join(LOG_DIR, "fallback.log")
 
-function logLine(msg: string): void {
+let globalConsoleLogging = false
+
+export function setGlobalConsoleLogging(enabled: boolean): void {
+  globalConsoleLogging = enabled
+}
+
+function logLine(msg: string, optsOrBool?: FallbackOptions | boolean): void {
   const clean = redact(msg)
   const line = `${new Date().toISOString()} [subagent-fallback] ${clean}\n`
   try {
@@ -2348,7 +2384,16 @@ function logLine(msg: string): void {
       appendFileSync(LOG_FILE, line, "utf8")
     } catch { /* logging must never break the hook or sweep */ }
   }
-  if (process.env.OPENCODE_FALLBACK_CONSOLE === "1") {
+  // Console output suppression (Silent Resilience):
+  // Suppressed by default (consoleLogging: false) to prevent parent orchestrators from misinterpreting
+  // intermediate failover signals (429, 503, breaker trips) as fatal job failures.
+  // Full diagnostics remain persistently available in fallback.log on disk.
+  const isSilent = process.env.OPENCODE_FALLBACK_SILENT === "1"
+  const consoleConfig = typeof optsOrBool === "boolean"
+    ? optsOrBool
+    : (optsOrBool?.consoleLogging ?? globalConsoleLogging)
+  const allowConsole = !isSilent && (consoleConfig === true || process.env.OPENCODE_FALLBACK_CONSOLE === "1")
+  if (allowConsole) {
     try { console.error(`[subagent-fallback] ${clean}`) } catch { /* best effort */ }
   }
 }
@@ -2379,7 +2424,7 @@ async function runSweep(ctx: any, opts: FallbackOptions): Promise<void> {
     // Recovery: interrupt, then verify via context before re-prompting.
     // (Single recovery path — l.onStall IS the recovery; do not call recover
     // twice for the same stall.)
-    logLine(`watchdog ${sid}: ${seenFirstToken ? "stall" : "first-token"} timeout (${silence}ms >= ${limit}ms) — interrupting`)
+    logLine(`watchdog ${sid}: ${seenFirstToken ? "stall" : "first-token"} timeout (${silence}ms >= ${limit}ms) — interrupting`, opts)
     armOurAbort(sid, t)
     try { await ctx?.session?.interrupt?.({ sessionID: sid }) } catch { /* best effort */ }
     l.startedAt = t

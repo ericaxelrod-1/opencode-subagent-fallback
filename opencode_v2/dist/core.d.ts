@@ -123,6 +123,21 @@ export interface FallbackOptions {
     budgetMs: number;
     maxIterations: number;
     compactionRatio: number;
+    /**
+     * consoleLogging: Master toggle for echoing fallback, retry, and breaker events to console (stderr/stdout).
+     * DEFAULT: false (silent console / clean boundary isolation).
+     *
+     * Architectural Rationale (Silent Resilience):
+     * In multi-agent systems, leaf worker stdout/stderr is monitored by parent orchestrator LLMs.
+     * When orchestrators observe intermediate provider failure signals (HTTP 429, 503, quota exhaustion, circuit breaker trips),
+     * their RLHF'd troubleshooting reflexes trigger, leading to panicked, counterproductive manual workarounds
+     * (e.g. launching rogue retries with hallucinated flags or aborting healthy batches) while the fallback
+     * plugin is already resolving the issue underneath.
+     *
+     * Set to true via config ("consoleLogging": true) or environment variable (OPENCODE_FALLBACK_CONSOLE=1)
+     * strictly for local human terminal debugging.
+     */
+    consoleLogging?: boolean;
     budgets: BudgetsConfig;
     interceptor: InterceptorConfig;
     watchdog: WatchdogConfig;
@@ -253,6 +268,7 @@ export declare function lastAssistantInTurn(msgs: any[]): any | undefined;
 /** Assistant text of the turn's last assistant message, concatenating across Ms.Continue splits (D3). */
 export declare function assistantText(msgs: any[]): string;
 export declare function checkCompletion(msgs: any[]): CompletionCheck;
+export declare function setGlobalConsoleLogging(enabled: boolean): void;
 declare function runSweep(ctx: any, opts: FallbackOptions): Promise<void>;
 declare function redact(s: string): string;
 export declare const __redactForTests: typeof redact;
