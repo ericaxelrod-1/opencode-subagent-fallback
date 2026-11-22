@@ -806,12 +806,12 @@ async function main(): Promise<void> {
   console.log("\ndynamic compaction curve & double-counting fix:")
   {
     __resetStateForTests()
-    // Test piecewise logarithmic curve anchors
+    // Test logarithmic curve anchors
     check("32k or less gets max ratio 0.85 (15% margin)", dynamicCompactionRatio(32768) === 0.85)
     check("small 16k gets max ratio 0.85", dynamicCompactionRatio(16000) === 0.85)
-    check("64k gets ~0.82", Math.abs(dynamicCompactionRatio(65536) - 0.823) < 0.005)
-    check("128k gets ~0.80", Math.abs(dynamicCompactionRatio(131072) - 0.796) < 0.005)
-    check("200k gets 0.78 (22% overhead, significantly less than 40%)", dynamicCompactionRatio(200000) === 0.78)
+    check("64k gets ~0.76", Math.abs(dynamicCompactionRatio(65536) - 0.76) < 0.005)
+    check("128k gets ~0.67", Math.abs(dynamicCompactionRatio(131072) - 0.67) < 0.005)
+    check("200k gets ~0.615", Math.abs(dynamicCompactionRatio(200000) - 0.615) < 0.005)
     check("1M gets base ratio 0.40 (60% margin)", dynamicCompactionRatio(1048576) === 0.40)
     check("2M gets base ratio 0.40", dynamicCompactionRatio(2097152) === 0.40)
 
@@ -829,7 +829,7 @@ async function main(): Promise<void> {
 
     // Simulate session: large prompt (67k chars = ~16.7k tokens) + prior tokens (26.6k)
     // 1) 26.6k tokens on 200k limit is 13.3%
-    // 2) Compaction threshold on 200k is 78% (156k tokens)
+    // 2) Compaction threshold on 200k is 61.5% (123k tokens)
     // 3) Proactive compaction does not trigger at 26.6k tokens or at 122.8k tokens
     await fbComp.onPrompt({ sessionID: "ses_curve", agent: "developer", text: "x".repeat(270600) })
     // Simulate event from assistant with actual measured tokens (26,652)
@@ -850,7 +850,7 @@ async function main(): Promise<void> {
     check("proactive compaction does NOT trigger at 26.6k tokens on 200k model (curve + no double counting)", compactCalls === 0)
 
     // Now simulate conversation reaching 122.8k tokens on 200k model (61.4%):
-    // Threshold is 78% (156k), so 122.8k tokens MUST NOT trigger compaction!
+    // Threshold is 61.5% (123k), so 122.8k tokens does NOT trigger compaction!
     const evCtx122k: any = { sessionID: "ses_curve_122k", agent: "developer", model: { providerID: "opencode", id: "big-pickle" } }
     await fbComp.onPrompt({ sessionID: "ses_curve_122k", agent: "developer", text: "x" })
     const st122k = (fbComp as any).ctx ? undefined : undefined
@@ -876,7 +876,7 @@ async function main(): Promise<void> {
       },
     })
     await fbComp.onContext(evCtx122k)
-    check("proactive compaction does NOT trigger at 122.8k tokens on 200k model (156k usable limit, overhead 22%)", compactCalls === 0)
+    check("proactive compaction does NOT trigger at 122.8k tokens on 200k model (123k usable limit, no double counting)", compactCalls === 0)
   }
 
   console.log("\ncandidate exhaustion loop termination & compaction retry detection:")

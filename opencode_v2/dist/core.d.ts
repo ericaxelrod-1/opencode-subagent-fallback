@@ -221,17 +221,14 @@ export declare function usableContextLimit(info: any): number | undefined;
  */
 export declare function rawContextLimit(info: any): number | undefined;
 /**
- * Dynamic compaction ratio on a piecewise logarithmic curve:
- * - Smaller context windows (<= 32k) clamp at 0.85 (15% safety margin).
- * - Mid-size models (e.g. 128k - 200k) preserve high usable capacity with overhead
- *   significantly less than 40% (~22% overhead at 200k -> 0.78 ratio).
- * - Massive models (>= 1M) scale down to baseRatio (default 0.40 = 40%, 60% margin).
+ * Dynamic compaction ratio on a continuous logarithmic curve:
+ * Smaller context windows get a higher threshold (smaller margin, up to 85%),
+ * while 1M+ windows scale down to baseRatio (default 0.40 = 40%, 60% margin).
  *
  * Formula:
  *   W <= 32k: 0.85
- *   32k < W <= 200k: linear on log2 scale between 32k (0.85) and 200k (0.78)
- *   200k < W < 1M:   linear on log2 scale between 200k (0.78) and 1M (baseRatio)
  *   W >= 1M:  baseRatio (default 0.40)
+ *   In between: linear interpolation on log2 scale between 32k (0.85) and 1M (baseRatio).
  */
 export declare function dynamicCompactionRatio(limit: number, baseRatio?: number): number;
 export declare function initCatalog(ctx: any): Promise<void>;

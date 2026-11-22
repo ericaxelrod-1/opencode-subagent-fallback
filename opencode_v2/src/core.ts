@@ -874,44 +874,32 @@ export function rawContextLimit(info: any): number | undefined {
 }
 
 /**
- * Dynamic compaction ratio on a piecewise logarithmic curve:
- * - Smaller context windows (<= 32k) clamp at 0.85 (15% safety margin).
- * - Mid-size models (e.g. 128k - 200k) preserve high usable capacity with overhead
- *   significantly less than 40% (~22% overhead at 200k -> 0.78 ratio).
- * - Massive models (>= 1M) scale down to baseRatio (default 0.40 = 40%, 60% margin).
+ * Dynamic compaction ratio on a continuous logarithmic curve:
+ * Smaller context windows get a higher threshold (smaller margin, up to 85%),
+ * while 1M+ windows scale down to baseRatio (default 0.40 = 40%, 60% margin).
  *
  * Formula:
  *   W <= 32k: 0.85
- *   32k < W <= 200k: linear on log2 scale between 32k (0.85) and 200k (0.78)
- *   200k < W < 1M:   linear on log2 scale between 200k (0.78) and 1M (baseRatio)
  *   W >= 1M:  baseRatio (default 0.40)
+ *   In between: linear interpolation on log2 scale between 32k (0.85) and 1M (baseRatio).
  */
 export function dynamicCompactionRatio(limit: number, baseRatio: number = DEFAULTS.compactionRatio): number {
   if (typeof limit !== "number" || !Number.isFinite(limit) || limit <= 0) return baseRatio
   const W_MIN = 32768   // 32k (2^15)
-  const W_MID = 200000  // 200k
   const W_MAX = 1048576 // 1M (2^20)
   const MAX_RATIO = 0.85
-  const MID_RATIO = 0.78 // 22% overhead at 200k (significantly less than 40%)
   const MIN_RATIO = Math.min(baseRatio, MAX_RATIO)
 
   if (limit <= W_MIN) return MAX_RATIO
   if (limit >= W_MAX) return MIN_RATIO
 
   const logMin = Math.log2(W_MIN)
-  const logMid = Math.log2(W_MID)
   const logMax = Math.log2(W_MAX)
   const logW = Math.log2(limit)
 
-  if (limit <= W_MID) {
-    const factor = (logMid - logW) / (logMid - logMin)
-    const ratio = MID_RATIO + (MAX_RATIO - MID_RATIO) * factor
-    return Math.round(ratio * 1000) / 1000
-  } else {
-    const factor = (logMax - logW) / (logMax - logMid)
-    const ratio = MIN_RATIO + (MID_RATIO - MIN_RATIO) * factor
-    return Math.round(ratio * 1000) / 1000
-  }
+  const factor = (logMax - logW) / (logMax - logMin)
+  const ratio = MIN_RATIO + (MAX_RATIO - MIN_RATIO) * factor
+  return Math.round(ratio * 1000) / 1000
 }
 
 export async function initCatalog(ctx: any): Promise<void> {
