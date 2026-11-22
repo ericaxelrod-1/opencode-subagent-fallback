@@ -755,6 +755,32 @@ async function main(): Promise<void> {
       JSON.stringify(savedAgents.get("compaction")),
     )
 
+    // Test: compaction switches to next model in fallback chain when candidate available
+    __resetStateForTests()
+    __setKnownModelsForTests(["c/comp1", "c/comp2"])
+    const switchesComp: any[] = []
+    const fbCompChain = createFallback(mockCtx(switchesComp), {
+      agents: {
+        compaction: {
+          largeContextModel: "c/comp1",
+          largeContextFallback: ["c/comp2"],
+        },
+      },
+    } as any)
+    const evCompFail: any = {
+      sessionID: "ses_comp_chain",
+      agent: "compaction",
+      model: { providerID: "c", id: "comp1" },
+      error: { message: "Too many requests", statusCode: 429 },
+      decision: { retry: true },
+    }
+    await fbCompChain.onRetry(evCompFail)
+    check(
+      "compaction switches to next model in fallback chain",
+      switchesComp.length === 1 && switchesComp[0]?.model?.id === "comp2" && evCompFail.decision.retry === true,
+      JSON.stringify(switchesComp),
+    )
+
     __setKnownModelsForTests(undefined)
   }
 
@@ -780,13 +806,12 @@ async function main(): Promise<void> {
   console.log("\ndynamic compaction curve & double-counting fix:")
   {
     __resetStateForTests()
-    // Test logarithmic curve anchors
+    // Test piecewise logarithmic curve anchors
     check("32k or less gets max ratio 0.85 (15% margin)", dynamicCompactionRatio(32768) === 0.85)
     check("small 16k gets max ratio 0.85", dynamicCompactionRatio(16000) === 0.85)
-    check("64k gets ~0.76", Math.abs(dynamicCompactionRatio(65536) - 0.76) < 0.005)
-    check("128k gets ~0.67", Math.abs(dynamicCompactionRatio(131072) - 0.67) < 0.005)
-    check("big-pickle 136k usable gets ~0.665", Math.abs(dynamicCompactionRatio(136000) - 0.665) < 0.005)
-    check("200k gets ~0.615", Math.abs(dynamicCompactionRatio(200000) - 0.615) < 0.005)
+    check("64k gets ~0.82", Math.abs(dynamicCompactionRatio(65536) - 0.823) < 0.005)
+    check("128k gets ~0.80", Math.abs(dynamicCompactionRatio(131072) - 0.796) < 0.005)
+    check("200k gets 0.78 (22% overhead, significantly less than 40%)", dynamicCompactionRatio(200000) === 0.78)
     check("1M gets base ratio 0.40 (60% margin)", dynamicCompactionRatio(1048576) === 0.40)
     check("2M gets base ratio 0.40", dynamicCompactionRatio(2097152) === 0.40)
 
@@ -799,19 +824,16 @@ async function main(): Promise<void> {
         compact: async () => { compactCalls++ },
       },
     }
-    __setModelLimitsForTests({ "opencode/big-pickle": 136000 })
+    __setModelLimitsForTests({ "opencode/big-pickle": 200000 })
     const fbComp = createFallback(ctxComp, { providerDefaults: { ...STICKY_FAST, stickyMs: 0 } })
 
     // Simulate session: large prompt (67k chars = ~16.7k tokens) + prior tokens (26.6k)
-    // In buggy code: 26.6k + 67.6k = 94.3k (> 40% of 136k = 54.4k) -> compacted immediately!
-    // With fix:
-    // 1) 26.6k tokens on 136k limit is 19.6%
-    // 2) Compaction threshold on 136k is ~66.5% (~90.4k)
-    // 3) When tokens are already measured in the session, prompt is not double-counted
+    // 1) 26.6k tokens on 200k limit is 13.3%
+    // 2) Compaction threshold on 200k is 78% (156k tokens)
+    // 3) Proactive compaction does not trigger at 26.6k tokens or at 122.8k tokens
     await fbComp.onPrompt({ sessionID: "ses_curve", agent: "developer", text: "x".repeat(270600) })
     // Simulate event from assistant with actual measured tokens (26,652)
     // This marks prompt as absorbed
-    // Event format: { properties: { info: { tokens: { input: 284, cache: { read: 26368 } } } } }
     const evChunk = {
       type: "session.text.delta",
       sessionID: "ses_curve",
@@ -825,7 +847,36 @@ async function main(): Promise<void> {
     const evCtx: any = { sessionID: "ses_curve", agent: "developer", model: { providerID: "opencode", id: "big-pickle" } }
     await fbComp.onContext(evCtx)
 
-    check("proactive compaction does NOT trigger at 26.6k tokens on 136k model (curve + no double counting)", compactCalls === 0)
+    check("proactive compaction does NOT trigger at 26.6k tokens on 200k model (curve + no double counting)", compactCalls === 0)
+
+    // Now simulate conversation reaching 122.8k tokens on 200k model (61.4%):
+    // Threshold is 78% (156k), so 122.8k tokens MUST NOT trigger compaction!
+    const evCtx122k: any = { sessionID: "ses_curve_122k", agent: "developer", model: { providerID: "opencode", id: "big-pickle" } }
+    await fbComp.onPrompt({ sessionID: "ses_curve_122k", agent: "developer", text: "x" })
+    const st122k = (fbComp as any).ctx ? undefined : undefined
+    // Inject 122,803 tokens into session state
+    const evChunk122k = {
+      type: "session.text.delta",
+      sessionID: "ses_curve_122k",
+      properties: {
+        info: {
+          tokens: { input: 2803, cache: { read: 120000 } },
+        },
+      },
+    }
+    // Handle delta event to set st.tokens = 122803
+    await fbComp.onPrompt({ sessionID: "ses_curve_122k", agent: "developer" })
+    await (fbComp as any).consumeEvents?.({
+      event: {
+        subscribe: () => ({
+          async *[Symbol.asyncIterator]() {
+            yield evChunk122k
+          },
+        }),
+      },
+    })
+    await fbComp.onContext(evCtx122k)
+    check("proactive compaction does NOT trigger at 122.8k tokens on 200k model (156k usable limit, overhead 22%)", compactCalls === 0)
   }
 
   console.log("\ncandidate exhaustion loop termination & compaction retry detection:")

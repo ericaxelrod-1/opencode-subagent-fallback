@@ -798,6 +798,7 @@ const lastCompactAt = new Map<string, number>()
 const MAX_SESSIONS = 256
 
 let modelLimitsCache: Map<string, number> | undefined
+let rawModelLimitsCache: Map<string, number> | undefined
 let knownModelsCache: Set<string> | undefined
 
 export function __resetStateForTests(): void {
@@ -806,6 +807,7 @@ export function __resetStateForTests(): void {
   blockedUntilByModel.clear()
   lastCompactAt.clear()
   modelLimitsCache = undefined
+  rawModelLimitsCache = undefined
   knownModelsCache = undefined
   const dir = currentConfigDir || (process.env.OPENCODE_CONFIG_DIR ?? "")
   if (dir) {
@@ -818,6 +820,15 @@ export function __resetStateForTests(): void {
 /** Test seam: inject model context limits (providerID/id -> context window). */
 export function __setModelLimitsForTests(limits: Record<string, number>): void {
   modelLimitsCache = new Map(Object.entries(limits))
+  rawModelLimitsCache = new Map(Object.entries(limits))
+}
+
+export function __setRawModelLimitsForTests(limits: Record<string, number> | undefined): void {
+  if (!limits) {
+    rawModelLimitsCache = undefined
+    return
+  }
+  rawModelLimitsCache = new Map(Object.entries(limits))
 }
 
 /** Test seam: inject known models for catalog validation tests. */
@@ -851,32 +862,56 @@ export function usableContextLimit(info: any): number | undefined {
 }
 
 /**
- * Dynamic compaction ratio on a logarithmic curve (Option 2):
- * Smaller context windows get a higher threshold (smaller margin, up to 85%),
- * while 1M+ windows scale down to baseRatio (default 0.40 = 40%, 60% margin).
+ * Raw context ceiling (nominal window) for compaction ratio calculation,
+ * avoiding compounding double-reserves on models where input limit < context limit.
+ */
+export function rawContextLimit(info: any): number | undefined {
+  const ctx0 = info?.limit?.context
+  const inp0 = info?.limit?.input
+  if (typeof ctx0 === "number" && ctx0 > 0) return ctx0
+  if (typeof inp0 === "number" && inp0 > 0) return inp0
+  return undefined
+}
+
+/**
+ * Dynamic compaction ratio on a piecewise logarithmic curve:
+ * - Smaller context windows (<= 32k) clamp at 0.85 (15% safety margin).
+ * - Mid-size models (e.g. 128k - 200k) preserve high usable capacity with overhead
+ *   significantly less than 40% (~22% overhead at 200k -> 0.78 ratio).
+ * - Massive models (>= 1M) scale down to baseRatio (default 0.40 = 40%, 60% margin).
  *
  * Formula:
  *   W <= 32k: 0.85
+ *   32k < W <= 200k: linear on log2 scale between 32k (0.85) and 200k (0.78)
+ *   200k < W < 1M:   linear on log2 scale between 200k (0.78) and 1M (baseRatio)
  *   W >= 1M:  baseRatio (default 0.40)
- *   In between: linear interpolation on log2 scale between 32k (0.85) and 1M (baseRatio).
  */
 export function dynamicCompactionRatio(limit: number, baseRatio: number = DEFAULTS.compactionRatio): number {
   if (typeof limit !== "number" || !Number.isFinite(limit) || limit <= 0) return baseRatio
   const W_MIN = 32768   // 32k (2^15)
+  const W_MID = 200000  // 200k
   const W_MAX = 1048576 // 1M (2^20)
   const MAX_RATIO = 0.85
+  const MID_RATIO = 0.78 // 22% overhead at 200k (significantly less than 40%)
   const MIN_RATIO = Math.min(baseRatio, MAX_RATIO)
 
   if (limit <= W_MIN) return MAX_RATIO
   if (limit >= W_MAX) return MIN_RATIO
 
   const logMin = Math.log2(W_MIN)
+  const logMid = Math.log2(W_MID)
   const logMax = Math.log2(W_MAX)
   const logW = Math.log2(limit)
 
-  const factor = (logMax - logW) / (logMax - logMin)
-  const ratio = MIN_RATIO + (MAX_RATIO - MIN_RATIO) * factor
-  return Math.round(ratio * 1000) / 1000
+  if (limit <= W_MID) {
+    const factor = (logMid - logW) / (logMid - logMin)
+    const ratio = MID_RATIO + (MAX_RATIO - MID_RATIO) * factor
+    return Math.round(ratio * 1000) / 1000
+  } else {
+    const factor = (logMax - logW) / (logMax - logMid)
+    const ratio = MIN_RATIO + (MID_RATIO - MIN_RATIO) * factor
+    return Math.round(ratio * 1000) / 1000
+  }
 }
 
 export async function initCatalog(ctx: any): Promise<void> {
@@ -1036,14 +1071,28 @@ export function isModelHealthyNow(model: any): boolean {
   return true
 }
 
-function fallbackChainFor(ctx: any, agent?: string): string[] {
+function fallbackChainFor(ctx: any, agent?: string, opts?: any): string[] {
   const fbFile = loadFallbackFile(ctx)
   const list: Array<FallbackEntry | string> = []
-  const agentFb = agent ? fbFile?.agents?.[agent] : undefined
-  list.push(...((agentFb?.fallback ?? []) as Array<FallbackEntry | string>))
-  list.push(...((agentFb?.largeContextFallback ?? []) as Array<FallbackEntry | string>))
-  list.push(...((fbFile?.defaultFallback ?? []) as Array<FallbackEntry | string>))
-  list.push(...((fbFile?.defaultLargeContextFallback ?? []) as Array<FallbackEntry | string>))
+  const sources = [opts, fbFile].filter(Boolean)
+  if (agent === "compaction") {
+    for (const src of sources) {
+      const agentFb = src.agents?.compaction
+      if (agentFb?.largeContextModel) list.push(agentFb.largeContextModel)
+      if (agentFb?.largeContextFallback) list.push(...agentFb.largeContextFallback)
+      if (agentFb?.fallback) list.push(...agentFb.fallback)
+      if (src.defaultLargeContextFallback) list.push(...src.defaultLargeContextFallback)
+      if (src.largeContextFallback) list.push(...src.largeContextFallback)
+    }
+  } else {
+    for (const src of sources) {
+      const agentFb = agent ? src.agents?.[agent] : undefined
+      if (agentFb?.fallback) list.push(...agentFb.fallback)
+      if (agentFb?.largeContextFallback) list.push(...agentFb.largeContextFallback)
+      if (src.defaultFallback) list.push(...src.defaultFallback)
+      if (src.defaultLargeContextFallback) list.push(...src.defaultLargeContextFallback)
+    }
+  }
   const models = list.map((e) => (typeof e === "string" ? e : e.model)).filter((m): m is string => typeof m === "string" && m.length > 0)
   return [...new Set(models)]
 }
@@ -1055,7 +1104,8 @@ function stateFor(ctx: any, sid: string, seat?: string, agent?: string, opts?: F
     const oldest = sessions.keys().next().value
     if (oldest !== undefined) sessions.delete(oldest)
   }
-  const chain = fallbackChainFor(ctx, agent).length > 0 ? fallbackChainFor(ctx, agent) : [HARDCODED_FALLBACK_TARGET]
+  const resolvedChain = fallbackChainFor(ctx, agent, opts)
+  const chain = resolvedChain.length > 0 ? resolvedChain : (agent === "compaction" ? [] : [HARDCODED_FALLBACK_TARGET])
   st = {
     sid,
     chain,
@@ -1096,8 +1146,9 @@ function enqueue<T>(sid: string, fn: () => Promise<T>): Promise<T> {
  * server's attempt counter reveals a turn boundary the prompt hook missed.
  */
 function resetTurnState(st: SessionState, ctx: any, agent?: string): void {
-  const chain = fallbackChainFor(ctx, agent ?? st.agent)
-  st.chain = chain.length > 0 ? chain : [HARDCODED_FALLBACK_TARGET]
+  const targetAgent = agent ?? st.agent
+  const resolvedChain = fallbackChainFor(ctx, targetAgent, st.opts)
+  st.chain = resolvedChain.length > 0 ? resolvedChain : (targetAgent === "compaction" ? [] : [HARDCODED_FALLBACK_TARGET])
   st.tried = new Set<string>()
   st.permFailed = new Set<string>()
   st.switched = false
@@ -1356,18 +1407,14 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         log(`retry ${e.sessionID}: agent=compaction model=${failedKey} -> ${c.cls} (${c.detail})`)
         recordModelFailure(failedKey, c, fbOpts, sessions.get(e.sessionID))
         if (c.cls === "model_not_found") markModelUnavailable(failedKey)
-        void Promise.resolve(ctx?.agent?.reload?.()).catch(() => undefined)
-        if (c.cls !== "transient") {
-          e.decision = { retry: false }
-        }
-        return
+        await Promise.resolve(ctx?.agent?.reload?.()).catch(() => undefined)
+      } else {
+        log(
+          `retry ${e.sessionID}: ${failedKey} attempt=${e?.attempt} -> ${c.cls}${c.detail ? ` (${c.detail})` : ""}${
+            c.retryAfterMs !== undefined ? ` retryAfterMs=${c.retryAfterMs}` : ""
+          }`,
+        )
       }
-
-      log(
-        `retry ${e.sessionID}: ${failedKey} attempt=${e?.attempt} -> ${c.cls}${c.detail ? ` (${c.detail})` : ""}${
-          c.retryAfterMs !== undefined ? ` retryAfterMs=${c.retryAfterMs}` : ""
-        }`,
-      )
 
       // O2: the retry hook is not called once the budget is spent; treat
       // `attempt` as the hard signal anyway and never advance beyond it.
@@ -1381,6 +1428,7 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
       const existingMaxIters = existingBudget?.maxIterations ?? fbOpts.maxIterations ?? DEFAULTS.budgets.maxIterations
       const canRollover =
         spent &&
+        !isCompaction &&
         !!existingSt &&
         (existingSt.hops === 0 || now() < existingSt.deadline) &&
         existingSt.hops < existingMaxIters &&
@@ -1421,7 +1469,8 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         rolloverTimers.add(timer)
       }
 
-      const st = stateFor(ctx, e.sessionID, failedKey, e?.agent, fbOpts)
+      const agentName = isCompaction ? "compaction" : (e?.agent ?? "developer")
+      const st = stateFor(ctx, e.sessionID, failedKey, agentName, fbOpts)
 
       const budget = st.opts?.budgets ?? fbOpts.budgets
       const budgetMs = budget?.fallbackBudgetMs ?? fbOpts.budgetMs ?? DEFAULTS.budgets.fallbackBudgetMs
@@ -1462,7 +1511,9 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
       // sticky window and the attempt budget is not spent. The window is
       // measured from the first transient failure — once it lapses the chain
       // advances (V1 sticky discipline, corrected blueprint §5.2/D1).
-      const isTransientClass = c.cls === "transient"
+      // Compaction calls do not wait in a long sticky window on rate-limited or broken models;
+      // they advance immediately down the compaction fallback chain.
+      const isTransientClass = c.cls === "transient" && !isCompaction
       if (isTransientClass) {
         const windowMs = (fbOpts.providers[providerOf(failedKey)] ?? fbOpts.providerDefaults)?.stickyMs ?? DEFAULTS.providerDefaults.stickyMs
         if (st.stickyUntil === 0) st.stickyUntil = now() + windowMs
@@ -1562,11 +1613,11 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
       // cannot hold the conversation. On context overflow, run the catch-all
       // large-context fallback chain instead of the regular fallback list;
       // in-seat self-compaction stays the normal tier.
-      const agentLocked = st.agent ?? e?.agent ?? "developer"
+      const agentLocked = isCompaction ? "compaction" : (st.agent ?? e?.agent ?? "developer")
       let target: string | undefined = next
       if (c.cls === "context_too_large") {
         target = await pickLargeContext(ctx, st, agentLocked, failedKey)
-      } else {
+      } else if (!isCompaction) {
         const fits = await contextFits(ctx, st, next)
         if (!fits) target = await pickLargeContext(ctx, st, agentLocked, failedKey)
       }
@@ -1708,17 +1759,20 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         await hydrateSessionTokens(ctx, st)
       }
       if (sid && key && key !== "unknown") {
+        const rawLimits = await getRawModelLimits(ctx)
+        const rawLimit = rawLimits.get(key)
         const limits = await getModelLimits(ctx)
         const limit = limits.get(key)
+        const limitForRatio = typeof rawLimit === "number" && rawLimit > 0 ? rawLimit : (typeof limit === "number" && limit > 0 ? limit : 0)
         const curTokens = st ? conversationTokens(st) : 0
         const baseCompactionRatio = fbOpts.budgets?.compactionRatio ?? fbOpts.compactionRatio ?? DEFAULTS.compactionRatio
-        const compactionRatio = typeof limit === "number" && limit > 0 ? dynamicCompactionRatio(limit, baseCompactionRatio) : baseCompactionRatio
+        const compactionRatio = limitForRatio > 0 ? dynamicCompactionRatio(limitForRatio, baseCompactionRatio) : baseCompactionRatio
         const debounceMs = fbOpts.parentWatchdog?.compactionDebounceMs ?? fbOpts.watchdog?.compactionDebounceMs ?? 120000
-        if (typeof limit === "number" && limit > 0 && curTokens >= limit * compactionRatio) {
+        if (limitForRatio > 0 && curTokens >= limitForRatio * compactionRatio) {
           const last = lastCompactAt.get(sid) ?? 0
           if (now() - last >= debounceMs) {
             lastCompactAt.set(sid, now())
-            log(`context ${sid}: ${Math.round((curTokens / limit) * 100)}% of ${key} (${curTokens}/${limit}) — triggering proactive self-compaction at ${Math.round(compactionRatio * 100)}%`)
+            log(`context ${sid}: ${Math.round((curTokens / limitForRatio) * 100)}% of ${key} (${curTokens}/${limitForRatio}) — triggering proactive self-compaction at ${Math.round(compactionRatio * 100)}%`)
             void Promise.resolve(ctx?.session?.compact?.({ sessionID: sid })).catch((err: any) => {
               log(`context ${sid}: proactive self-compaction failed: ${String(err)}`)
             })
@@ -2299,16 +2353,19 @@ async function handleEvent(ctx: any, ev: any, opts: FallbackOptions): Promise<vo
         if (sid) {
           const seat = sessions.get(sid)?.seat
           if (seat && seat !== "unknown") {
+            const rawLimits = rawModelLimitsCache
+            const rawLimit = rawLimits?.get(seat)
             const limits = modelLimitsCache
             const limit = limits?.get(seat)
+            const limitForRatio = typeof rawLimit === "number" && rawLimit > 0 ? rawLimit : (typeof limit === "number" && limit > 0 ? limit : 0)
             const baseCompactionRatio = opts.budgets?.compactionRatio ?? opts.compactionRatio ?? DEFAULTS.compactionRatio
-            const compactionRatio = typeof limit === "number" && limit > 0 ? dynamicCompactionRatio(limit, baseCompactionRatio) : baseCompactionRatio
+            const compactionRatio = limitForRatio > 0 ? dynamicCompactionRatio(limitForRatio, baseCompactionRatio) : baseCompactionRatio
             const debounceMs = opts.parentWatchdog?.compactionDebounceMs ?? opts.watchdog?.compactionDebounceMs ?? 120000
-            if (typeof limit === "number" && limit > 0 && tok >= limit * compactionRatio) {
+            if (limitForRatio > 0 && tok >= limitForRatio * compactionRatio) {
               const last = lastCompactAt.get(sid) ?? 0
               if (now() - last >= debounceMs) {
                 lastCompactAt.set(sid, now())
-                logLine(`event ${sid}: ${Math.round((tok / limit) * 100)}% of ${seat} (${tok}/${limit}) — triggering proactive self-compaction at ${Math.round(compactionRatio * 100)}%`, opts)
+                logLine(`event ${sid}: ${Math.round((tok / limitForRatio) * 100)}% of ${seat} (${tok}/${limitForRatio}) — triggering proactive self-compaction at ${Math.round(compactionRatio * 100)}%`, opts)
                 void Promise.resolve(ctx?.session?.compact?.({ sessionID: sid })).catch((err: any) => {
                   logLine(`event ${sid}: proactive self-compaction failed: ${String(err)}`, opts)
                 })
@@ -2439,14 +2496,29 @@ async function loadModelLimits(ctx: any): Promise<Map<string, number>> {
     const res = await ctx?.model?.list?.()
     const data = res?.data ?? res?.models ?? []
     const m = new Map<string, number>()
+    const rawMap = new Map<string, number>()
     for (const info of Array.isArray(data) ? data : []) {
       const full = `${info?.providerID}/${info?.id}`
       const usable = usableContextLimit(info)
+      const raw = rawContextLimit(info)
       if (typeof usable === "number") {
         m.set(full, usable)
         m.set(full.toLowerCase(), usable)
+        if (info.id) {
+          m.set(info.id, usable)
+          m.set(info.id.toLowerCase(), usable)
+        }
+      }
+      if (typeof raw === "number") {
+        rawMap.set(full, raw)
+        rawMap.set(full.toLowerCase(), raw)
+        if (info.id) {
+          rawMap.set(info.id, raw)
+          rawMap.set(info.id.toLowerCase(), raw)
+        }
       }
     }
+    rawModelLimitsCache = rawMap
     return m
   } catch {
     return new Map<string, number>()
@@ -2456,6 +2528,13 @@ async function loadModelLimits(ctx: any): Promise<Map<string, number>> {
 async function getModelLimits(ctx: any): Promise<Map<string, number>> {
   if (!modelLimitsCache) modelLimitsCache = await loadModelLimits(ctx)
   return modelLimitsCache
+}
+
+async function getRawModelLimits(ctx: any): Promise<Map<string, number>> {
+  if (!rawModelLimitsCache) {
+    await getModelLimits(ctx)
+  }
+  return rawModelLimitsCache ?? new Map<string, number>()
 }
 
 // ── Redaction + telemetry helper ─────────────────────────────────────────────

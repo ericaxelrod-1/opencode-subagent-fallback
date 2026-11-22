@@ -211,18 +211,27 @@ interface SessionState {
 export declare function __resetStateForTests(): void;
 /** Test seam: inject model context limits (providerID/id -> context window). */
 export declare function __setModelLimitsForTests(limits: Record<string, number>): void;
+export declare function __setRawModelLimitsForTests(limits: Record<string, number> | undefined): void;
 /** Test seam: inject known models for catalog validation tests. */
 export declare function __setKnownModelsForTests(models: string[] | undefined): void;
 export declare function usableContextLimit(info: any): number | undefined;
 /**
- * Dynamic compaction ratio on a logarithmic curve (Option 2):
- * Smaller context windows get a higher threshold (smaller margin, up to 85%),
- * while 1M+ windows scale down to baseRatio (default 0.40 = 40%, 60% margin).
+ * Raw context ceiling (nominal window) for compaction ratio calculation,
+ * avoiding compounding double-reserves on models where input limit < context limit.
+ */
+export declare function rawContextLimit(info: any): number | undefined;
+/**
+ * Dynamic compaction ratio on a piecewise logarithmic curve:
+ * - Smaller context windows (<= 32k) clamp at 0.85 (15% safety margin).
+ * - Mid-size models (e.g. 128k - 200k) preserve high usable capacity with overhead
+ *   significantly less than 40% (~22% overhead at 200k -> 0.78 ratio).
+ * - Massive models (>= 1M) scale down to baseRatio (default 0.40 = 40%, 60% margin).
  *
  * Formula:
  *   W <= 32k: 0.85
+ *   32k < W <= 200k: linear on log2 scale between 32k (0.85) and 200k (0.78)
+ *   200k < W < 1M:   linear on log2 scale between 200k (0.78) and 1M (baseRatio)
  *   W >= 1M:  baseRatio (default 0.40)
- *   In between: linear interpolation on log2 scale between 32k (0.85) and 1M (baseRatio).
  */
 export declare function dynamicCompactionRatio(limit: number, baseRatio?: number): number;
 export declare function initCatalog(ctx: any): Promise<void>;
