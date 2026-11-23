@@ -2033,6 +2033,23 @@ export function assistantText(msgs) {
     }
     return parts.filter((p) => p.trim().length > 0).join("\n");
 }
+export function isToolRefusal(text) {
+    if (!text)
+        return false;
+    const lower = text.toLowerCase();
+    const mentionsUnavailability = lower.includes("not available in this") ||
+        lower.includes("do not have access to") ||
+        lower.includes("cannot directly run") ||
+        lower.includes("tools are not available") ||
+        lower.includes("tools are unavailable") ||
+        lower.includes("no access to tools");
+    const mentionsTools = lower.includes("tool") ||
+        lower.includes("shell") ||
+        lower.includes("subagent") ||
+        lower.includes("execute") ||
+        lower.includes("filesystem");
+    return mentionsUnavailability && mentionsTools;
+}
 export function checkCompletion(msgs) {
     const m = lastAssistantInTurn(msgs);
     if (!m)
@@ -2051,13 +2068,15 @@ export function checkCompletion(msgs) {
     const content = Array.isArray(m?.content) ? m.content : [];
     const toolParts = content.some((c) => c?.type === "tool");
     const busy = content.some((c) => c?.type === "tool" && (c?.state?.status === "streaming" || c?.state?.status === "running"));
+    const refusal = !toolParts && isToolRefusal(text ?? "");
     const ok = m.time?.completed != null &&
         m.error == null &&
         !busy &&
+        !refusal &&
         m.finish !== "length" &&
         m.finish !== "error" &&
         ((text ?? "").trim().length > 0 || toolParts || trailingIdleSucceeded);
-    return { ok, finish: m.finish, text, tokens: contextTokens(m), error: m.error };
+    return { ok, finish: m.finish, text, tokens: contextTokens(m), error: m.error, ...(refusal ? { reason: "tool-refusal" } : {}) };
 }
 const liveness = new Map();
 const abortStampedAt = new Map();

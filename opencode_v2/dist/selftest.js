@@ -76,6 +76,7 @@ async function main() {
     check("finish=length rejected", !checkCompletion([{ type: "assistant", content: [{ type: "text", text: "p" }], time: {}, finish: "length" }]).ok);
     check("finish=error rejected", !checkCompletion([{ type: "assistant", content: [{ type: "text", text: "p" }], time: { completed: 1 }, finish: "error" }]).ok);
     check("busy tool rejected", !checkCompletion([{ type: "assistant", content: [{ type: "tool", state: { status: "running" } }], time: { completed: 1 }, finish: "tool-calls" }]).ok);
+    check("tool refusal rejected", !checkCompletion([{ type: "assistant", content: [{ type: "text", text: "Local filesystem, shell, and subagent execution tools (shell, read, write, edit, subagent, execute) are not available in this runtime environment, so I cannot directly run evidence_store.py" }], time: { completed: 1 }, finish: "stop" }]).ok);
     check("tool-calls finish accepted when tool part present", checkCompletion([{ type: "assistant", content: [{ type: "tool", state: { status: "completed" } }], time: { completed: 1 }, finish: "tool-calls" }]).ok);
     check("no assistant in turn rejected", !checkCompletion([{ type: "user", text: "do it" }]).ok);
     const splitMsgs = [

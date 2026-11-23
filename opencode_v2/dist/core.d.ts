@@ -273,6 +273,7 @@ export declare function contextTokens(m: any): number;
 export declare function lastAssistantInTurn(msgs: any[]): any | undefined;
 /** Assistant text of the turn's last assistant message, concatenating across Ms.Continue splits (D3). */
 export declare function assistantText(msgs: any[]): string;
+export declare function isToolRefusal(text: string): boolean;
 export declare function checkCompletion(msgs: any[]): CompletionCheck;
 export declare function setGlobalConsoleLogging(enabled: boolean): void;
 declare function runSweep(ctx: any, opts: FallbackOptions): Promise<void>;

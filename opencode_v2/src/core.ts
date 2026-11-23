@@ -2188,6 +2188,25 @@ export function assistantText(msgs: any[]): string {
   return parts.filter((p) => p.trim().length > 0).join("\n")
 }
 
+export function isToolRefusal(text: string): boolean {
+  if (!text) return false
+  const lower = text.toLowerCase()
+  const mentionsUnavailability =
+    lower.includes("not available in this") ||
+    lower.includes("do not have access to") ||
+    lower.includes("cannot directly run") ||
+    lower.includes("tools are not available") ||
+    lower.includes("tools are unavailable") ||
+    lower.includes("no access to tools")
+  const mentionsTools =
+    lower.includes("tool") ||
+    lower.includes("shell") ||
+    lower.includes("subagent") ||
+    lower.includes("execute") ||
+    lower.includes("filesystem")
+  return mentionsUnavailability && mentionsTools
+}
+
 export function checkCompletion(msgs: any[]): CompletionCheck {
   const m = lastAssistantInTurn(msgs)
   if (!m) return { ok: false, finish: undefined, text: "", tokens: 0, error: undefined, reason: "no-assistant" }
@@ -2206,14 +2225,16 @@ export function checkCompletion(msgs: any[]): CompletionCheck {
   const busy = content.some(
     (c: any) => c?.type === "tool" && (c?.state?.status === "streaming" || c?.state?.status === "running"),
   )
+  const refusal = !toolParts && isToolRefusal(text ?? "")
   const ok =
     m.time?.completed != null &&
     m.error == null &&
     !busy &&
+    !refusal &&
     m.finish !== "length" &&
     m.finish !== "error" &&
     ((text ?? "").trim().length > 0 || toolParts || trailingIdleSucceeded)
-  return { ok, finish: m.finish, text, tokens: contextTokens(m), error: m.error }
+  return { ok, finish: m.finish, text, tokens: contextTokens(m), error: m.error, ...(refusal ? { reason: "tool-refusal" } : {}) }
 }
 
 // ── Event handling / watchdog (blueprint §5.5, step 4) ────────────────────────
