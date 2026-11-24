@@ -878,6 +878,71 @@ async function main() {
         check("compaction retry via matching compaction model requests agent reload", reloadCalled2 === 1);
         check("compaction retry via matching compaction model stops non-transient spin", evCompModel.decision.retry === false);
     }
+    console.log("\ncompaction state isolation, agent re-bind & lastSwitchedFrom exemption:");
+    {
+        __resetStateForTests();
+        __setKnownModelsForTests(["o/orch1", "o/orch2", "c1/comp1", "c2/comp2", "c3/comp3"]);
+        const switchesIso = [];
+        const savedAgentsIso = new Map();
+        savedAgentsIso.set("compaction", { id: "compaction", model: "c1/comp1" });
+        const mockEditorIso = {
+            list: () => Array.from(savedAgentsIso.values()),
+            get: (id) => savedAgentsIso.get(id),
+            update: (id, fn) => {
+                const cur = savedAgentsIso.get(id) ?? { id };
+                const next = fn(cur) ?? cur;
+                savedAgentsIso.set(id, next);
+            },
+        };
+        let fbIso;
+        const ctxIso = {
+            ...mockCtx(switchesIso),
+            agent: {
+                reload: async () => {
+                    fbIso.installAgents(mockEditorIso);
+                },
+            },
+        };
+        fbIso = createFallback(ctxIso, {
+            providerDefaults: { ...STICKY_FAST, stickyMs: 0 },
+            agents: {
+                orchestrator: { fallback: ["o/orch1", "o/orch2"] },
+                compaction: {
+                    largeContextModel: "c1/comp1",
+                    largeContextFallback: ["c2/comp2", "c3/comp3"],
+                },
+            },
+        });
+        // 1) Cache orchestrator state on parent session first
+        await fbIso.onPrompt({ sessionID: "ses_comp_iso", agent: "orchestrator", prompt: { text: "hello" } });
+        // 2) Compaction fails transiently (429 rate limit) -> must use compaction chain & re-bind compaction agent
+        //    even though transient failure does not mark c1/comp1 unhealthy in isModelHealthyNow()
+        const evIso1 = {
+            sessionID: "ses_comp_iso",
+            agent: "compaction",
+            model: { providerID: "c1", id: "comp1" },
+            error: { statusCode: 429, message: "Too many requests" },
+            attempt: 0,
+            decision: { retry: true },
+        };
+        await fbIso.onRetry(evIso1);
+        check("compaction uses compaction fallback chain instead of cached orchestrator chain", switchesIso.length === 1 && switchesIso[0]?.model?.providerID === "c2" && switchesIso[0]?.model?.id === "comp2", JSON.stringify(switchesIso));
+        check("transient compaction failure re-binds compaction agent via reload + installAgents", savedAgentsIso.get("compaction")?.model?.providerID === "c2" && savedAgentsIso.get("compaction")?.model?.id === "comp2", JSON.stringify(savedAgentsIso.get("compaction")));
+        check("compaction transient failover keeps decision.retry = true", evIso1.decision.retry === true);
+        // 3) Subsequent compaction retry reporting failedKey === lastSwitchedFrom is NOT aborted
+        const evIso2 = {
+            sessionID: "ses_comp_iso",
+            agent: "compaction",
+            model: { providerID: "c1", id: "comp1" },
+            error: { statusCode: 503, message: "Service unavailable" },
+            attempt: 1,
+            decision: { retry: true },
+        };
+        await fbIso.onRetry(evIso2);
+        check("compaction exempt from lastSwitchedFrom abort guard (continues walking chain)", evIso2.decision.retry === true && switchesIso.length === 2 && switchesIso[1]?.model?.providerID === "c3" && switchesIso[1]?.model?.id === "comp3", JSON.stringify({ decision: evIso2.decision, switches: switchesIso }));
+        check("subsequent compaction failover re-binds compaction agent to c3/comp3", savedAgentsIso.get("compaction")?.model?.providerID === "c3" && savedAgentsIso.get("compaction")?.model?.id === "comp3", JSON.stringify(savedAgentsIso.get("compaction")));
+        __setKnownModelsForTests(undefined);
+    }
     console.log("\nselftest result:");
     if (failures === 0) {
         console.log("  all checks passed\n");

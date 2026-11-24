@@ -699,6 +699,7 @@ const MAX_SESSIONS = 256;
 let modelLimitsCache;
 let rawModelLimitsCache;
 let knownModelsCache;
+let compactionModelOverride;
 export function __resetStateForTests() {
     sessions.clear();
     breakersByModel.clear();
@@ -707,6 +708,7 @@ export function __resetStateForTests() {
     modelLimitsCache = undefined;
     rawModelLimitsCache = undefined;
     knownModelsCache = undefined;
+    compactionModelOverride = undefined;
     const dir = currentConfigDir || (process.env.OPENCODE_CONFIG_DIR ?? "");
     if (dir) {
         try {
@@ -1004,8 +1006,9 @@ function fallbackChainFor(ctx, agent, opts) {
     const models = list.map((e) => (typeof e === "string" ? e : e.model)).filter((m) => typeof m === "string" && m.length > 0);
     return [...new Set(models)];
 }
-function stateFor(ctx, sid, seat, agent, opts) {
-    let st = sessions.get(sid);
+function stateFor(ctx, sid, seat, agent, opts, stateKey) {
+    const key = stateKey ?? sid;
+    let st = sessions.get(key);
     if (st)
         return st;
     if (sessions.size >= MAX_SESSIONS) {
@@ -1037,7 +1040,7 @@ function stateFor(ctx, sid, seat, agent, opts) {
         hops: 0,
         lastAttempt: -1,
     };
-    sessions.set(sid, st);
+    sessions.set(key, st);
     return st;
 }
 function enqueue(sid, fn) {
@@ -1293,262 +1296,280 @@ export function createFallback(ctx, opts) {
                 }
                 catch { }
             }
+            const stateKey = isCompaction ? `${e.sessionID}:compaction` : e.sessionID;
+            let compactionReloaded = false;
+            const reloadCompactionAgent = async () => {
+                if (!isCompaction || compactionReloaded)
+                    return;
+                compactionReloaded = true;
+                await Promise.resolve(ctx?.agent?.reload?.()).catch(() => undefined);
+            };
             if (isCompaction) {
                 log(`retry ${e.sessionID}: agent=compaction model=${failedKey} -> ${c.cls} (${c.detail})`);
-                recordModelFailure(failedKey, c, fbOpts, sessions.get(e.sessionID));
+                recordModelFailure(failedKey, c, fbOpts, sessions.get(stateKey));
                 if (c.cls === "model_not_found")
                     markModelUnavailable(failedKey);
-                await Promise.resolve(ctx?.agent?.reload?.()).catch(() => undefined);
+                if (compactionModelOverride === failedKey)
+                    compactionModelOverride = undefined;
             }
             else {
                 log(`retry ${e.sessionID}: ${failedKey} attempt=${e?.attempt} -> ${c.cls}${c.detail ? ` (${c.detail})` : ""}${c.retryAfterMs !== undefined ? ` retryAfterMs=${c.retryAfterMs}` : ""}`);
             }
-            // O2: the retry hook is not called once the budget is spent; treat
-            // `attempt` as the hard signal anyway and never advance beyond it.
-            const spent = typeof e?.attempt === "number" && e.attempt >= MAX_RETRY_ATTEMPTS;
-            if (c.cls === "fatal") {
-                log(`retry ${e.sessionID}: fatal — keeping default decision`);
-                return;
-            }
-            const existingSt = sessions.get(e.sessionID);
-            const existingBudget = existingSt?.opts?.budgets ?? fbOpts.budgets;
-            const existingMaxIters = existingBudget?.maxIterations ?? fbOpts.maxIterations ?? DEFAULTS.budgets.maxIterations;
-            const canRollover = spent &&
-                !isCompaction &&
-                !!existingSt &&
-                (existingSt.hops === 0 || now() < existingSt.deadline) &&
-                existingSt.hops < existingMaxIters &&
-                typeof ctx?.session?.prompt === "function";
-            if (spent && !canRollover) {
-                log(`retry ${e.sessionID}: attempt budget (${MAX_RETRY_ATTEMPTS}) spent — keeping default decision`);
-                unregisterLiveness(e.sessionID);
-                return;
-            }
-            const scheduleRolloverIfSpent = () => {
-                if (!canRollover || e?.decision?.retry !== true)
+            try {
+                // O2: the retry hook is not called once the budget is spent; treat
+                // `attempt` as the hard signal anyway and never advance beyond it.
+                const spent = typeof e?.attempt === "number" && e.attempt >= MAX_RETRY_ATTEMPTS;
+                if (c.cls === "fatal") {
+                    log(`retry ${e.sessionID}: fatal — keeping default decision`);
                     return;
-                const delay = typeof e.decision.delay === "number" && Number.isFinite(e.decision.delay) && e.decision.delay > 0 ? e.decision.delay : 0;
-                e.decision = { retry: false };
-                const sid = e.sessionID;
-                const stCur = sessions.get(sid);
-                if (!stCur)
+                }
+                const existingSt = sessions.get(stateKey);
+                const existingBudget = existingSt?.opts?.budgets ?? fbOpts.budgets;
+                const existingMaxIters = existingBudget?.maxIterations ?? fbOpts.maxIterations ?? DEFAULTS.budgets.maxIterations;
+                const canRollover = spent &&
+                    !isCompaction &&
+                    !!existingSt &&
+                    (existingSt.hops === 0 || now() < existingSt.deadline) &&
+                    existingSt.hops < existingMaxIters &&
+                    typeof ctx?.session?.prompt === "function";
+                if (spent && !canRollover) {
+                    log(`retry ${e.sessionID}: attempt budget (${MAX_RETRY_ATTEMPTS}) spent — keeping default decision`);
+                    unregisterLiveness(e.sessionID);
                     return;
-                stCur.lastAttempt = -1;
-                deferLiveness(sid, delay + 50);
-                log(`retry ${sid}: attempt budget (${MAX_RETRY_ATTEMPTS}) spent — rolling over to fresh step in ${delay}ms`);
-                const timer = setTimeout(() => {
-                    rolloverTimers.delete(timer);
-                    const payload = stCur.prompt;
-                    recoveringSessions.add(sid);
-                    Promise.resolve(ctx?.session?.prompt?.({
-                        sessionID: sid,
-                        text: payload?.text ?? CONTINUE_PROMPT,
-                        files: payload?.files,
-                        agents: payload?.agents,
-                        skills: payload?.skills,
-                        delivery: payload?.delivery,
-                        resume: payload?.resume ?? true,
-                    })).catch(() => undefined).finally(() => { recoveringSessions.delete(sid); });
-                }, Math.max(50, delay));
-                timer.unref?.();
-                rolloverTimers.add(timer);
-            };
-            const agentName = isCompaction ? "compaction" : (e?.agent ?? "developer");
-            const st = stateFor(ctx, e.sessionID, failedKey, agentName, fbOpts);
-            const budget = st.opts?.budgets ?? fbOpts.budgets;
-            const budgetMs = budget?.fallbackBudgetMs ?? fbOpts.budgetMs ?? DEFAULTS.budgets.fallbackBudgetMs;
-            const maxIters = budget?.maxIterations ?? fbOpts.maxIterations ?? DEFAULTS.budgets.maxIterations;
-            // Turn detection (live-test fix): the server's `attempt` counter resets to
-            // 0 on every new turn. A non-increasing attempt therefore means a NEW
-            // turn started. The `prompt` hook is the primary per-turn reset, but it
-            // does not fire for every turn boundary (watchdog re-prompts, server-side
-            // turn restarts, resumed sessions). Without this, `st.deadline` stays
-            // expired from a previous turn and the wall-clock budget immediately
-            // blocks all failover — observed live as "wall-clock budget exhausted"
-            // on the very first retry of every new turn.
-            const attempt = typeof e?.attempt === "number" ? e.attempt : undefined;
-            if (attempt !== undefined && (st.lastAttempt === -1 || attempt <= st.lastAttempt)) {
-                if (st.lastAttempt !== -1) {
-                    log(`retry ${e.sessionID}: new turn detected (attempt ${attempt} <= ${st.lastAttempt}) — resetting per-turn state`);
-                    resetTurnState(st, ctx, st.agent);
                 }
-            }
-            if (attempt !== undefined)
-                st.lastAttempt = attempt;
-            if (st.switched && st.seat && failedKey !== st.seat && failedKey === st.lastSwitchedFrom) {
-                log(`retry ${e.sessionID}: received retry for previously switched model ${failedKey} while seat is ${st.seat} — aborting retry for old model`);
-                e.decision = { retry: false };
-                return;
-            }
-            // Fresh failure sequence: if no failover hops have occurred yet (st.hops === 0),
-            // ensure the wall-clock deadline starts from THIS failure sequence rather than
-            // an expired timestamp from session creation or earlier execution.
-            if (st.hops === 0) {
-                st.deadline = now() + budgetMs;
-            }
-            // D1: transient-class failure opens (or holds open) the sticky window; a
-            // rate-limit (429) counts as transient when its retryAfterMs fits the
-            // sticky window and the attempt budget is not spent. The window is
-            // measured from the first transient failure — once it lapses the chain
-            // advances (V1 sticky discipline, corrected blueprint §5.2/D1).
-            // Compaction calls do not wait in a long sticky window on rate-limited or broken models;
-            // they advance immediately down the compaction fallback chain.
-            const isTransientClass = c.cls === "transient" && !isCompaction;
-            if (isTransientClass) {
-                const windowMs = (fbOpts.providers[providerOf(failedKey)] ?? fbOpts.providerDefaults)?.stickyMs ?? DEFAULTS.providerDefaults.stickyMs;
-                if (st.stickyUntil === 0)
-                    st.stickyUntil = now() + windowMs;
-            }
-            if (isTransientClass && now() < st.stickyUntil) {
-                const rateLimitedUntil = st.rateLimitMs?.[failedKey];
-                const pcfg = st.opts?.providers?.[providerOf(failedKey)] ?? st.opts?.providerDefaults ?? DEFAULTS.providerDefaults;
-                const delay = e?.error?.retryAfterMs ??
-                    (typeof rateLimitedUntil === "number" && rateLimitedUntil > now() ? rateLimitedUntil - now() : undefined) ??
-                    (typeof pcfg?.rateLimitMs === "number" ? pcfg.rateLimitMs : undefined) ??
-                    (typeof pcfg?.retryDelayMs === "number" ? pcfg.retryDelayMs : undefined) ??
-                    (typeof fbOpts.interceptor?.fastRetryMs === "number" ? fbOpts.interceptor.fastRetryMs : undefined) ??
-                    backoffFor(e.attempt ?? 0);
-                e.decision = { retry: true, delay };
-                deferLiveness(e.sessionID, delay);
-                scheduleRolloverIfSpent();
-                return;
-            }
-            // Wall-clock failover budget (HIGH, requirement: fallbackBudgetMs /
-            // maxIterations): ceiling for this turn's failover walk plus a cap on the
-            // number of full passes over the chain. Checked before spending another
-            // attempt on a candidate.
-            if (now() >= st.deadline) {
-                log(`retry ${e.sessionID}: wall-clock budget (${budgetMs}ms) exhausted — stopping retries`);
-                e.decision = { retry: false };
-                unregisterLiveness(e.sessionID);
-                return;
-            }
-            if (st.hops >= maxIters) {
-                log(`retry ${e.sessionID}: failover pass budget (${maxIters}) spent — stopping retries`);
-                e.decision = { retry: false };
-                unregisterLiveness(e.sessionID);
-                return;
-            }
-            // P1 #6: a model that just failed is never revisited later in this pass —
-            // mark it tried; non-transient failures (quota/auth/forbidden/not-found/
-            // context_too_large) are also permanently excluded for this turn.
-            st.tried.add(failedKey);
-            if (c.cls === "quota" ||
-                c.cls === "auth" ||
-                c.cls === "forbidden" ||
-                c.cls === "model_not_found" ||
-                c.cls === "context_too_large") {
-                st.permFailed = st.permFailed ?? new Set();
-                st.permFailed.add(failedKey);
-            }
-            if (c.cls === "model_not_found") {
-                markModelUnavailable(failedKey);
-            }
-            // Breaker & quota enforcement: record failure before selecting candidate
-            recordModelFailure(failedKey, c, fbOpts, st);
-            // P1 #11: auth / forbidden / provider-level failures invalidate the whole
-            // provider for this turn's failover walk (a dead credential or sick gateway
-            // behind provider A invalidates every sibling fallback on A).
-            if (c.cls === "auth" || c.cls === "forbidden" || c.cls === "provider_level") {
-                st.outProviders = st.outProviders ?? new Set();
-                st.outProviders.add(providerOf(failedKey));
-            }
-            let next = nextCandidate(st);
-            // R4/F2: validate candidate against catalog; skip unavailable models
-            while (next && !isModelAvailable(next)) {
-                st.chain = st.chain.filter((m) => m !== next);
-                st.tried.add(next);
-                next = nextCandidate(st);
-            }
-            // Multi-pass cycling (V1 parity): if the first pass exhausted all
-            // candidates via transient failures and budget/hops remain, reset
-            // `st.tried` (preserving `st.permFailed`) and start a fresh pass.
-            if (!next && st.chain.length > 0) {
-                const retryableInChain = st.chain.filter((m) => !st.permFailed?.has(m));
-                if (retryableInChain.length > 0) {
-                    st.tried = new Set(st.permFailed ?? []);
-                    if (retryableInChain.length > 1)
-                        st.tried.add(failedKey);
-                    next = nextCandidate(st);
-                    if (next)
-                        log(`retry ${e.sessionID}: starting new pass over fallback chain -> ${next}`);
-                }
-            }
-            if (!next) {
-                log(`retry ${e.sessionID}: no fallback candidate left for ${failedKey} — stopping retries`);
-                if (c.cls !== "transient") {
+                const scheduleRolloverIfSpent = () => {
+                    if (!canRollover || e?.decision?.retry !== true)
+                        return;
+                    const delay = typeof e.decision.delay === "number" && Number.isFinite(e.decision.delay) && e.decision.delay > 0 ? e.decision.delay : 0;
                     e.decision = { retry: false };
-                }
-                return;
-            }
-            // Context pre-filter (HIGH, requirement: context pre-filter): before
-            // spending an attempt on a candidate, rule out models whose context limit
-            // cannot hold the conversation. On context overflow, run the catch-all
-            // large-context fallback chain instead of the regular fallback list;
-            // in-seat self-compaction stays the normal tier.
-            const agentLocked = isCompaction ? "compaction" : (st.agent ?? e?.agent ?? "developer");
-            let target = next;
-            if (c.cls === "context_too_large") {
-                target = await pickLargeContext(ctx, st, agentLocked, failedKey);
-            }
-            else if (!isCompaction) {
-                const fits = await contextFits(ctx, st, next);
-                if (!fits)
-                    target = await pickLargeContext(ctx, st, agentLocked, failedKey);
-            }
-            if (!target) {
-                log(`retry ${e.sessionID}: no fallback candidate left for ${failedKey} — stopping retries`);
-                if (c.cls !== "transient") {
-                    e.decision = { retry: false };
-                }
-                return;
-            }
-            // O6: switchModel may throw (model unavailable / provider unauthenticated);
-            // the hook must never propagate — try next candidates if switch fails.
-            let switchSucceeded = false;
-            while (target && !switchSucceeded) {
-                const candidate = target;
-                try {
-                    await enqueue(e.sessionID, async () => {
-                        if (!st.switched)
-                            st.originalSeat = st.seat;
-                        st.lastSwitchedFrom = failedKey;
-                        await ctx?.session?.switchModel({ sessionID: e.sessionID, model: toModelRef(candidate) });
-                        st.switched = true;
-                        st.tried.add(candidate);
-                        st.stickyUntil = 0;
-                        st.seat = candidate;
-                    });
-                    switchSucceeded = true;
-                }
-                catch (switchErr) {
-                    log(`switchModel to ${candidate} failed: ${String(switchErr)} — marking unavailable`);
-                    markModelUnavailable(candidate);
-                    st.tried.add(candidate);
-                    target = undefined;
-                    let alt = nextCandidate(st);
-                    while (alt && !isModelAvailable(alt)) {
-                        st.chain = st.chain.filter((m) => m !== alt);
-                        st.tried.add(alt);
-                        alt = nextCandidate(st);
+                    const sid = e.sessionID;
+                    const stCur = sessions.get(sid);
+                    if (!stCur)
+                        return;
+                    stCur.lastAttempt = -1;
+                    deferLiveness(sid, delay + 50);
+                    log(`retry ${sid}: attempt budget (${MAX_RETRY_ATTEMPTS}) spent — rolling over to fresh step in ${delay}ms`);
+                    const timer = setTimeout(() => {
+                        rolloverTimers.delete(timer);
+                        const payload = stCur.prompt;
+                        recoveringSessions.add(sid);
+                        Promise.resolve(ctx?.session?.prompt?.({
+                            sessionID: sid,
+                            text: payload?.text ?? CONTINUE_PROMPT,
+                            files: payload?.files,
+                            agents: payload?.agents,
+                            skills: payload?.skills,
+                            delivery: payload?.delivery,
+                            resume: payload?.resume ?? true,
+                        })).catch(() => undefined).finally(() => { recoveringSessions.delete(sid); });
+                    }, Math.max(50, delay));
+                    timer.unref?.();
+                    rolloverTimers.add(timer);
+                };
+                const agentName = isCompaction ? "compaction" : (e?.agent ?? "developer");
+                const st = stateFor(ctx, e.sessionID, failedKey, agentName, fbOpts, stateKey);
+                const budget = st.opts?.budgets ?? fbOpts.budgets;
+                const budgetMs = budget?.fallbackBudgetMs ?? fbOpts.budgetMs ?? DEFAULTS.budgets.fallbackBudgetMs;
+                const maxIters = budget?.maxIterations ?? fbOpts.maxIterations ?? DEFAULTS.budgets.maxIterations;
+                // Turn detection (live-test fix): the server's `attempt` counter resets to
+                // 0 on every new turn. A non-increasing attempt therefore means a NEW
+                // turn started. The `prompt` hook is the primary per-turn reset, but it
+                // does not fire for every turn boundary (watchdog re-prompts, server-side
+                // turn restarts, resumed sessions). Without this, `st.deadline` stays
+                // expired from a previous turn and the wall-clock budget immediately
+                // blocks all failover — observed live as "wall-clock budget exhausted"
+                // on the very first retry of every new turn.
+                const attempt = typeof e?.attempt === "number" ? e.attempt : undefined;
+                if (attempt !== undefined && (st.lastAttempt === -1 || attempt <= st.lastAttempt)) {
+                    if (st.lastAttempt !== -1) {
+                        log(`retry ${e.sessionID}: new turn detected (attempt ${attempt} <= ${st.lastAttempt}) — resetting per-turn state`);
+                        resetTurnState(st, ctx, st.agent);
                     }
-                    if (alt)
-                        target = alt;
                 }
+                if (attempt !== undefined)
+                    st.lastAttempt = attempt;
+                if (!isCompaction && st.switched && st.seat && failedKey !== st.seat && failedKey === st.lastSwitchedFrom) {
+                    log(`retry ${e.sessionID}: received retry for previously switched model ${failedKey} while seat is ${st.seat} — aborting retry for old model`);
+                    e.decision = { retry: false };
+                    return;
+                }
+                // Fresh failure sequence: if no failover hops have occurred yet (st.hops === 0),
+                // ensure the wall-clock deadline starts from THIS failure sequence rather than
+                // an expired timestamp from session creation or earlier execution.
+                if (st.hops === 0) {
+                    st.deadline = now() + budgetMs;
+                }
+                // D1: transient-class failure opens (or holds open) the sticky window; a
+                // rate-limit (429) counts as transient when its retryAfterMs fits the
+                // sticky window and the attempt budget is not spent. The window is
+                // measured from the first transient failure — once it lapses the chain
+                // advances (V1 sticky discipline, corrected blueprint §5.2/D1).
+                // Compaction calls do not wait in a long sticky window on rate-limited or broken models;
+                // they advance immediately down the compaction fallback chain.
+                const isTransientClass = c.cls === "transient" && !isCompaction;
+                if (isTransientClass) {
+                    const windowMs = (fbOpts.providers[providerOf(failedKey)] ?? fbOpts.providerDefaults)?.stickyMs ?? DEFAULTS.providerDefaults.stickyMs;
+                    if (st.stickyUntil === 0)
+                        st.stickyUntil = now() + windowMs;
+                }
+                if (isTransientClass && now() < st.stickyUntil) {
+                    const rateLimitedUntil = st.rateLimitMs?.[failedKey];
+                    const pcfg = st.opts?.providers?.[providerOf(failedKey)] ?? st.opts?.providerDefaults ?? DEFAULTS.providerDefaults;
+                    const delay = e?.error?.retryAfterMs ??
+                        (typeof rateLimitedUntil === "number" && rateLimitedUntil > now() ? rateLimitedUntil - now() : undefined) ??
+                        (typeof pcfg?.rateLimitMs === "number" ? pcfg.rateLimitMs : undefined) ??
+                        (typeof pcfg?.retryDelayMs === "number" ? pcfg.retryDelayMs : undefined) ??
+                        (typeof fbOpts.interceptor?.fastRetryMs === "number" ? fbOpts.interceptor.fastRetryMs : undefined) ??
+                        backoffFor(e.attempt ?? 0);
+                    e.decision = { retry: true, delay };
+                    deferLiveness(e.sessionID, delay);
+                    scheduleRolloverIfSpent();
+                    return;
+                }
+                // Wall-clock failover budget (HIGH, requirement: fallbackBudgetMs /
+                // maxIterations): ceiling for this turn's failover walk plus a cap on the
+                // number of full passes over the chain. Checked before spending another
+                // attempt on a candidate.
+                if (now() >= st.deadline) {
+                    log(`retry ${e.sessionID}: wall-clock budget (${budgetMs}ms) exhausted — stopping retries`);
+                    e.decision = { retry: false };
+                    unregisterLiveness(e.sessionID);
+                    return;
+                }
+                if (st.hops >= maxIters) {
+                    log(`retry ${e.sessionID}: failover pass budget (${maxIters}) spent — stopping retries`);
+                    e.decision = { retry: false };
+                    unregisterLiveness(e.sessionID);
+                    return;
+                }
+                // P1 #6: a model that just failed is never revisited later in this pass —
+                // mark it tried; non-transient failures (quota/auth/forbidden/not-found/
+                // context_too_large) are also permanently excluded for this turn.
+                st.tried.add(failedKey);
+                if (c.cls === "quota" ||
+                    c.cls === "auth" ||
+                    c.cls === "forbidden" ||
+                    c.cls === "model_not_found" ||
+                    c.cls === "context_too_large") {
+                    st.permFailed = st.permFailed ?? new Set();
+                    st.permFailed.add(failedKey);
+                }
+                if (c.cls === "model_not_found") {
+                    markModelUnavailable(failedKey);
+                }
+                // Breaker & quota enforcement: record failure before selecting candidate
+                recordModelFailure(failedKey, c, fbOpts, st);
+                // P1 #11: auth / forbidden / provider-level failures invalidate the whole
+                // provider for this turn's failover walk (a dead credential or sick gateway
+                // behind provider A invalidates every sibling fallback on A).
+                if (c.cls === "auth" || c.cls === "forbidden" || c.cls === "provider_level") {
+                    st.outProviders = st.outProviders ?? new Set();
+                    st.outProviders.add(providerOf(failedKey));
+                }
+                let next = nextCandidate(st);
+                // R4/F2: validate candidate against catalog; skip unavailable models
+                while (next && !isModelAvailable(next)) {
+                    st.chain = st.chain.filter((m) => m !== next);
+                    st.tried.add(next);
+                    next = nextCandidate(st);
+                }
+                // Multi-pass cycling (V1 parity): if the first pass exhausted all
+                // candidates via transient failures and budget/hops remain, reset
+                // `st.tried` (preserving `st.permFailed`) and start a fresh pass.
+                if (!next && st.chain.length > 0) {
+                    const retryableInChain = st.chain.filter((m) => !st.permFailed?.has(m));
+                    if (retryableInChain.length > 0) {
+                        st.tried = new Set(st.permFailed ?? []);
+                        if (retryableInChain.length > 1)
+                            st.tried.add(failedKey);
+                        next = nextCandidate(st);
+                        if (next)
+                            log(`retry ${e.sessionID}: starting new pass over fallback chain -> ${next}`);
+                    }
+                }
+                if (!next) {
+                    log(`retry ${e.sessionID}: no fallback candidate left for ${failedKey} — stopping retries`);
+                    if (c.cls !== "transient") {
+                        e.decision = { retry: false };
+                    }
+                    return;
+                }
+                // Context pre-filter (HIGH, requirement: context pre-filter): before
+                // spending an attempt on a candidate, rule out models whose context limit
+                // cannot hold the conversation. On context overflow, run the catch-all
+                // large-context fallback chain instead of the regular fallback list;
+                // in-seat self-compaction stays the normal tier.
+                const agentLocked = isCompaction ? "compaction" : (st.agent ?? e?.agent ?? "developer");
+                let target = next;
+                if (c.cls === "context_too_large") {
+                    target = await pickLargeContext(ctx, st, agentLocked, failedKey);
+                }
+                else if (!isCompaction) {
+                    const fits = await contextFits(ctx, st, next);
+                    if (!fits)
+                        target = await pickLargeContext(ctx, st, agentLocked, failedKey);
+                }
+                if (!target) {
+                    log(`retry ${e.sessionID}: no fallback candidate left for ${failedKey} — stopping retries`);
+                    if (c.cls !== "transient") {
+                        e.decision = { retry: false };
+                    }
+                    return;
+                }
+                // O6: switchModel may throw (model unavailable / provider unauthenticated);
+                // the hook must never propagate — try next candidates if switch fails.
+                let switchSucceeded = false;
+                while (target && !switchSucceeded) {
+                    const candidate = target;
+                    try {
+                        await enqueue(e.sessionID, async () => {
+                            if (!st.switched)
+                                st.originalSeat = st.seat;
+                            st.lastSwitchedFrom = failedKey;
+                            await ctx?.session?.switchModel({ sessionID: e.sessionID, model: toModelRef(candidate) });
+                            st.switched = true;
+                            st.tried.add(candidate);
+                            st.stickyUntil = 0;
+                            st.seat = candidate;
+                        });
+                        switchSucceeded = true;
+                    }
+                    catch (switchErr) {
+                        log(`switchModel to ${candidate} failed: ${String(switchErr)} — marking unavailable`);
+                        markModelUnavailable(candidate);
+                        st.tried.add(candidate);
+                        target = undefined;
+                        let alt = nextCandidate(st);
+                        while (alt && !isModelAvailable(alt)) {
+                            st.chain = st.chain.filter((m) => m !== alt);
+                            st.tried.add(alt);
+                            alt = nextCandidate(st);
+                        }
+                        if (alt)
+                            target = alt;
+                    }
+                }
+                if (!switchSucceeded || !target) {
+                    log(`retry ${e.sessionID}: switchModel failed and no fallback candidate left — keeping default decision`);
+                    return;
+                }
+                if (isCompaction) {
+                    compactionModelOverride = target;
+                    await reloadCompactionAgent();
+                }
+                st.hops += 1;
+                // Always re-decide after switching: the failed model's Retry-After is
+                // meaningless once we have moved to a different model. Sleep only the
+                // next model's cooldown — 0 when it has no active rate-limit window (O1:
+                // sticky failover writes one durable model-switched artifact).
+                e.decision = { retry: true, delay: nextCooldownMs(target, st) };
+                deferLiveness(e.sessionID, e.decision.delay);
+                scheduleRolloverIfSpent();
+                log(`retry ${e.sessionID}: switched ${failedKey} -> ${target} (${c.cls}, attempt ${e.attempt})`);
             }
-            if (!switchSucceeded || !target) {
-                log(`retry ${e.sessionID}: switchModel failed and no fallback candidate left — keeping default decision`);
-                return;
+            finally {
+                await reloadCompactionAgent();
             }
-            st.hops += 1;
-            // Always re-decide after switching: the failed model's Retry-After is
-            // meaningless once we have moved to a different model. Sleep only the
-            // next model's cooldown — 0 when it has no active rate-limit window (O1:
-            // sticky failover writes one durable model-switched artifact).
-            e.decision = { retry: true, delay: nextCooldownMs(target, st) };
-            deferLiveness(e.sessionID, e.decision.delay);
-            scheduleRolloverIfSpent();
-            log(`retry ${e.sessionID}: switched ${failedKey} -> ${target} (${c.cls}, attempt ${e.attempt})`);
         }
         catch (err) {
             log(`retry hook failed, keeping default decision: ${String(err)}`);
@@ -1560,8 +1581,10 @@ export function createFallback(ctx, opts) {
             const sid = e?.sessionID;
             if (!sid)
                 return;
-            const existing = sessions.get(sid);
-            const st = existing ?? stateFor(ctx, sid, undefined, e?.agent, fbOpts);
+            const isCompactionPrompt = e?.agent === "compaction" || e?.type === "compaction" || e?.action === "compaction";
+            const stateKey = isCompactionPrompt ? `${sid}:compaction` : sid;
+            const existing = sessions.get(stateKey);
+            const st = existing ?? stateFor(ctx, sid, undefined, isCompactionPrompt ? "compaction" : e?.agent, fbOpts, stateKey);
             // Agent locking (MEDIUM, requirement: fallback chain uses the agent locked
             // at session start): only an explicit user choice (prompt admission) may
             // update the lock; OpenCode's inferred agent is ignored.
@@ -1576,6 +1599,11 @@ export function createFallback(ctx, opts) {
                 // candidates consumed by a previous turn's failover walk do not leak.
                 st.rePrompts += 1;
                 resetTurnState(st, ctx, st.agent);
+                if (!isCompactionPrompt) {
+                    const compSt = sessions.get(`${sid}:compaction`);
+                    if (compSt)
+                        resetTurnState(compSt, ctx, "compaction");
+                }
             }
             else {
                 // A watchdog recovery re-prompt continues the SAME logical failover
@@ -1795,7 +1823,7 @@ export function createFallback(ctx, opts) {
                         existingMap.set(id, ag);
                 }
             }
-            const allIds = [...new Set([...wanted, ...existingMap.keys()])];
+            const allIds = [...new Set([...wanted, ...existingMap.keys(), ...(compactionModelOverride ? ["compaction"] : [])])];
             for (const id of allIds) {
                 const agentFb = fbFile?.agents?.[id];
                 const fallbacks = id === "compaction"
@@ -1822,18 +1850,31 @@ export function createFallback(ctx, opts) {
                 const existingObj = existing && typeof existing === "object" ? existing : undefined;
                 const currentModelKey = existingObj?.model ? fmtModel(existingObj.model) : undefined;
                 const currentModelHealthy = currentModelKey ? isModelHealthyNow(currentModelKey) : false;
-                // Guard: if operator configured an agent with an available, working model, leave it alone.
+                const activeCompactionOverride = id === "compaction" &&
+                    compactionModelOverride &&
+                    isModelHealthyNow(compactionModelOverride) &&
+                    isModelAvailable(compactionModelOverride)
+                    ? compactionModelOverride
+                    : undefined;
+                // Guard: if operator configured an agent with an available, working model, leave it alone,
+                // unless an active compaction failover override targets a different model.
                 if (existingObj && currentModelKey && currentModelHealthy) {
-                    continue;
+                    if (!activeCompactionOverride || currentModelKey === activeCompactionOverride) {
+                        continue;
+                    }
                 }
+                const chosenModel = activeCompactionOverride ?? healthyFallback;
                 if (existingObj && currentModelKey && !currentModelHealthy) {
-                    log(`agent '${id}' model '${currentModelKey}' is unhealthy/unavailable — replacing with healthy fallback '${healthyFallback}'`);
+                    log(`agent '${id}' model '${currentModelKey}' is unhealthy/unavailable — replacing with healthy fallback '${chosenModel}'`);
+                }
+                else if (activeCompactionOverride && currentModelKey !== activeCompactionOverride) {
+                    log(`agent 'compaction' model '${currentModelKey ?? "(none)"}' overridden to '${activeCompactionOverride}' after failover`);
                 }
                 const agent = {
                     name: id,
                     description: existingObj?.description ?? `Fallback agent registered by opencode-subagent-fallback (${id})`,
                     mode: id === "compaction" ? "primary" : (existingObj?.mode ?? "subagent"),
-                    model: toModelRef(healthyFallback),
+                    model: toModelRef(chosenModel),
                 };
                 // V2 AgentEditor contract: `update(id, fn)` is an upsert that receives a
                 // mutable draft (creating the agent when absent) and ignores the return.

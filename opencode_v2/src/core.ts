@@ -862,6 +862,7 @@ const MAX_SESSIONS = 256
 let modelLimitsCache: Map<string, number> | undefined
 let rawModelLimitsCache: Map<string, number> | undefined
 let knownModelsCache: Set<string> | undefined
+let compactionModelOverride: string | undefined
 
 export function __resetStateForTests(): void {
   sessions.clear()
@@ -871,6 +872,7 @@ export function __resetStateForTests(): void {
   modelLimitsCache = undefined
   rawModelLimitsCache = undefined
   knownModelsCache = undefined
+  compactionModelOverride = undefined
   const dir = currentConfigDir || (process.env.OPENCODE_CONFIG_DIR ?? "")
   if (dir) {
     try {
@@ -1147,8 +1149,9 @@ function fallbackChainFor(ctx: any, agent?: string, opts?: any): string[] {
   return [...new Set(models)]
 }
 
-function stateFor(ctx: any, sid: string, seat?: string, agent?: string, opts?: FallbackOptions): SessionState {
-  let st = sessions.get(sid)
+function stateFor(ctx: any, sid: string, seat?: string, agent?: string, opts?: FallbackOptions, stateKey?: string): SessionState {
+  const key = stateKey ?? sid
+  let st = sessions.get(key)
   if (st) return st
   if (sessions.size >= MAX_SESSIONS) {
     const oldest = sessions.keys().next().value
@@ -1178,7 +1181,7 @@ function stateFor(ctx: any, sid: string, seat?: string, agent?: string, opts?: F
     hops: 0,
     lastAttempt: -1,
   }
-  sessions.set(sid, st)
+  sessions.set(key, st)
   return st
 }
 
@@ -1454,11 +1457,19 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         } catch {}
       }
 
+      const stateKey = isCompaction ? `${e.sessionID}:compaction` : e.sessionID
+      let compactionReloaded = false
+      const reloadCompactionAgent = async (): Promise<void> => {
+        if (!isCompaction || compactionReloaded) return
+        compactionReloaded = true
+        await Promise.resolve(ctx?.agent?.reload?.()).catch(() => undefined)
+      }
+
       if (isCompaction) {
         log(`retry ${e.sessionID}: agent=compaction model=${failedKey} -> ${c.cls} (${c.detail})`)
-        recordModelFailure(failedKey, c, fbOpts, sessions.get(e.sessionID))
+        recordModelFailure(failedKey, c, fbOpts, sessions.get(stateKey))
         if (c.cls === "model_not_found") markModelUnavailable(failedKey)
-        await Promise.resolve(ctx?.agent?.reload?.()).catch(() => undefined)
+        if (compactionModelOverride === failedKey) compactionModelOverride = undefined
       } else {
         log(
           `retry ${e.sessionID}: ${failedKey} attempt=${e?.attempt} -> ${c.cls}${c.detail ? ` (${c.detail})` : ""}${
@@ -1467,6 +1478,7 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         )
       }
 
+      try {
       // O2: the retry hook is not called once the budget is spent; treat
       // `attempt` as the hard signal anyway and never advance beyond it.
       const spent = typeof e?.attempt === "number" && e.attempt >= MAX_RETRY_ATTEMPTS
@@ -1474,7 +1486,7 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         log(`retry ${e.sessionID}: fatal — keeping default decision`)
         return
       }
-      const existingSt = sessions.get(e.sessionID)
+      const existingSt = sessions.get(stateKey)
       const existingBudget = existingSt?.opts?.budgets ?? fbOpts.budgets
       const existingMaxIters = existingBudget?.maxIterations ?? fbOpts.maxIterations ?? DEFAULTS.budgets.maxIterations
       const canRollover =
@@ -1521,7 +1533,7 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
       }
 
       const agentName = isCompaction ? "compaction" : (e?.agent ?? "developer")
-      const st = stateFor(ctx, e.sessionID, failedKey, agentName, fbOpts)
+      const st = stateFor(ctx, e.sessionID, failedKey, agentName, fbOpts, stateKey)
 
       const budget = st.opts?.budgets ?? fbOpts.budgets
       const budgetMs = budget?.fallbackBudgetMs ?? fbOpts.budgetMs ?? DEFAULTS.budgets.fallbackBudgetMs
@@ -1544,7 +1556,7 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
       }
       if (attempt !== undefined) st.lastAttempt = attempt
 
-      if (st.switched && st.seat && failedKey !== st.seat && failedKey === st.lastSwitchedFrom) {
+      if (!isCompaction && st.switched && st.seat && failedKey !== st.seat && failedKey === st.lastSwitchedFrom) {
         log(`retry ${e.sessionID}: received retry for previously switched model ${failedKey} while seat is ${st.seat} — aborting retry for old model`)
         e.decision = { retry: false }
         return
@@ -1715,6 +1727,10 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         log(`retry ${e.sessionID}: switchModel failed and no fallback candidate left — keeping default decision`)
         return
       }
+      if (isCompaction) {
+        compactionModelOverride = target
+        await reloadCompactionAgent()
+      }
       st.hops += 1
 
       // Always re-decide after switching: the failed model's Retry-After is
@@ -1725,6 +1741,9 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
       deferLiveness(e.sessionID, e.decision.delay)
       scheduleRolloverIfSpent()
       log(`retry ${e.sessionID}: switched ${failedKey} -> ${target} (${c.cls}, attempt ${e.attempt})`)
+      } finally {
+        await reloadCompactionAgent()
+      }
     } catch (err: any) {
       log(`retry hook failed, keeping default decision: ${String(err)}`)
     }
@@ -1735,8 +1754,10 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
     try {
       const sid = e?.sessionID
       if (!sid) return
-      const existing = sessions.get(sid)
-      const st = existing ?? stateFor(ctx, sid, undefined, e?.agent, fbOpts)
+      const isCompactionPrompt = e?.agent === "compaction" || e?.type === "compaction" || e?.action === "compaction"
+      const stateKey = isCompactionPrompt ? `${sid}:compaction` : sid
+      const existing = sessions.get(stateKey)
+      const st = existing ?? stateFor(ctx, sid, undefined, isCompactionPrompt ? "compaction" : e?.agent, fbOpts, stateKey)
       // Agent locking (MEDIUM, requirement: fallback chain uses the agent locked
       // at session start): only an explicit user choice (prompt admission) may
       // update the lock; OpenCode's inferred agent is ignored.
@@ -1751,6 +1772,10 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         // candidates consumed by a previous turn's failover walk do not leak.
         st.rePrompts += 1
         resetTurnState(st, ctx, st.agent)
+        if (!isCompactionPrompt) {
+          const compSt = sessions.get(`${sid}:compaction`)
+          if (compSt) resetTurnState(compSt, ctx, "compaction")
+        }
       } else {
         // A watchdog recovery re-prompt continues the SAME logical failover
         // walk: keep the chain, the tried set and the wall-clock deadline, but
@@ -1955,7 +1980,7 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         }
       }
 
-      const allIds = [...new Set([...wanted, ...existingMap.keys()])]
+      const allIds = [...new Set([...wanted, ...existingMap.keys(), ...(compactionModelOverride ? ["compaction"] : [])])]
 
       for (const id of allIds) {
         const agentFb = fbFile?.agents?.[id]
@@ -1987,20 +2012,35 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         const currentModelKey = existingObj?.model ? fmtModel(existingObj.model) : undefined
         const currentModelHealthy = currentModelKey ? isModelHealthyNow(currentModelKey) : false
 
-        // Guard: if operator configured an agent with an available, working model, leave it alone.
+        const activeCompactionOverride =
+          id === "compaction" &&
+          compactionModelOverride &&
+          isModelHealthyNow(compactionModelOverride) &&
+          isModelAvailable(compactionModelOverride)
+            ? compactionModelOverride
+            : undefined
+
+        // Guard: if operator configured an agent with an available, working model, leave it alone,
+        // unless an active compaction failover override targets a different model.
         if (existingObj && currentModelKey && currentModelHealthy) {
-          continue
+          if (!activeCompactionOverride || currentModelKey === activeCompactionOverride) {
+            continue
+          }
         }
 
+        const chosenModel = activeCompactionOverride ?? healthyFallback
+
         if (existingObj && currentModelKey && !currentModelHealthy) {
-          log(`agent '${id}' model '${currentModelKey}' is unhealthy/unavailable — replacing with healthy fallback '${healthyFallback}'`)
+          log(`agent '${id}' model '${currentModelKey}' is unhealthy/unavailable — replacing with healthy fallback '${chosenModel}'`)
+        } else if (activeCompactionOverride && currentModelKey !== activeCompactionOverride) {
+          log(`agent 'compaction' model '${currentModelKey ?? "(none)"}' overridden to '${activeCompactionOverride}' after failover`)
         }
 
         const agent: any = {
           name: id,
           description: existingObj?.description ?? `Fallback agent registered by opencode-subagent-fallback (${id})`,
           mode: id === "compaction" ? "primary" : (existingObj?.mode ?? "subagent"),
-          model: toModelRef(healthyFallback),
+          model: toModelRef(chosenModel),
         }
 
         // V2 AgentEditor contract: `update(id, fn)` is an upsert that receives a
