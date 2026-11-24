@@ -36,8 +36,10 @@ export interface Classified {
 /** Error emitted when OUR watchdog aborted an attempt, so classification can tell ours from the provider's. */
 export declare const WatchdogAbort: any;
 /**
- * V1 quota text parser: derive the blocked-until reset hint ("resets in Ns" /
- * "retry in Ns") from the error text (message + response body) into a duration.
+ * Uniform quota text parser: derive the blocked-until reset hint from error text
+ * (message + response body) into a duration in milliseconds.
+ * Handles compound relative times ("in 17 h 3 min"), absolute UTC clock times ("at 00:00 UTC"),
+ * and standard unit durations ("resets in 3600s"). Enforces positive finite output.
  */
 export declare function parseQuotaBlockedUntil(err: any): number | undefined;
 export declare function classifyError(err: any): Classified;

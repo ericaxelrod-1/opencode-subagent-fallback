@@ -72,6 +72,9 @@ async function main(): Promise<void> {
   t("V2 error.type provider.auth", { error: { type: "provider.auth" }, statusCode: 401 }, "auth")
   t("V2 error.type provider.rate-limit + retryAfterMs", { error: { type: "provider.rate-limit", retryAfterMs: 30000 } }, "transient")
   check("parseQuotaBlockedUntil parses 'resets in 3600s'", parseQuotaBlockedUntil({ error: { message: "quota resets in 3600s" } }) === 3600000, String(parseQuotaBlockedUntil({ error: { message: "quota resets in 3600s" } })))
+  check("parseQuotaBlockedUntil parses compound 'resets at 00:00 UTC, in 17 h 3 min.'", parseQuotaBlockedUntil({ error: { message: "Today's free usage is used up. It resets at 00:00 UTC, in 17 h 3 min." } }) === 61380000, String(parseQuotaBlockedUntil({ error: { message: "Today's free usage is used up. It resets at 00:00 UTC, in 17 h 3 min." } })))
+  check("parseQuotaBlockedUntil parses absolute 'resets at 00:00 UTC'", (parseQuotaBlockedUntil({ error: { message: "quota resets at 00:00 UTC" } }) ?? 0) > 0, String(parseQuotaBlockedUntil({ error: { message: "quota resets at 00:00 UTC" } })))
+  check("parseQuotaBlockedUntil parses compound 'in 5 min 30 sec'", parseQuotaBlockedUntil({ error: { message: "retry in 5 min 30 sec" } }) === 330000, String(parseQuotaBlockedUntil({ error: { message: "retry in 5 min 30 sec" } })))
 
   console.log("\ncompletion gate (V2 flat schema, D3):")
   check("complete ok", checkCompletion([{ type: "assistant", content: [{ type: "text", text: "hi" }], time: { completed: 1 }, finish: "stop" }]).ok)

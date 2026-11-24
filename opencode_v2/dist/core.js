@@ -69,18 +69,69 @@ function errorText(err) {
     return text.toLowerCase();
 }
 /**
- * V1 quota text parser: derive the blocked-until reset hint ("resets in Ns" /
- * "retry in Ns") from the error text (message + response body) into a duration.
+ * Uniform quota text parser: derive the blocked-until reset hint from error text
+ * (message + response body) into a duration in milliseconds.
+ * Handles compound relative times ("in 17 h 3 min"), absolute UTC clock times ("at 00:00 UTC"),
+ * and standard unit durations ("resets in 3600s"). Enforces positive finite output.
  */
 export function parseQuotaBlockedUntil(err) {
     const text = errorText(err);
-    const m = /resets?\s+(?:in|at|:)\s*(\d+(?:\.\d+)?)\s*(\w+)?/.exec(text) ?? /retry\s+in\s+(\d+(?:\.\d+)?)\s*(\w+)?/.exec(text);
-    if (!m)
+    if (!text)
         return undefined;
-    const n = Number(m[1]);
-    const unit = String(m[2] ?? "seconds").toLowerCase();
-    const mult = /ms$/.test(unit) ? 1 : /second|sec/.test(unit) ? 1000 : /minute|min/.test(unit) ? 60000 : /hour|hr/.test(unit) ? 3600000 : /day/.test(unit) ? 86400000 : 1000;
-    return n * mult;
+    // 1. Compound relative duration: e.g. "in 17 h 3 min", "17 hours 3 minutes", "after 2h 15m 30s"
+    const comp = /(?:in|after)\s+(\d+(?:\.\d+)?)\s*(?:h|hr|hours?)\s*(?:(?:and|,)?\s*(\d+(?:\.\d+)?)\s*(?:m|min|minutes?))?(?:\s*(?:(?:and|,)?\s*(\d+(?:\.\d+)?)\s*(?:s|sec|seconds?)))?/i.exec(text);
+    if (comp) {
+        const hrs = Number(comp[1]) || 0;
+        const mins = Number(comp[2]) || 0;
+        const secs = Number(comp[3]) || 0;
+        const totalMs = (hrs * 3600 + mins * 60 + secs) * 1000;
+        if (totalMs > 0)
+            return totalMs;
+    }
+    // 2. Compound minutes + seconds: e.g. "in 5 min 30 sec", "5m 30s"
+    const minSec = /(?:in|after)\s+(\d+(?:\.\d+)?)\s*(?:m|min|minutes?)\s*(?:(?:and|,)?\s*(\d+(?:\.\d+)?)\s*(?:s|sec|seconds?))/i.exec(text);
+    if (minSec) {
+        const mins = Number(minSec[1]) || 0;
+        const secs = Number(minSec[2]) || 0;
+        const totalMs = (mins * 60 + secs) * 1000;
+        if (totalMs > 0)
+            return totalMs;
+    }
+    // 3. Absolute UTC timestamp: e.g. "resets at 00:00 UTC", "at 14:30:00 UTC"
+    const utc = /resets?\s+at\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*utc/i.exec(text);
+    if (utc) {
+        const targetH = Number(utc[1]);
+        const targetM = Number(utc[2]);
+        const targetS = Number(utc[3] ?? "0");
+        if (targetH >= 0 && targetH < 24 && targetM >= 0 && targetM < 60) {
+            const nowDate = new Date();
+            const targetDate = new Date(Date.UTC(nowDate.getUTCFullYear(), nowDate.getUTCMonth(), nowDate.getUTCDate(), targetH, targetM, targetS));
+            let delta = targetDate.getTime() - nowDate.getTime();
+            if (delta <= 0) {
+                delta += 86400000; // Next occurrence tomorrow
+            }
+            if (delta > 0)
+                return delta;
+        }
+    }
+    // 4. Standard single duration: e.g. "resets in 45s", "retry in 30 seconds", "resets in 2 hours"
+    const single = /resets?\s+(?:in|:)\s*(\d+(?:\.\d+)?)\s*(\w+)?/i.exec(text) ??
+        /retry\s+in\s+(\d+(?:\.\d+)?)\s*(\w+)?/i.exec(text);
+    if (single) {
+        const n = Number(single[1]);
+        if (Number.isFinite(n) && n > 0) {
+            const unit = String(single[2] ?? "seconds").toLowerCase();
+            const mult = /ms$/.test(unit) ? 1 :
+                /second|sec|^s$/.test(unit) ? 1000 :
+                    /minute|min|^m$/.test(unit) ? 60000 :
+                        /hour|hr|^h$/.test(unit) ? 3600000 :
+                            /day|^d$/.test(unit) ? 86400000 : 1000;
+            const totalMs = n * mult;
+            if (totalMs > 0)
+                return totalMs;
+        }
+    }
+    return undefined;
 }
 /** V2 `SessionError.Error.type` taxonomy (provider.*), falling back to status/message heuristics. */
 function errTypeOf(err, status) {
@@ -130,8 +181,9 @@ export function classifyError(err) {
     const name = e?.name ?? "";
     const msg = String(e?.message ?? err?.message ?? "").toLowerCase();
     const type = errTypeOf(err, status);
-    const retryAfterMs = (typeof e?.retryAfterMs === "number" && e.retryAfterMs > 0 ? e.retryAfterMs : undefined) ??
-        parseQuotaBlockedUntil(err) ??
+    const parsedQuotaMs = parseQuotaBlockedUntil(err);
+    const retryAfterMs = (typeof e?.retryAfterMs === "number" && Number.isFinite(e.retryAfterMs) && e.retryAfterMs > 0 ? e.retryAfterMs : undefined) ??
+        (typeof parsedQuotaMs === "number" && Number.isFinite(parsedQuotaMs) && parsedQuotaMs > 0 ? parsedQuotaMs : undefined) ??
         headerRetryAfter(e?.responseHeaders) ??
         headerRetryAfter(e?.response?.headers) ??
         headerRetryAfter(err?.responseHeaders);
@@ -1119,7 +1171,8 @@ export function recordModelFailure(failedKey, c, fbOpts, st) {
         b.recordFailure();
     }
     if (c.cls === "quota") {
-        const reset = c.retryAfterMs ?? fbOpts.budgets?.quotaThresholdMs ?? QUOTA_THRESHOLD_MS;
+        const rawReset = typeof c.retryAfterMs === "number" && Number.isFinite(c.retryAfterMs) && c.retryAfterMs > 0 ? c.retryAfterMs : undefined;
+        const reset = rawReset ?? fbOpts.budgets?.quotaThresholdMs ?? QUOTA_THRESHOLD_MS;
         const until = now() + reset;
         blockedUntilByModel.set(failedKey, until);
         if (st)
