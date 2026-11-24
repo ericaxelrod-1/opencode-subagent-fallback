@@ -612,7 +612,11 @@ async function main(): Promise<void> {
     await fb.onContext({ sessionID: "ses_parent_1", model: "anthropic/claude-3-7-sonnet" })
     await fb.onToolExecuteBefore(hookPayload1)
 
-    check("subagent inherits healthy parent model", hookPayload1.input.model?.id === "claude-3-7-sonnet", JSON.stringify(hookPayload1.input.model))
+    check(
+      "subagent inherits healthy parent model",
+      typeof hookPayload1.input.model === "string" && hookPayload1.input.model.includes("claude-3-7-sonnet"),
+      JSON.stringify(hookPayload1.input.model),
+    )
 
     // Caller passes dead model explicitly
     const hookPayload2: any = {
@@ -621,7 +625,13 @@ async function main(): Promise<void> {
       input: { agent: "developer", model: "openrouter/xingchen-agi/xing4.0-29b-a4b:free", description: "do task" },
     }
     await fb.onToolExecuteBefore(hookPayload2)
-    check("subagent replaces explicit dead model with healthy fallback", hookPayload2.input.model?.id !== "xing4.0-29b-a4b:free" && isModelAvailable(hookPayload2.input.model), JSON.stringify(hookPayload2.input.model))
+    check(
+      "subagent replaces explicit dead model with healthy fallback",
+      typeof hookPayload2.input.model === "string" &&
+        !hookPayload2.input.model.includes("xing4.0") &&
+        isModelAvailable(hookPayload2.input.model),
+      JSON.stringify(hookPayload2.input.model),
+    )
 
     __setKnownModelsForTests(undefined)
   }

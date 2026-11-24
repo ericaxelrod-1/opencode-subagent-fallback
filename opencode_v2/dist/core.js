@@ -1861,7 +1861,7 @@ export function createFallback(ctx, opts) {
                 .find((m) => m && isModelHealthyNow(m)) ?? pickDefaultAvailableModel();
             if (!input.model) {
                 const chosenModel = parentHealthy && parentModelKey ? parentModelKey : healthyFallback;
-                input.model = toModelRef(chosenModel);
+                input.model = chosenModel;
                 log(`subagent tool: assigned model ${chosenModel} to '${targetAgentId}' (parent: ${parentModelKey ?? "none"}, parentHealthy: ${parentHealthy})`);
             }
         }
