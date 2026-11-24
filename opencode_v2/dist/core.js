@@ -1558,14 +1558,62 @@ export function createFallback(ctx, opts) {
                     await reloadCompactionAgent();
                 }
                 st.hops += 1;
-                // Always re-decide after switching: the failed model's Retry-After is
-                // meaningless once we have moved to a different model. Sleep only the
-                // next model's cooldown — 0 when it has no active rate-limit window (O1:
-                // sticky failover writes one durable model-switched artifact).
-                e.decision = { retry: true, delay: nextCooldownMs(target, st) };
-                deferLiveness(e.sessionID, e.decision.delay);
-                scheduleRolloverIfSpent();
-                log(`retry ${e.sessionID}: switched ${failedKey} -> ${target} (${c.cls}, attempt ${e.attempt})`);
+                if (isCompaction &&
+                    typeof ctx?.session?.compact === "function" &&
+                    now() < st.deadline &&
+                    st.hops <= maxIters) {
+                    const sid = e.sessionID;
+                    const delay = nextCooldownMs(target, st);
+                    e.decision = { retry: false };
+                    st.lastAttempt = -1;
+                    deferLiveness(sid, Math.max(50, delay) + 500);
+                    log(`retry ${sid}: compaction switched ${failedKey} -> ${target} (${c.cls}, attempt ${e.attempt}) — breaking in-flight retry loop & rolling over in ${Math.max(50, delay)}ms`);
+                    const timer = setTimeout(() => {
+                        rolloverTimers.delete(timer);
+                        void (async () => {
+                            await reloadCompactionAgent();
+                            try {
+                                await Promise.resolve(ctx.session.compact({ sessionID: sid }));
+                            }
+                            catch {
+                                return;
+                            }
+                            const parentSt = sessions.get(sid);
+                            if (typeof ctx?.session?.prompt === "function" && parentSt) {
+                                recoveringSessions.add(sid);
+                                try {
+                                    await Promise.resolve(ctx.session.prompt({
+                                        sessionID: sid,
+                                        text: parentSt.prompt?.text ?? CONTINUE_PROMPT,
+                                        files: parentSt.prompt?.files,
+                                        agents: parentSt.prompt?.agents,
+                                        skills: parentSt.prompt?.skills,
+                                        delivery: parentSt.prompt?.delivery,
+                                        resume: parentSt.prompt?.resume ?? true,
+                                    }));
+                                }
+                                catch {
+                                    // ignore prompt resume errors
+                                }
+                                finally {
+                                    recoveringSessions.delete(sid);
+                                }
+                            }
+                        })();
+                    }, Math.max(50, delay));
+                    timer.unref?.();
+                    rolloverTimers.add(timer);
+                }
+                else {
+                    // Always re-decide after switching: the failed model's Retry-After is
+                    // meaningless once we have moved to a different model. Sleep only the
+                    // next model's cooldown — 0 when it has no active rate-limit window (O1:
+                    // sticky failover writes one durable model-switched artifact).
+                    e.decision = { retry: true, delay: nextCooldownMs(target, st) };
+                    deferLiveness(e.sessionID, e.decision.delay);
+                    scheduleRolloverIfSpent();
+                    log(`retry ${e.sessionID}: switched ${failedKey} -> ${target} (${c.cls}, attempt ${e.attempt})`);
+                }
             }
             finally {
                 await reloadCompactionAgent();

@@ -943,6 +943,69 @@ async function main() {
         check("subsequent compaction failover re-binds compaction agent to c3/comp3", savedAgentsIso.get("compaction")?.model?.providerID === "c3" && savedAgentsIso.get("compaction")?.model?.id === "comp3", JSON.stringify(savedAgentsIso.get("compaction")));
         __setKnownModelsForTests(undefined);
     }
+    console.log("\ncompaction rollover (breaks wedged in-flight loop & resumes prompt):");
+    {
+        __resetStateForTests();
+        __setKnownModelsForTests(["o/orch1", "c1/comp1", "c2/comp2", "c3/comp3"]);
+        const switchesRoll = [];
+        const compactCalls = [];
+        const promptCalls = [];
+        const savedAgentsRoll = new Map();
+        savedAgentsRoll.set("compaction", { id: "compaction", model: "c1/comp1" });
+        const mockEditorRoll = {
+            list: () => Array.from(savedAgentsRoll.values()),
+            get: (id) => savedAgentsRoll.get(id),
+            update: (id, fn) => {
+                const cur = savedAgentsRoll.get(id) ?? { id };
+                const next = fn(cur) ?? cur;
+                savedAgentsRoll.set(id, next);
+            },
+        };
+        let fbRoll;
+        const ctxRoll = {
+            ...mockCtx(switchesRoll),
+            session: {
+                ...mockCtx(switchesRoll).session,
+                compact: async (args) => {
+                    compactCalls.push(args);
+                },
+                prompt: async (args) => {
+                    promptCalls.push(args);
+                },
+            },
+            agent: {
+                reload: async () => {
+                    fbRoll.installAgents(mockEditorRoll);
+                },
+            },
+        };
+        fbRoll = createFallback(ctxRoll, {
+            providerDefaults: { ...STICKY_FAST, stickyMs: 0 },
+            agents: {
+                orchestrator: { fallback: ["o/orch1"] },
+                compaction: {
+                    largeContextModel: "c1/comp1",
+                    largeContextFallback: ["c2/comp2", "c3/comp3"],
+                },
+            },
+        });
+        await fbRoll.onPrompt({ sessionID: "ses_comp_rollover", agent: "orchestrator", text: "resume work" });
+        const evRoll = {
+            sessionID: "ses_comp_rollover",
+            agent: "compaction",
+            model: { providerID: "c1", id: "comp1" },
+            error: { statusCode: 503, message: "Service unavailable" },
+            attempt: 0,
+            decision: { retry: true },
+        };
+        await fbRoll.onRetry(evRoll);
+        check("compaction rollover sets decision.retry = false immediately", evRoll.decision.retry === false);
+        check("compaction rollover re-binds compaction agent to c2/comp2 via reload + installAgents", savedAgentsRoll.get("compaction")?.model?.providerID === "c2" && savedAgentsRoll.get("compaction")?.model?.id === "comp2", JSON.stringify(savedAgentsRoll.get("compaction")));
+        await new Promise((r) => setTimeout(r, 100));
+        check("compaction rollover invokes ctx.session.compact({ sessionID: 'ses_comp_rollover' })", compactCalls.length === 1 && compactCalls[0]?.sessionID === "ses_comp_rollover", JSON.stringify(compactCalls));
+        check("compaction rollover resumes parent prompt with 'resume work' after compact resolves", promptCalls.length === 1 && promptCalls[0]?.sessionID === "ses_comp_rollover" && promptCalls[0]?.text === "resume work", JSON.stringify(promptCalls));
+        __setKnownModelsForTests(undefined);
+    }
     console.log("\nselftest result:");
     if (failures === 0) {
         console.log("  all checks passed\n");
