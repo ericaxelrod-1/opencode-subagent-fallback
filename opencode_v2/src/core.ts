@@ -531,6 +531,7 @@ function resolveOpts(opts?: Partial<FallbackOptions>): FallbackOptions {
     providers: { ...DEFAULTS.providers, ...(o.providers ?? {}) },
   }
   if ((o as any).agents) out.agents = (o as any).agents
+  if ((o as any).defaultFallback) out.defaultFallback = (o as any).defaultFallback
   if ((o as any).defaultLargeContextModel) out.defaultLargeContextModel = (o as any).defaultLargeContextModel
   if ((o as any).defaultLargeContextFallback) out.defaultLargeContextFallback = (o as any).defaultLargeContextFallback
   if ((o as any).largeContextModel) out.largeContextModel = (o as any).largeContextModel
@@ -862,7 +863,8 @@ const MAX_SESSIONS = 256
 let modelLimitsCache: Map<string, number> | undefined
 let rawModelLimitsCache: Map<string, number> | undefined
 let knownModelsCache: Set<string> | undefined
-let compactionModelOverride: string | undefined
+const compactionModelOverrides = new Map<string, string>()
+let latestCompactionModelOverride: string | undefined
 
 export function __resetStateForTests(): void {
   sessions.clear()
@@ -872,7 +874,8 @@ export function __resetStateForTests(): void {
   modelLimitsCache = undefined
   rawModelLimitsCache = undefined
   knownModelsCache = undefined
-  compactionModelOverride = undefined
+  compactionModelOverrides.clear()
+  latestCompactionModelOverride = undefined
   const dir = currentConfigDir || (process.env.OPENCODE_CONFIG_DIR ?? "")
   if (dir) {
     try {
@@ -1404,23 +1407,6 @@ function isCompactionModel(modelKey: string, ctx?: any, opts?: any): boolean {
   for (const src of [opts, fbFile]) {
     if (!src) continue
     if (src.agents?.compaction?.largeContextModel) candidates.push(src.agents.compaction.largeContextModel)
-    if (src.agents?.compaction?.largeContextFallback) {
-      for (const f of src.agents.compaction.largeContextFallback) {
-        candidates.push(typeof f === "string" ? f : f.model)
-      }
-    }
-    if (src.defaultLargeContextModel) candidates.push(src.defaultLargeContextModel)
-    if (src.defaultLargeContextFallback) {
-      for (const f of src.defaultLargeContextFallback) {
-        candidates.push(typeof f === "string" ? f : f.model)
-      }
-    }
-    if (src.largeContextModel) candidates.push(src.largeContextModel)
-    if (src.largeContextFallback) {
-      for (const f of src.largeContextFallback) {
-        candidates.push(typeof f === "string" ? f : f.model)
-      }
-    }
   }
   return candidates.some((c) => c && fmtModel(c).toLowerCase() === norm)
 }
@@ -1445,9 +1431,9 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         e?.agent === "compaction" ||
         e?.type === "compaction" ||
         e?.action === "compaction" ||
-        isCompactionModel(failedKey, ctx, fbOpts)
+        (!e?.agent && isCompactionModel(failedKey, ctx, fbOpts))
 
-      if (!isCompaction && ctx?.session?.messages && e?.sessionID) {
+      if (!isCompaction && !e?.agent && ctx?.session?.messages && e?.sessionID) {
         try {
           const msgs = await readFlatMessages(ctx, e.sessionID)
           const lastMsg = msgs[msgs.length - 1]
@@ -1469,7 +1455,12 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         log(`retry ${e.sessionID}: agent=compaction model=${failedKey} -> ${c.cls} (${c.detail})`)
         recordModelFailure(failedKey, c, fbOpts, sessions.get(stateKey))
         if (c.cls === "model_not_found") markModelUnavailable(failedKey)
-        if (compactionModelOverride === failedKey) compactionModelOverride = undefined
+        if (compactionModelOverrides.get(e.sessionID) === failedKey) {
+          compactionModelOverrides.delete(e.sessionID)
+        }
+        if (latestCompactionModelOverride === failedKey) {
+          latestCompactionModelOverride = undefined
+        }
       } else {
         log(
           `retry ${e.sessionID}: ${failedKey} attempt=${e?.attempt} -> ${c.cls}${c.detail ? ` (${c.detail})` : ""}${
@@ -1728,7 +1719,8 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         return
       }
       if (isCompaction) {
-        compactionModelOverride = target
+        compactionModelOverrides.set(e.sessionID, target)
+        latestCompactionModelOverride = target
         await reloadCompactionAgent()
       }
       st.hops += 1
@@ -2028,7 +2020,7 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         }
       }
 
-      const allIds = [...new Set([...wanted, ...existingMap.keys(), ...(compactionModelOverride ? ["compaction"] : [])])]
+      const allIds = [...new Set([...wanted, ...existingMap.keys(), ...(latestCompactionModelOverride ? ["compaction"] : [])])]
 
       for (const id of allIds) {
         const agentFb = fbFile?.agents?.[id]
@@ -2062,10 +2054,10 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
 
         const activeCompactionOverride =
           id === "compaction" &&
-          compactionModelOverride &&
-          isModelHealthyNow(compactionModelOverride) &&
-          isModelAvailable(compactionModelOverride)
-            ? compactionModelOverride
+          latestCompactionModelOverride &&
+          isModelHealthyNow(latestCompactionModelOverride) &&
+          isModelAvailable(latestCompactionModelOverride)
+            ? latestCompactionModelOverride
             : undefined
 
         // Guard: if operator configured an agent with an available, working model, leave it alone,

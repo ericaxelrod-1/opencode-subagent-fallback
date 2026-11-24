@@ -386,6 +386,8 @@ function resolveOpts(opts) {
     };
     if (o.agents)
         out.agents = o.agents;
+    if (o.defaultFallback)
+        out.defaultFallback = o.defaultFallback;
     if (o.defaultLargeContextModel)
         out.defaultLargeContextModel = o.defaultLargeContextModel;
     if (o.defaultLargeContextFallback)
@@ -699,7 +701,8 @@ const MAX_SESSIONS = 256;
 let modelLimitsCache;
 let rawModelLimitsCache;
 let knownModelsCache;
-let compactionModelOverride;
+const compactionModelOverrides = new Map();
+let latestCompactionModelOverride;
 export function __resetStateForTests() {
     sessions.clear();
     breakersByModel.clear();
@@ -708,7 +711,8 @@ export function __resetStateForTests() {
     modelLimitsCache = undefined;
     rawModelLimitsCache = undefined;
     knownModelsCache = undefined;
-    compactionModelOverride = undefined;
+    compactionModelOverrides.clear();
+    latestCompactionModelOverride = undefined;
     const dir = currentConfigDir || (process.env.OPENCODE_CONFIG_DIR ?? "");
     if (dir) {
         try {
@@ -1247,25 +1251,6 @@ function isCompactionModel(modelKey, ctx, opts) {
             continue;
         if (src.agents?.compaction?.largeContextModel)
             candidates.push(src.agents.compaction.largeContextModel);
-        if (src.agents?.compaction?.largeContextFallback) {
-            for (const f of src.agents.compaction.largeContextFallback) {
-                candidates.push(typeof f === "string" ? f : f.model);
-            }
-        }
-        if (src.defaultLargeContextModel)
-            candidates.push(src.defaultLargeContextModel);
-        if (src.defaultLargeContextFallback) {
-            for (const f of src.defaultLargeContextFallback) {
-                candidates.push(typeof f === "string" ? f : f.model);
-            }
-        }
-        if (src.largeContextModel)
-            candidates.push(src.largeContextModel);
-        if (src.largeContextFallback) {
-            for (const f of src.largeContextFallback) {
-                candidates.push(typeof f === "string" ? f : f.model);
-            }
-        }
     }
     return candidates.some((c) => c && fmtModel(c).toLowerCase() === norm);
 }
@@ -1285,8 +1270,8 @@ export function createFallback(ctx, opts) {
             let isCompaction = e?.agent === "compaction" ||
                 e?.type === "compaction" ||
                 e?.action === "compaction" ||
-                isCompactionModel(failedKey, ctx, fbOpts);
-            if (!isCompaction && ctx?.session?.messages && e?.sessionID) {
+                (!e?.agent && isCompactionModel(failedKey, ctx, fbOpts));
+            if (!isCompaction && !e?.agent && ctx?.session?.messages && e?.sessionID) {
                 try {
                     const msgs = await readFlatMessages(ctx, e.sessionID);
                     const lastMsg = msgs[msgs.length - 1];
@@ -1309,8 +1294,12 @@ export function createFallback(ctx, opts) {
                 recordModelFailure(failedKey, c, fbOpts, sessions.get(stateKey));
                 if (c.cls === "model_not_found")
                     markModelUnavailable(failedKey);
-                if (compactionModelOverride === failedKey)
-                    compactionModelOverride = undefined;
+                if (compactionModelOverrides.get(e.sessionID) === failedKey) {
+                    compactionModelOverrides.delete(e.sessionID);
+                }
+                if (latestCompactionModelOverride === failedKey) {
+                    latestCompactionModelOverride = undefined;
+                }
             }
             else {
                 log(`retry ${e.sessionID}: ${failedKey} attempt=${e?.attempt} -> ${c.cls}${c.detail ? ` (${c.detail})` : ""}${c.retryAfterMs !== undefined ? ` retryAfterMs=${c.retryAfterMs}` : ""}`);
@@ -1554,7 +1543,8 @@ export function createFallback(ctx, opts) {
                     return;
                 }
                 if (isCompaction) {
-                    compactionModelOverride = target;
+                    compactionModelOverrides.set(e.sessionID, target);
+                    latestCompactionModelOverride = target;
                     await reloadCompactionAgent();
                 }
                 st.hops += 1;
@@ -1871,7 +1861,7 @@ export function createFallback(ctx, opts) {
                         existingMap.set(id, ag);
                 }
             }
-            const allIds = [...new Set([...wanted, ...existingMap.keys(), ...(compactionModelOverride ? ["compaction"] : [])])];
+            const allIds = [...new Set([...wanted, ...existingMap.keys(), ...(latestCompactionModelOverride ? ["compaction"] : [])])];
             for (const id of allIds) {
                 const agentFb = fbFile?.agents?.[id];
                 const fallbacks = id === "compaction"
@@ -1899,10 +1889,10 @@ export function createFallback(ctx, opts) {
                 const currentModelKey = existingObj?.model ? fmtModel(existingObj.model) : undefined;
                 const currentModelHealthy = currentModelKey ? isModelHealthyNow(currentModelKey) : false;
                 const activeCompactionOverride = id === "compaction" &&
-                    compactionModelOverride &&
-                    isModelHealthyNow(compactionModelOverride) &&
-                    isModelAvailable(compactionModelOverride)
-                    ? compactionModelOverride
+                    latestCompactionModelOverride &&
+                    isModelHealthyNow(latestCompactionModelOverride) &&
+                    isModelAvailable(latestCompactionModelOverride)
+                    ? latestCompactionModelOverride
                     : undefined;
                 // Guard: if operator configured an agent with an available, working model, leave it alone,
                 // unless an active compaction failover override targets a different model.

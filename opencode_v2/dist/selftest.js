@@ -1006,6 +1006,67 @@ async function main() {
         check("compaction rollover resumes parent prompt with 'resume work' after compact resolves", promptCalls.length === 1 && promptCalls[0]?.sessionID === "ses_comp_rollover" && promptCalls[0]?.text === "resume work", JSON.stringify(promptCalls));
         __setKnownModelsForTests(undefined);
     }
+    console.log("\nnon-compaction agent not hijacked by isCompactionModel:");
+    {
+        __resetStateForTests();
+        __setKnownModelsForTests(["u/comp-primary", "u/shared-model", "opencode/healthy-fallback"]);
+        const switchesNonComp = [];
+        const compactCallsNonComp = [];
+        let reloadCallsNonComp = 0;
+        const ctxNonComp = {
+            ...mockCtx(switchesNonComp),
+            session: {
+                ...mockCtx(switchesNonComp).session,
+                compact: async (args) => {
+                    compactCallsNonComp.push(args);
+                },
+            },
+            agent: {
+                reload: async () => {
+                    reloadCallsNonComp++;
+                },
+            },
+        };
+        const fbNonComp = createFallback(ctxNonComp, {
+            providerDefaults: { ...STICKY_FAST, stickyMs: 0 },
+            defaultFallback: ["opencode/healthy-fallback"],
+            agents: {
+                compaction: {
+                    largeContextModel: "u/comp-primary",
+                    largeContextFallback: ["u/shared-model"],
+                },
+            },
+        });
+        const evShared = {
+            sessionID: "ses_general_shared",
+            agent: "general",
+            model: { providerID: "u", id: "shared-model" },
+            error: { statusCode: 429, message: "Rate limit" },
+            attempt: 0,
+            decision: { retry: true },
+        };
+        await fbNonComp.onRetry(evShared);
+        check("general agent on shared largeContextFallback switches to defaultFallback (opencode/healthy-fallback)", switchesNonComp.length === 1 &&
+            switchesNonComp[0]?.model?.providerID === "opencode" &&
+            switchesNonComp[0]?.model?.id === "healthy-fallback", JSON.stringify(switchesNonComp));
+        check("general agent on shared largeContextFallback does not trigger compact", compactCallsNonComp.length === 0);
+        check("general agent on shared largeContextFallback does not reload compaction agent", reloadCallsNonComp === 0);
+        const evCompPrimary = {
+            sessionID: "ses_general_primary",
+            agent: "general",
+            model: { providerID: "u", id: "comp-primary" },
+            error: { statusCode: 429, message: "Rate limit" },
+            attempt: 0,
+            decision: { retry: true },
+        };
+        await fbNonComp.onRetry(evCompPrimary);
+        check("general agent on compaction largeContextModel switches to defaultFallback (opencode/healthy-fallback)", switchesNonComp.length === 2 &&
+            switchesNonComp[1]?.model?.providerID === "opencode" &&
+            switchesNonComp[1]?.model?.id === "healthy-fallback", JSON.stringify(switchesNonComp));
+        check("general agent on compaction largeContextModel does not trigger compact", compactCallsNonComp.length === 0);
+        check("general agent on compaction largeContextModel does not reload compaction agent", reloadCallsNonComp === 0);
+        __setKnownModelsForTests(undefined);
+    }
     console.log("\nselftest result:");
     if (failures === 0) {
         console.log("  all checks passed\n");
