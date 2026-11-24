@@ -36,8 +36,10 @@ export interface Classified {
 /** Error emitted when OUR watchdog aborted an attempt, so classification can tell ours from the provider's. */
 export declare const WatchdogAbort: any;
 /**
- * V1 quota text parser: derive the blocked-until reset hint ("resets in Ns" /
- * "retry in Ns") from the error text (message + response body) into a duration.
+ * Uniform quota text parser: derive the blocked-until reset hint from error text
+ * (message + response body) into a duration in milliseconds.
+ * Handles compound relative times ("in 17 h 3 min"), absolute UTC clock times ("at 00:00 UTC"),
+ * and standard unit durations ("resets in 3600s"). Enforces positive finite output.
  */
 export declare function parseQuotaBlockedUntil(err: any): number | undefined;
 export declare function classifyError(err: any): Classified;
@@ -123,6 +125,21 @@ export interface FallbackOptions {
     budgetMs: number;
     maxIterations: number;
     compactionRatio: number;
+    /**
+     * consoleLogging: Master toggle for echoing fallback, retry, and breaker events to console (stderr/stdout).
+     * DEFAULT: false (silent console / clean boundary isolation).
+     *
+     * Architectural Rationale (Silent Resilience):
+     * In multi-agent systems, leaf worker stdout/stderr is monitored by parent orchestrator LLMs.
+     * When orchestrators observe intermediate provider failure signals (HTTP 429, 503, quota exhaustion, circuit breaker trips),
+     * their RLHF'd troubleshooting reflexes trigger, leading to panicked, counterproductive manual workarounds
+     * (e.g. launching rogue retries with hallucinated flags or aborting healthy batches) while the fallback
+     * plugin is already resolving the issue underneath.
+     *
+     * Set to true via config ("consoleLogging": true) or environment variable (OPENCODE_FALLBACK_CONSOLE=1)
+     * strictly for local human terminal debugging.
+     */
+    consoleLogging?: boolean;
     budgets: BudgetsConfig;
     interceptor: InterceptorConfig;
     watchdog: WatchdogConfig;
@@ -169,6 +186,7 @@ interface SessionState {
         delivery?: any;
         resume?: boolean | null;
     } | undefined;
+    promptPending?: boolean;
     breakers: Map<string, Breaker>;
     blockedUntil: Map<string, number>;
     /** Last observed context size (input + cache read) for this session's turn. */
@@ -195,9 +213,26 @@ interface SessionState {
 export declare function __resetStateForTests(): void;
 /** Test seam: inject model context limits (providerID/id -> context window). */
 export declare function __setModelLimitsForTests(limits: Record<string, number>): void;
+export declare function __setRawModelLimitsForTests(limits: Record<string, number> | undefined): void;
 /** Test seam: inject known models for catalog validation tests. */
 export declare function __setKnownModelsForTests(models: string[] | undefined): void;
 export declare function usableContextLimit(info: any): number | undefined;
+/**
+ * Raw context ceiling (nominal window) for compaction ratio calculation,
+ * avoiding compounding double-reserves on models where input limit < context limit.
+ */
+export declare function rawContextLimit(info: any): number | undefined;
+/**
+ * Dynamic compaction ratio on a continuous logarithmic curve:
+ * Smaller context windows get a higher threshold (smaller margin, up to 85%),
+ * while 1M+ windows scale down to baseRatio (default 0.40 = 40%, 60% margin).
+ *
+ * Formula:
+ *   W <= 32k: 0.85
+ *   W >= 1M:  baseRatio (default 0.40)
+ *   In between: linear interpolation on log2 scale between 32k (0.85) and 1M (baseRatio).
+ */
+export declare function dynamicCompactionRatio(limit: number, baseRatio?: number): number;
 export declare function initCatalog(ctx: any): Promise<void>;
 export declare function isModelAvailable(model: any): boolean;
 export declare function markModelUnavailable(model: any): void;
@@ -240,7 +275,9 @@ export declare function contextTokens(m: any): number;
 export declare function lastAssistantInTurn(msgs: any[]): any | undefined;
 /** Assistant text of the turn's last assistant message, concatenating across Ms.Continue splits (D3). */
 export declare function assistantText(msgs: any[]): string;
+export declare function isToolRefusal(text: string): boolean;
 export declare function checkCompletion(msgs: any[]): CompletionCheck;
+export declare function setGlobalConsoleLogging(enabled: boolean): void;
 declare function runSweep(ctx: any, opts: FallbackOptions): Promise<void>;
 declare function redact(s: string): string;
 export declare const __redactForTests: typeof redact;

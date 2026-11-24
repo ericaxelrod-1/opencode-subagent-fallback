@@ -26,7 +26,7 @@
  *   7. cleanup, telemetry, redaction
  */
 
-import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync, rmSync } from "node:fs"
+import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { homedir } from "node:os"
 
@@ -86,17 +86,78 @@ function errorText(err: any): string {
 }
 
 /**
- * V1 quota text parser: derive the blocked-until reset hint ("resets in Ns" /
- * "retry in Ns") from the error text (message + response body) into a duration.
+ * Uniform quota text parser: derive the blocked-until reset hint from error text
+ * (message + response body) into a duration in milliseconds.
+ * Handles compound relative times ("in 17 h 3 min"), absolute UTC clock times ("at 00:00 UTC"),
+ * and standard unit durations ("resets in 3600s"). Enforces positive finite output.
  */
 export function parseQuotaBlockedUntil(err: any): number | undefined {
   const text = errorText(err)
-  const m = /resets?\s+(?:in|at|:)\s*(\d+(?:\.\d+)?)\s*(\w+)?/.exec(text) ?? /retry\s+in\s+(\d+(?:\.\d+)?)\s*(\w+)?/.exec(text)
-  if (!m) return undefined
-  const n = Number(m[1])
-  const unit = String(m[2] ?? "seconds").toLowerCase()
-  const mult = /ms$/.test(unit) ? 1 : /second|sec/.test(unit) ? 1000 : /minute|min/.test(unit) ? 60000 : /hour|hr/.test(unit) ? 3600000 : /day/.test(unit) ? 86400000 : 1000
-  return n * mult
+  if (!text) return undefined
+
+  // 1. Compound relative duration: e.g. "in 17 h 3 min", "17 hours 3 minutes", "after 2h 15m 30s"
+  const comp = /(?:in|after)\s+(\d+(?:\.\d+)?)\s*(?:h|hr|hours?)\s*(?:(?:and|,)?\s*(\d+(?:\.\d+)?)\s*(?:m|min|minutes?))?(?:\s*(?:(?:and|,)?\s*(\d+(?:\.\d+)?)\s*(?:s|sec|seconds?)))?/i.exec(text)
+  if (comp) {
+    const hrs = Number(comp[1]) || 0
+    const mins = Number(comp[2]) || 0
+    const secs = Number(comp[3]) || 0
+    const totalMs = (hrs * 3600 + mins * 60 + secs) * 1000
+    if (totalMs > 0) return totalMs
+  }
+
+  // 2. Compound minutes + seconds: e.g. "in 5 min 30 sec", "5m 30s"
+  const minSec = /(?:in|after)\s+(\d+(?:\.\d+)?)\s*(?:m|min|minutes?)\s*(?:(?:and|,)?\s*(\d+(?:\.\d+)?)\s*(?:s|sec|seconds?))/i.exec(text)
+  if (minSec) {
+    const mins = Number(minSec[1]) || 0
+    const secs = Number(minSec[2]) || 0
+    const totalMs = (mins * 60 + secs) * 1000
+    if (totalMs > 0) return totalMs
+  }
+
+  // 3. Absolute UTC timestamp: e.g. "resets at 00:00 UTC", "at 14:30:00 UTC"
+  const utc = /resets?\s+at\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*utc/i.exec(text)
+  if (utc) {
+    const targetH = Number(utc[1])
+    const targetM = Number(utc[2])
+    const targetS = Number(utc[3] ?? "0")
+    if (targetH >= 0 && targetH < 24 && targetM >= 0 && targetM < 60) {
+      const nowDate = new Date()
+      const targetDate = new Date(Date.UTC(
+        nowDate.getUTCFullYear(),
+        nowDate.getUTCMonth(),
+        nowDate.getUTCDate(),
+        targetH,
+        targetM,
+        targetS,
+      ))
+      let delta = targetDate.getTime() - nowDate.getTime()
+      if (delta <= 0) {
+        delta += 86400000 // Next occurrence tomorrow
+      }
+      if (delta > 0) return delta
+    }
+  }
+
+  // 4. Standard single duration: e.g. "resets in 45s", "retry in 30 seconds", "resets in 2 hours"
+  const single =
+    /resets?\s+(?:in|:)\s*(\d+(?:\.\d+)?)\s*(\w+)?/i.exec(text) ??
+    /retry\s+in\s+(\d+(?:\.\d+)?)\s*(\w+)?/i.exec(text)
+  if (single) {
+    const n = Number(single[1])
+    if (Number.isFinite(n) && n > 0) {
+      const unit = String(single[2] ?? "seconds").toLowerCase()
+      const mult =
+        /ms$/.test(unit) ? 1 :
+        /second|sec|^s$/.test(unit) ? 1000 :
+        /minute|min|^m$/.test(unit) ? 60000 :
+        /hour|hr|^h$/.test(unit) ? 3600000 :
+        /day|^d$/.test(unit) ? 86400000 : 1000
+      const totalMs = n * mult
+      if (totalMs > 0) return totalMs
+    }
+  }
+
+  return undefined
 }
 
 /** V2 `SessionError.Error.type` taxonomy (provider.*), falling back to status/message heuristics. */
@@ -133,9 +194,10 @@ export function classifyError(err: any): Classified {
   const name: string = e?.name ?? ""
   const msg = String(e?.message ?? err?.message ?? "").toLowerCase()
   const type = errTypeOf(err, status)
+  const parsedQuotaMs = parseQuotaBlockedUntil(err)
   const retryAfterMs =
-    (typeof e?.retryAfterMs === "number" && e.retryAfterMs > 0 ? e.retryAfterMs : undefined) ??
-    parseQuotaBlockedUntil(err) ??
+    (typeof e?.retryAfterMs === "number" && Number.isFinite(e.retryAfterMs) && e.retryAfterMs > 0 ? e.retryAfterMs : undefined) ??
+    (typeof parsedQuotaMs === "number" && Number.isFinite(parsedQuotaMs) && parsedQuotaMs > 0 ? parsedQuotaMs : undefined) ??
     headerRetryAfter(e?.responseHeaders) ??
     headerRetryAfter(e?.response?.headers) ??
     headerRetryAfter(err?.responseHeaders)
@@ -380,6 +442,21 @@ export interface FallbackOptions {
   budgetMs: number
   maxIterations: number
   compactionRatio: number
+  /**
+   * consoleLogging: Master toggle for echoing fallback, retry, and breaker events to console (stderr/stdout).
+   * DEFAULT: false (silent console / clean boundary isolation).
+   *
+   * Architectural Rationale (Silent Resilience):
+   * In multi-agent systems, leaf worker stdout/stderr is monitored by parent orchestrator LLMs.
+   * When orchestrators observe intermediate provider failure signals (HTTP 429, 503, quota exhaustion, circuit breaker trips),
+   * their RLHF'd troubleshooting reflexes trigger, leading to panicked, counterproductive manual workarounds
+   * (e.g. launching rogue retries with hallucinated flags or aborting healthy batches) while the fallback
+   * plugin is already resolving the issue underneath.
+   *
+   * Set to true via config ("consoleLogging": true) or environment variable (OPENCODE_FALLBACK_CONSOLE=1)
+   * strictly for local human terminal debugging.
+   */
+  consoleLogging?: boolean
   budgets: BudgetsConfig
   interceptor: InterceptorConfig
   watchdog: WatchdogConfig
@@ -392,6 +469,9 @@ const DEFAULTS: FallbackOptions = {
   budgetMs: 600000,
   maxIterations: 10,
   compactionRatio: 0.4,
+  // consoleLogging: Suppresses all fallback, retry, and breaker output to stdout/stderr when false (default: false).
+  // Silent resilience: hides internal model failover traces from parent orchestrator agents to prevent panic.
+  consoleLogging: false,
   budgets: {
     fallbackBudgetMs: 600000,
     maxIterations: 10,
@@ -438,10 +518,11 @@ function resolveOpts(opts?: Partial<FallbackOptions>): FallbackOptions {
   const watchdog: WatchdogConfig = { ...DEFAULTS.watchdog, ...(o.watchdog ?? {}) }
   const parentWatchdog: WatchdogConfig = { ...DEFAULTS.parentWatchdog, ...(o.parentWatchdog ?? {}) }
   const providerDefaults: ProviderConfig = { ...DEFAULTS.providerDefaults, ...(o.providerDefaults ?? {}) }
-  return {
+  const out: any = {
     budgetMs: typeof o.budgetMs === "number" ? o.budgetMs : budgets.fallbackBudgetMs,
     maxIterations: budgets.maxIterations,
     compactionRatio: budgets.compactionRatio,
+    consoleLogging: typeof o.consoleLogging === "boolean" ? o.consoleLogging : DEFAULTS.consoleLogging,
     budgets,
     interceptor,
     watchdog,
@@ -449,6 +530,12 @@ function resolveOpts(opts?: Partial<FallbackOptions>): FallbackOptions {
     providerDefaults,
     providers: { ...DEFAULTS.providers, ...(o.providers ?? {}) },
   }
+  if ((o as any).agents) out.agents = (o as any).agents
+  if ((o as any).defaultLargeContextModel) out.defaultLargeContextModel = (o as any).defaultLargeContextModel
+  if ((o as any).defaultLargeContextFallback) out.defaultLargeContextFallback = (o as any).defaultLargeContextFallback
+  if ((o as any).largeContextModel) out.largeContextModel = (o as any).largeContextModel
+  if ((o as any).largeContextFallback) out.largeContextFallback = (o as any).largeContextFallback
+  return out as FallbackOptions
 }
 
 /** Merge a raw provider config over a base (base keys win on undefined). */
@@ -647,10 +734,20 @@ function loadRoot(ctx: any): FallbackOptions {
   const maxIterations = budgets.maxIterations
   const compactionRatio = budgets.compactionRatio
 
+  // Console output suppression (Silent Resilience):
+  // Suppress stderr/stdout fallback traces by default to keep orchestrator agents calm.
+  const consoleLogging =
+    typeof raw.consoleLogging === "boolean"
+      ? raw.consoleLogging
+      : typeof defaults.consoleLogging === "boolean"
+        ? defaults.consoleLogging
+        : DEFAULTS.consoleLogging
+
   return {
     budgetMs: fallbackBudgetMs,
     maxIterations,
     compactionRatio,
+    consoleLogging,
     budgets,
     interceptor,
     watchdog,
@@ -728,6 +825,7 @@ interface SessionState {
   opts: FallbackOptions
   originalSeat?: string
   prompt: { text?: string; files?: any; agents?: string[]; skills?: string[]; delivery?: any; resume?: boolean | null } | undefined
+  promptPending?: boolean
   breakers: Map<string, Breaker>
   blockedUntil: Map<string, number>
   /** Last observed context size (input + cache read) for this session's turn. */
@@ -762,7 +860,9 @@ const lastCompactAt = new Map<string, number>()
 const MAX_SESSIONS = 256
 
 let modelLimitsCache: Map<string, number> | undefined
+let rawModelLimitsCache: Map<string, number> | undefined
 let knownModelsCache: Set<string> | undefined
+let compactionModelOverride: string | undefined
 
 export function __resetStateForTests(): void {
   sessions.clear()
@@ -770,7 +870,9 @@ export function __resetStateForTests(): void {
   blockedUntilByModel.clear()
   lastCompactAt.clear()
   modelLimitsCache = undefined
+  rawModelLimitsCache = undefined
   knownModelsCache = undefined
+  compactionModelOverride = undefined
   const dir = currentConfigDir || (process.env.OPENCODE_CONFIG_DIR ?? "")
   if (dir) {
     try {
@@ -782,6 +884,15 @@ export function __resetStateForTests(): void {
 /** Test seam: inject model context limits (providerID/id -> context window). */
 export function __setModelLimitsForTests(limits: Record<string, number>): void {
   modelLimitsCache = new Map(Object.entries(limits))
+  rawModelLimitsCache = new Map(Object.entries(limits))
+}
+
+export function __setRawModelLimitsForTests(limits: Record<string, number> | undefined): void {
+  if (!limits) {
+    rawModelLimitsCache = undefined
+    return
+  }
+  rawModelLimitsCache = new Map(Object.entries(limits))
 }
 
 /** Test seam: inject known models for catalog validation tests. */
@@ -812,6 +923,47 @@ export function usableContextLimit(info: any): number | undefined {
   if (typeof raw !== "number" || raw <= 0) return undefined
   const reserve = Math.max(Math.floor(raw * 0.15), raw >= 40000 ? 20000 : 0)
   return Math.max(0, raw - reserve)
+}
+
+/**
+ * Raw context ceiling (nominal window) for compaction ratio calculation,
+ * avoiding compounding double-reserves on models where input limit < context limit.
+ */
+export function rawContextLimit(info: any): number | undefined {
+  const ctx0 = info?.limit?.context
+  const inp0 = info?.limit?.input
+  if (typeof ctx0 === "number" && ctx0 > 0) return ctx0
+  if (typeof inp0 === "number" && inp0 > 0) return inp0
+  return undefined
+}
+
+/**
+ * Dynamic compaction ratio on a continuous logarithmic curve:
+ * Smaller context windows get a higher threshold (smaller margin, up to 85%),
+ * while 1M+ windows scale down to baseRatio (default 0.40 = 40%, 60% margin).
+ *
+ * Formula:
+ *   W <= 32k: 0.85
+ *   W >= 1M:  baseRatio (default 0.40)
+ *   In between: linear interpolation on log2 scale between 32k (0.85) and 1M (baseRatio).
+ */
+export function dynamicCompactionRatio(limit: number, baseRatio: number = DEFAULTS.compactionRatio): number {
+  if (typeof limit !== "number" || !Number.isFinite(limit) || limit <= 0) return baseRatio
+  const W_MIN = 32768   // 32k (2^15)
+  const W_MAX = 1048576 // 1M (2^20)
+  const MAX_RATIO = 0.85
+  const MIN_RATIO = Math.min(baseRatio, MAX_RATIO)
+
+  if (limit <= W_MIN) return MAX_RATIO
+  if (limit >= W_MAX) return MIN_RATIO
+
+  const logMin = Math.log2(W_MIN)
+  const logMax = Math.log2(W_MAX)
+  const logW = Math.log2(limit)
+
+  const factor = (logMax - logW) / (logMax - logMin)
+  const ratio = MIN_RATIO + (MAX_RATIO - MIN_RATIO) * factor
+  return Math.round(ratio * 1000) / 1000
 }
 
 export async function initCatalog(ctx: any): Promise<void> {
@@ -845,6 +997,86 @@ export async function initCatalog(ctx: any): Promise<void> {
       knownModelsCache = models
       modelLimitsCache = limits
       logLine(`catalog initialized: ${models.size / 2} model variants indexed`)
+    }
+
+    // Also index custom providers and models configured in opencode.json
+    try {
+      const dir = configDir(ctx)
+      const opencodeJsonPath = join(dir, "opencode.json")
+      if (existsSync(opencodeJsonPath)) {
+        const opencodeCfg = parseJsonWithComments(readFileSync(opencodeJsonPath, "utf8"))
+        if (opencodeCfg && typeof opencodeCfg === "object" && opencodeCfg.provider) {
+          const mCache = knownModelsCache ?? new Set<string>()
+          const lCache = modelLimitsCache ?? new Map<string, number>()
+          for (const [pName, pVal] of Object.entries(opencodeCfg.provider)) {
+            const pObj: any = pVal
+            if (pObj?.models && typeof pObj.models === "object") {
+              for (const [mName, mVal] of Object.entries(pObj.models)) {
+                const mObj: any = mVal
+                const full = `${pName}/${mName}`
+                mCache.add(full)
+                mCache.add(full.toLowerCase())
+                mCache.add(mName)
+                mCache.add(mName.toLowerCase())
+                const ctxLim = mObj?.limit?.context
+                if (typeof ctxLim === "number" && ctxLim > 0) {
+                  const usable = Math.max(1, ctxLim - (mObj?.limit?.output ?? 0))
+                  lCache.set(full, usable)
+                  lCache.set(full.toLowerCase(), usable)
+                  lCache.set(mName, usable)
+                  lCache.set(mName.toLowerCase(), usable)
+                }
+              }
+            }
+          }
+          knownModelsCache = mCache
+          modelLimitsCache = lCache
+        }
+      }
+    } catch (err: any) {
+      logLine(`catalog: indexing opencode.json models failed: ${String(err)}`)
+    }
+
+    // Also index all declared fallback targets in fallback.json
+    try {
+      const fbFile = loadFallbackFile(ctx)
+      const fbModels: string[] = []
+      if (fbFile?.defaultLargeContextModel) fbModels.push(fbFile.defaultLargeContextModel)
+      if (fbFile?.defaultFallback) {
+        for (const e of fbFile.defaultFallback) fbModels.push(typeof e === "string" ? e : e.model)
+      }
+      if (fbFile?.defaultLargeContextFallback) {
+        for (const e of fbFile.defaultLargeContextFallback) fbModels.push(typeof e === "string" ? e : e.model)
+      }
+      if (fbFile?.agents) {
+        for (const ag of Object.values(fbFile.agents)) {
+          if (ag?.largeContextModel) fbModels.push(ag.largeContextModel)
+          if (ag?.fallback) {
+            for (const e of ag.fallback) fbModels.push(typeof e === "string" ? e : e.model)
+          }
+          if (ag?.largeContextFallback) {
+            for (const e of ag.largeContextFallback) fbModels.push(typeof e === "string" ? e : e.model)
+          }
+        }
+      }
+      if (fbModels.length > 0) {
+        const mCache = knownModelsCache ?? new Set<string>()
+        for (const m of fbModels) {
+          if (!m || typeof m !== "string") continue
+          const full = fmtModel(m)
+          mCache.add(full)
+          mCache.add(full.toLowerCase())
+          const slash = full.indexOf("/")
+          if (slash !== -1) {
+            const id = full.slice(slash + 1)
+            mCache.add(id)
+            mCache.add(id.toLowerCase())
+          }
+        }
+        knownModelsCache = mCache
+      }
+    } catch (err: any) {
+      logLine(`catalog: indexing fallback.json models failed: ${String(err)}`)
     }
   } catch (err: any) {
     logLine(`catalog initialization failed: ${String(err)}`)
@@ -891,26 +1123,42 @@ export function isModelHealthyNow(model: any): boolean {
   return true
 }
 
-function fallbackChainFor(ctx: any, agent?: string): string[] {
+function fallbackChainFor(ctx: any, agent?: string, opts?: any): string[] {
   const fbFile = loadFallbackFile(ctx)
   const list: Array<FallbackEntry | string> = []
-  const agentFb = agent ? fbFile?.agents?.[agent] : undefined
-  list.push(...((agentFb?.fallback ?? []) as Array<FallbackEntry | string>))
-  list.push(...((agentFb?.largeContextFallback ?? []) as Array<FallbackEntry | string>))
-  list.push(...((fbFile?.defaultFallback ?? []) as Array<FallbackEntry | string>))
-  list.push(...((fbFile?.defaultLargeContextFallback ?? []) as Array<FallbackEntry | string>))
+  const sources = [opts, fbFile].filter(Boolean)
+  if (agent === "compaction") {
+    for (const src of sources) {
+      const agentFb = src.agents?.compaction
+      if (agentFb?.largeContextModel) list.push(agentFb.largeContextModel)
+      if (agentFb?.largeContextFallback) list.push(...agentFb.largeContextFallback)
+      if (agentFb?.fallback) list.push(...agentFb.fallback)
+      if (src.defaultLargeContextFallback) list.push(...src.defaultLargeContextFallback)
+      if (src.largeContextFallback) list.push(...src.largeContextFallback)
+    }
+  } else {
+    for (const src of sources) {
+      const agentFb = agent ? src.agents?.[agent] : undefined
+      if (agentFb?.fallback) list.push(...agentFb.fallback)
+      if (agentFb?.largeContextFallback) list.push(...agentFb.largeContextFallback)
+      if (src.defaultFallback) list.push(...src.defaultFallback)
+      if (src.defaultLargeContextFallback) list.push(...src.defaultLargeContextFallback)
+    }
+  }
   const models = list.map((e) => (typeof e === "string" ? e : e.model)).filter((m): m is string => typeof m === "string" && m.length > 0)
   return [...new Set(models)]
 }
 
-function stateFor(ctx: any, sid: string, seat?: string, agent?: string, opts?: FallbackOptions): SessionState {
-  let st = sessions.get(sid)
+function stateFor(ctx: any, sid: string, seat?: string, agent?: string, opts?: FallbackOptions, stateKey?: string): SessionState {
+  const key = stateKey ?? sid
+  let st = sessions.get(key)
   if (st) return st
   if (sessions.size >= MAX_SESSIONS) {
     const oldest = sessions.keys().next().value
     if (oldest !== undefined) sessions.delete(oldest)
   }
-  const chain = fallbackChainFor(ctx, agent).length > 0 ? fallbackChainFor(ctx, agent) : [HARDCODED_FALLBACK_TARGET]
+  const resolvedChain = fallbackChainFor(ctx, agent, opts)
+  const chain = resolvedChain.length > 0 ? resolvedChain : (agent === "compaction" ? [] : [HARDCODED_FALLBACK_TARGET])
   st = {
     sid,
     chain,
@@ -923,6 +1171,7 @@ function stateFor(ctx: any, sid: string, seat?: string, agent?: string, opts?: F
     rePrompts: 0,
     opts: opts ?? DEFAULTS,
     prompt: undefined,
+    promptPending: false,
     breakers: new Map<string, Breaker>(),
     blockedUntil: new Map<string, number>(),
     tokens: 0,
@@ -932,7 +1181,7 @@ function stateFor(ctx: any, sid: string, seat?: string, agent?: string, opts?: F
     hops: 0,
     lastAttempt: -1,
   }
-  sessions.set(sid, st)
+  sessions.set(key, st)
   return st
 }
 
@@ -950,8 +1199,9 @@ function enqueue<T>(sid: string, fn: () => Promise<T>): Promise<T> {
  * server's attempt counter reveals a turn boundary the prompt hook missed.
  */
 function resetTurnState(st: SessionState, ctx: any, agent?: string): void {
-  const chain = fallbackChainFor(ctx, agent ?? st.agent)
-  st.chain = chain.length > 0 ? chain : [HARDCODED_FALLBACK_TARGET]
+  const targetAgent = agent ?? st.agent
+  const resolvedChain = fallbackChainFor(ctx, targetAgent, st.opts)
+  st.chain = resolvedChain.length > 0 ? resolvedChain : (targetAgent === "compaction" ? [] : [HARDCODED_FALLBACK_TARGET])
   st.tried = new Set<string>()
   st.permFailed = new Set<string>()
   st.switched = false
@@ -995,13 +1245,19 @@ function breakerFor(st: SessionState, key: string): Breaker {
   return b
 }
 
-/** Rough conversation-size estimate: accumulated context tokens + current prompt. */
+/** Rough conversation-size estimate: accumulated context tokens + pending prompt (if not yet in tokens). */
 function conversationTokens(st: SessionState): number {
   const text = typeof st?.prompt?.text === "string" ? st.prompt.text : ""
   const ratio = st?.opts?.budgets?.charsPerToken ?? DEFAULTS.budgets.charsPerToken
   const r = ratio > 0 ? ratio : 4
   const promptTokens = Math.ceil(text.length / r)
-  return (st?.tokens ?? 0) + promptTokens
+  if (st?.tokens && st.tokens > 0) {
+    if (st.promptPending && promptTokens > 0) {
+      return st.tokens + promptTokens
+    }
+    return st.tokens
+  }
+  return promptTokens
 }
 
 function lastTokenCount(msgs: any[]): number {
@@ -1023,6 +1279,9 @@ async function hydrateSessionTokens(ctx: any, st: SessionState): Promise<number>
     const tok = lastTokenCount(msgs)
     if (tok > 0) {
       st.tokens = tok
+      if (!st.prompt?.text) {
+        st.promptPending = false
+      }
     }
   } catch { /* best effort */ }
   return conversationTokens(st)
@@ -1056,7 +1315,8 @@ export function recordModelFailure(failedKey: string, c: Classified, fbOpts: Fal
   }
 
   if (c.cls === "quota") {
-    const reset = c.retryAfterMs ?? fbOpts.budgets?.quotaThresholdMs ?? QUOTA_THRESHOLD_MS
+    const rawReset = typeof c.retryAfterMs === "number" && Number.isFinite(c.retryAfterMs) && c.retryAfterMs > 0 ? c.retryAfterMs : undefined
+    const reset = rawReset ?? fbOpts.budgets?.quotaThresholdMs ?? QUOTA_THRESHOLD_MS
     const until = now() + reset
     blockedUntilByModel.set(failedKey, until)
     if (st) st.rateLimitMs[failedKey] = until
@@ -1136,37 +1396,89 @@ export interface Fallback {
   recordModelFailure: typeof recordModelFailure
 }
 
+function isCompactionModel(modelKey: string, ctx?: any, opts?: any): boolean {
+  if (!modelKey) return false
+  const norm = fmtModel(modelKey).toLowerCase()
+  const candidates: string[] = []
+  const fbFile = loadFallbackFile(ctx)
+  for (const src of [opts, fbFile]) {
+    if (!src) continue
+    if (src.agents?.compaction?.largeContextModel) candidates.push(src.agents.compaction.largeContextModel)
+    if (src.agents?.compaction?.largeContextFallback) {
+      for (const f of src.agents.compaction.largeContextFallback) {
+        candidates.push(typeof f === "string" ? f : f.model)
+      }
+    }
+    if (src.defaultLargeContextModel) candidates.push(src.defaultLargeContextModel)
+    if (src.defaultLargeContextFallback) {
+      for (const f of src.defaultLargeContextFallback) {
+        candidates.push(typeof f === "string" ? f : f.model)
+      }
+    }
+    if (src.largeContextModel) candidates.push(src.largeContextModel)
+    if (src.largeContextFallback) {
+      for (const f of src.largeContextFallback) {
+        candidates.push(typeof f === "string" ? f : f.model)
+      }
+    }
+  }
+  return candidates.some((c) => c && fmtModel(c).toLowerCase() === norm)
+}
+
 export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallback {
   const fbOpts = resolveOpts(opts ?? loadRoot(ctx))
+  setGlobalConsoleLogging(fbOpts.consoleLogging ?? false)
 
-  const log = logLine
+  const log = (msg: string) => logLine(msg, fbOpts)
 
   // ── retry hook: classify → sticky / failover / force retry (step 1 + step 2) ──
   const onRetry = async (e: any): Promise<void> => {
     try {
-      // F3: auxiliary calls (compaction) arrive with agent "compaction" and resolve
-      // their own model before entering the retry loop — never switch for them.
+      const c = classifyError(e?.error)
+      const failedKey = fmtModel(e?.model)
+
+      // F3: auxiliary calls (compaction) arrive with agent "compaction", type "compaction",
+      // or using the configured compaction model — resolve their own model before entering
+      // the retry loop — never switch for them.
       // However, record failures, trip breakers/quotas, reload agents, and abort non-transient retries.
-      if (e?.agent === "compaction") {
-        const c = classifyError(e?.error)
-        const failedKey = fmtModel(e?.model)
-        log(`retry ${e.sessionID}: agent=compaction model=${failedKey} -> ${c.cls} (${c.detail})`)
-        recordModelFailure(failedKey, c, fbOpts, sessions.get(e.sessionID))
-        if (c.cls === "model_not_found") markModelUnavailable(failedKey)
-        void Promise.resolve(ctx?.agent?.reload?.()).catch(() => undefined)
-        if (c.cls !== "transient") {
-          e.decision = { retry: false }
-        }
-        return
+      let isCompaction =
+        e?.agent === "compaction" ||
+        e?.type === "compaction" ||
+        e?.action === "compaction" ||
+        isCompactionModel(failedKey, ctx, fbOpts)
+
+      if (!isCompaction && ctx?.session?.messages && e?.sessionID) {
+        try {
+          const msgs = await readFlatMessages(ctx, e.sessionID)
+          const lastMsg = msgs[msgs.length - 1]
+          if (lastMsg?.type === "compaction" || lastMsg?.compaction === true) {
+            isCompaction = true
+          }
+        } catch {}
       }
 
-      const c = classifyError(e?.error)
-      log(
-        `retry ${e.sessionID}: ${fmtModel(e?.model)} attempt=${e?.attempt} -> ${c.cls}${c.detail ? ` (${c.detail})` : ""}${
-          c.retryAfterMs !== undefined ? ` retryAfterMs=${c.retryAfterMs}` : ""
-        }`,
-      )
+      const stateKey = isCompaction ? `${e.sessionID}:compaction` : e.sessionID
+      let compactionReloaded = false
+      const reloadCompactionAgent = async (): Promise<void> => {
+        if (!isCompaction || compactionReloaded) return
+        compactionReloaded = true
+        await Promise.resolve(ctx?.agent?.reload?.()).catch(() => undefined)
+      }
 
+      if (isCompaction) {
+        log(`retry ${e.sessionID}: agent=compaction model=${failedKey} -> ${c.cls} (${c.detail})`)
+        recordModelFailure(failedKey, c, fbOpts, sessions.get(stateKey))
+        if (c.cls === "model_not_found") markModelUnavailable(failedKey)
+        if (compactionModelOverride === failedKey) compactionModelOverride = undefined
+      } else {
+        log(
+          `retry ${e.sessionID}: ${failedKey} attempt=${e?.attempt} -> ${c.cls}${c.detail ? ` (${c.detail})` : ""}${
+            c.retryAfterMs !== undefined ? ` retryAfterMs=${c.retryAfterMs}` : ""
+          }`,
+        )
+      }
+
+      try {
       // O2: the retry hook is not called once the budget is spent; treat
       // `attempt` as the hard signal anyway and never advance beyond it.
       const spent = typeof e?.attempt === "number" && e.attempt >= MAX_RETRY_ATTEMPTS
@@ -1174,11 +1486,12 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         log(`retry ${e.sessionID}: fatal — keeping default decision`)
         return
       }
-      const existingSt = sessions.get(e.sessionID)
+      const existingSt = sessions.get(stateKey)
       const existingBudget = existingSt?.opts?.budgets ?? fbOpts.budgets
       const existingMaxIters = existingBudget?.maxIterations ?? fbOpts.maxIterations ?? DEFAULTS.budgets.maxIterations
       const canRollover =
         spent &&
+        !isCompaction &&
         !!existingSt &&
         (existingSt.hops === 0 || now() < existingSt.deadline) &&
         existingSt.hops < existingMaxIters &&
@@ -1219,8 +1532,8 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         rolloverTimers.add(timer)
       }
 
-      const failedKey = fmtModel(e?.model)
-      const st = stateFor(ctx, e.sessionID, failedKey, e?.agent, fbOpts)
+      const agentName = isCompaction ? "compaction" : (e?.agent ?? "developer")
+      const st = stateFor(ctx, e.sessionID, failedKey, agentName, fbOpts, stateKey)
 
       const budget = st.opts?.budgets ?? fbOpts.budgets
       const budgetMs = budget?.fallbackBudgetMs ?? fbOpts.budgetMs ?? DEFAULTS.budgets.fallbackBudgetMs
@@ -1243,7 +1556,7 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
       }
       if (attempt !== undefined) st.lastAttempt = attempt
 
-      if (st.switched && st.seat && failedKey !== st.seat && failedKey === st.lastSwitchedFrom) {
+      if (!isCompaction && st.switched && st.seat && failedKey !== st.seat && failedKey === st.lastSwitchedFrom) {
         log(`retry ${e.sessionID}: received retry for previously switched model ${failedKey} while seat is ${st.seat} — aborting retry for old model`)
         e.decision = { retry: false }
         return
@@ -1261,7 +1574,9 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
       // sticky window and the attempt budget is not spent. The window is
       // measured from the first transient failure — once it lapses the chain
       // advances (V1 sticky discipline, corrected blueprint §5.2/D1).
-      const isTransientClass = c.cls === "transient"
+      // Compaction calls do not wait in a long sticky window on rate-limited or broken models;
+      // they advance immediately down the compaction fallback chain.
+      const isTransientClass = c.cls === "transient" && !isCompaction
       if (isTransientClass) {
         const windowMs = (fbOpts.providers[providerOf(failedKey)] ?? fbOpts.providerDefaults)?.stickyMs ?? DEFAULTS.providerDefaults.stickyMs
         if (st.stickyUntil === 0) st.stickyUntil = now() + windowMs
@@ -1318,6 +1633,17 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         markModelUnavailable(failedKey)
       }
 
+      // Breaker & quota enforcement: record failure before selecting candidate
+      recordModelFailure(failedKey, c, fbOpts, st)
+
+      // P1 #11: auth / forbidden / provider-level failures invalidate the whole
+      // provider for this turn's failover walk (a dead credential or sick gateway
+      // behind provider A invalidates every sibling fallback on A).
+      if (c.cls === "auth" || c.cls === "forbidden" || c.cls === "provider_level") {
+        st.outProviders = st.outProviders ?? new Set<string>()
+        st.outProviders.add(providerOf(failedKey))
+      }
+
       let next = nextCandidate(st)
       // R4/F2: validate candidate against catalog; skip unavailable models
       while (next && !isModelAvailable(next)) {
@@ -1338,7 +1664,10 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         }
       }
       if (!next) {
-        log(`retry ${e.sessionID}: no fallback candidate left for ${failedKey} — keeping default decision`)
+        log(`retry ${e.sessionID}: no fallback candidate left for ${failedKey} — stopping retries`)
+        if (c.cls !== "transient") {
+          e.decision = { retry: false }
+        }
         return
       }
 
@@ -1347,28 +1676,20 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
       // cannot hold the conversation. On context overflow, run the catch-all
       // large-context fallback chain instead of the regular fallback list;
       // in-seat self-compaction stays the normal tier.
-      const agentLocked = st.agent ?? e?.agent ?? "developer"
+      const agentLocked = isCompaction ? "compaction" : (st.agent ?? e?.agent ?? "developer")
       let target: string | undefined = next
       if (c.cls === "context_too_large") {
         target = await pickLargeContext(ctx, st, agentLocked, failedKey)
-      } else {
+      } else if (!isCompaction) {
         const fits = await contextFits(ctx, st, next)
         if (!fits) target = await pickLargeContext(ctx, st, agentLocked, failedKey)
       }
       if (!target) {
-        log(`retry ${e.sessionID}: no fallback candidate left for ${failedKey} — keeping default decision`)
+        log(`retry ${e.sessionID}: no fallback candidate left for ${failedKey} — stopping retries`)
+        if (c.cls !== "transient") {
+          e.decision = { retry: false }
+        }
         return
-      }
-
-      // Breaker & quota enforcement: record failure before advancing.
-      recordModelFailure(failedKey, c, fbOpts, st)
-
-      // P1 #11: auth / forbidden / provider-level failures invalidate the whole
-      // provider for this turn's failover walk (a dead credential or sick gateway
-      // behind provider A invalidates every sibling fallback on A).
-      if (c.cls === "auth" || c.cls === "forbidden" || c.cls === "provider_level") {
-        st.outProviders = st.outProviders ?? new Set<string>()
-        st.outProviders.add(providerOf(failedKey))
       }
 
       // O6: switchModel may throw (model unavailable / provider unauthenticated);
@@ -1406,16 +1727,71 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         log(`retry ${e.sessionID}: switchModel failed and no fallback candidate left — keeping default decision`)
         return
       }
+      if (isCompaction) {
+        compactionModelOverride = target
+        await reloadCompactionAgent()
+      }
       st.hops += 1
 
-      // Always re-decide after switching: the failed model's Retry-After is
-      // meaningless once we have moved to a different model. Sleep only the
-      // next model's cooldown — 0 when it has no active rate-limit window (O1:
-      // sticky failover writes one durable model-switched artifact).
-      e.decision = { retry: true, delay: nextCooldownMs(target, st) }
-      deferLiveness(e.sessionID, e.decision.delay)
-      scheduleRolloverIfSpent()
-      log(`retry ${e.sessionID}: switched ${failedKey} -> ${target} (${c.cls}, attempt ${e.attempt})`)
+      if (
+        isCompaction &&
+        typeof ctx?.session?.compact === "function" &&
+        now() < st.deadline &&
+        st.hops <= maxIters
+      ) {
+        const sid = e.sessionID
+        const delay = nextCooldownMs(target, st)
+        e.decision = { retry: false }
+        st.lastAttempt = -1
+        deferLiveness(sid, Math.max(50, delay) + 500)
+        log(`retry ${sid}: compaction switched ${failedKey} -> ${target} (${c.cls}, attempt ${e.attempt}) — breaking in-flight retry loop & rolling over in ${Math.max(50, delay)}ms`)
+        const timer = setTimeout(() => {
+          rolloverTimers.delete(timer)
+          void (async () => {
+            await reloadCompactionAgent()
+            try {
+              await Promise.resolve(ctx.session.compact({ sessionID: sid }))
+            } catch {
+              return
+            }
+            const parentSt = sessions.get(sid)
+            if (typeof ctx?.session?.prompt === "function" && parentSt) {
+              recoveringSessions.add(sid)
+              try {
+                await Promise.resolve(
+                  ctx.session.prompt({
+                    sessionID: sid,
+                    text: parentSt.prompt?.text ?? CONTINUE_PROMPT,
+                    files: parentSt.prompt?.files,
+                    agents: parentSt.prompt?.agents,
+                    skills: parentSt.prompt?.skills,
+                    delivery: parentSt.prompt?.delivery,
+                    resume: parentSt.prompt?.resume ?? true,
+                  }),
+                )
+              } catch {
+                // ignore prompt resume errors
+              } finally {
+                recoveringSessions.delete(sid)
+              }
+            }
+          })()
+        }, Math.max(50, delay))
+        timer.unref?.()
+        rolloverTimers.add(timer)
+      } else {
+        // Always re-decide after switching: the failed model's Retry-After is
+        // meaningless once we have moved to a different model. Sleep only the
+        // next model's cooldown — 0 when it has no active rate-limit window (O1:
+        // sticky failover writes one durable model-switched artifact).
+        e.decision = { retry: true, delay: nextCooldownMs(target, st) }
+        deferLiveness(e.sessionID, e.decision.delay)
+        scheduleRolloverIfSpent()
+        log(`retry ${e.sessionID}: switched ${failedKey} -> ${target} (${c.cls}, attempt ${e.attempt})`)
+      }
+      } finally {
+        await reloadCompactionAgent()
+      }
     } catch (err: any) {
       log(`retry hook failed, keeping default decision: ${String(err)}`)
     }
@@ -1426,8 +1802,10 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
     try {
       const sid = e?.sessionID
       if (!sid) return
-      const existing = sessions.get(sid)
-      const st = existing ?? stateFor(ctx, sid, undefined, e?.agent, fbOpts)
+      const isCompactionPrompt = e?.agent === "compaction" || e?.type === "compaction" || e?.action === "compaction"
+      const stateKey = isCompactionPrompt ? `${sid}:compaction` : sid
+      const existing = sessions.get(stateKey)
+      const st = existing ?? stateFor(ctx, sid, undefined, isCompactionPrompt ? "compaction" : e?.agent, fbOpts, stateKey)
       // Agent locking (MEDIUM, requirement: fallback chain uses the agent locked
       // at session start): only an explicit user choice (prompt admission) may
       // update the lock; OpenCode's inferred agent is ignored.
@@ -1442,6 +1820,10 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         // candidates consumed by a previous turn's failover walk do not leak.
         st.rePrompts += 1
         resetTurnState(st, ctx, st.agent)
+        if (!isCompactionPrompt) {
+          const compSt = sessions.get(`${sid}:compaction`)
+          if (compSt) resetTurnState(compSt, ctx, "compaction")
+        }
       } else {
         // A watchdog recovery re-prompt continues the SAME logical failover
         // walk: keep the chain, the tried set and the wall-clock deadline, but
@@ -1458,6 +1840,7 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         delivery: p?.delivery ?? e?.delivery ?? e?.input?.delivery,
         resume: p?.resume ?? e?.resume ?? e?.input?.resume ?? true,
       }
+      st.promptPending = true
       // Register liveness for this session so pre-token stalls are watched
       // even before the first streaming event lands (P1 #9).
       if (sid) ensureLiveness(ctx, sid, fbOpts)
@@ -1500,16 +1883,20 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         await hydrateSessionTokens(ctx, st)
       }
       if (sid && key && key !== "unknown") {
+        const rawLimits = await getRawModelLimits(ctx)
+        const rawLimit = rawLimits.get(key)
         const limits = await getModelLimits(ctx)
         const limit = limits.get(key)
+        const limitForRatio = typeof rawLimit === "number" && rawLimit > 0 ? rawLimit : (typeof limit === "number" && limit > 0 ? limit : 0)
         const curTokens = st ? conversationTokens(st) : 0
-        const compactionRatio = fbOpts.budgets?.compactionRatio ?? fbOpts.compactionRatio ?? DEFAULTS.compactionRatio
+        const baseCompactionRatio = fbOpts.budgets?.compactionRatio ?? fbOpts.compactionRatio ?? DEFAULTS.compactionRatio
+        const compactionRatio = limitForRatio > 0 ? dynamicCompactionRatio(limitForRatio, baseCompactionRatio) : baseCompactionRatio
         const debounceMs = fbOpts.parentWatchdog?.compactionDebounceMs ?? fbOpts.watchdog?.compactionDebounceMs ?? 120000
-        if (typeof limit === "number" && limit > 0 && curTokens >= limit * compactionRatio) {
+        if (limitForRatio > 0 && curTokens >= limitForRatio * compactionRatio) {
           const last = lastCompactAt.get(sid) ?? 0
           if (now() - last >= debounceMs) {
             lastCompactAt.set(sid, now())
-            log(`context ${sid}: ${Math.round((curTokens / limit) * 100)}% of ${key} (${curTokens}/${limit}) — triggering proactive self-compaction at ${compactionRatio * 100}%`)
+            log(`context ${sid}: ${Math.round((curTokens / limitForRatio) * 100)}% of ${key} (${curTokens}/${limitForRatio}) — triggering proactive self-compaction at ${Math.round(compactionRatio * 100)}%`)
             void Promise.resolve(ctx?.session?.compact?.({ sessionID: sid })).catch((err: any) => {
               log(`context ${sid}: proactive self-compaction failed: ${String(err)}`)
             })
@@ -1641,7 +2028,7 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         }
       }
 
-      const allIds = [...new Set([...wanted, ...existingMap.keys()])]
+      const allIds = [...new Set([...wanted, ...existingMap.keys(), ...(compactionModelOverride ? ["compaction"] : [])])]
 
       for (const id of allIds) {
         const agentFb = fbFile?.agents?.[id]
@@ -1673,20 +2060,35 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
         const currentModelKey = existingObj?.model ? fmtModel(existingObj.model) : undefined
         const currentModelHealthy = currentModelKey ? isModelHealthyNow(currentModelKey) : false
 
-        // Guard: if operator configured an agent with an available, working model, leave it alone.
+        const activeCompactionOverride =
+          id === "compaction" &&
+          compactionModelOverride &&
+          isModelHealthyNow(compactionModelOverride) &&
+          isModelAvailable(compactionModelOverride)
+            ? compactionModelOverride
+            : undefined
+
+        // Guard: if operator configured an agent with an available, working model, leave it alone,
+        // unless an active compaction failover override targets a different model.
         if (existingObj && currentModelKey && currentModelHealthy) {
-          continue
+          if (!activeCompactionOverride || currentModelKey === activeCompactionOverride) {
+            continue
+          }
         }
 
+        const chosenModel = activeCompactionOverride ?? healthyFallback
+
         if (existingObj && currentModelKey && !currentModelHealthy) {
-          log(`agent '${id}' model '${currentModelKey}' is unhealthy/unavailable — replacing with healthy fallback '${healthyFallback}'`)
+          log(`agent '${id}' model '${currentModelKey}' is unhealthy/unavailable — replacing with healthy fallback '${chosenModel}'`)
+        } else if (activeCompactionOverride && currentModelKey !== activeCompactionOverride) {
+          log(`agent 'compaction' model '${currentModelKey ?? "(none)"}' overridden to '${activeCompactionOverride}' after failover`)
         }
 
         const agent: any = {
           name: id,
           description: existingObj?.description ?? `Fallback agent registered by opencode-subagent-fallback (${id})`,
           mode: id === "compaction" ? "primary" : (existingObj?.mode ?? "subagent"),
-          model: toModelRef(healthyFallback),
+          model: toModelRef(chosenModel),
         }
 
         // V2 AgentEditor contract: `update(id, fn)` is an upsert that receives a
@@ -1765,7 +2167,7 @@ export function createFallback(ctx: any, opts?: Partial<FallbackOptions>): Fallb
 
       if (!input.model) {
         const chosenModel = parentHealthy && parentModelKey ? parentModelKey : healthyFallback
-        input.model = toModelRef(chosenModel)
+        input.model = chosenModel
         log(`subagent tool: assigned model ${chosenModel} to '${targetAgentId}' (parent: ${parentModelKey ?? "none"}, parentHealthy: ${parentHealthy})`)
       }
     } catch (err: any) {
@@ -1937,6 +2339,25 @@ export function assistantText(msgs: any[]): string {
   return parts.filter((p) => p.trim().length > 0).join("\n")
 }
 
+export function isToolRefusal(text: string): boolean {
+  if (!text) return false
+  const lower = text.toLowerCase()
+  const mentionsUnavailability =
+    lower.includes("not available in this") ||
+    lower.includes("do not have access to") ||
+    lower.includes("cannot directly run") ||
+    lower.includes("tools are not available") ||
+    lower.includes("tools are unavailable") ||
+    lower.includes("no access to tools")
+  const mentionsTools =
+    lower.includes("tool") ||
+    lower.includes("shell") ||
+    lower.includes("subagent") ||
+    lower.includes("execute") ||
+    lower.includes("filesystem")
+  return mentionsUnavailability && mentionsTools
+}
+
 export function checkCompletion(msgs: any[]): CompletionCheck {
   const m = lastAssistantInTurn(msgs)
   if (!m) return { ok: false, finish: undefined, text: "", tokens: 0, error: undefined, reason: "no-assistant" }
@@ -1955,14 +2376,16 @@ export function checkCompletion(msgs: any[]): CompletionCheck {
   const busy = content.some(
     (c: any) => c?.type === "tool" && (c?.state?.status === "streaming" || c?.state?.status === "running"),
   )
+  const refusal = !toolParts && isToolRefusal(text ?? "")
   const ok =
     m.time?.completed != null &&
     m.error == null &&
     !busy &&
+    !refusal &&
     m.finish !== "length" &&
     m.finish !== "error" &&
     ((text ?? "").trim().length > 0 || toolParts || trailingIdleSucceeded)
-  return { ok, finish: m.finish, text, tokens: contextTokens(m), error: m.error }
+  return { ok, finish: m.finish, text, tokens: contextTokens(m), error: m.error, ...(refusal ? { reason: "tool-refusal" } : {}) }
 }
 
 // ── Event handling / watchdog (blueprint §5.5, step 4) ────────────────────────
@@ -2078,23 +2501,33 @@ async function handleEvent(ctx: any, ev: any, opts: FallbackOptions): Promise<vo
       if (tok !== undefined && l) {
         l.firstTokenReceived = true
         const st = sessions.get(sid)
-        if (st) st.tokens = tok
-        else stateFor(ctx, sid).tokens = tok
+        if (st) {
+          st.tokens = tok
+          st.promptPending = false
+        } else {
+          const s = stateFor(ctx, sid)
+          s.tokens = tok
+          s.promptPending = false
+        }
 
         if (sid) {
           const seat = sessions.get(sid)?.seat
           if (seat && seat !== "unknown") {
+            const rawLimits = rawModelLimitsCache
+            const rawLimit = rawLimits?.get(seat)
             const limits = modelLimitsCache
             const limit = limits?.get(seat)
-            const compactionRatio = opts.budgets?.compactionRatio ?? opts.compactionRatio ?? DEFAULTS.compactionRatio
+            const limitForRatio = typeof rawLimit === "number" && rawLimit > 0 ? rawLimit : (typeof limit === "number" && limit > 0 ? limit : 0)
+            const baseCompactionRatio = opts.budgets?.compactionRatio ?? opts.compactionRatio ?? DEFAULTS.compactionRatio
+            const compactionRatio = limitForRatio > 0 ? dynamicCompactionRatio(limitForRatio, baseCompactionRatio) : baseCompactionRatio
             const debounceMs = opts.parentWatchdog?.compactionDebounceMs ?? opts.watchdog?.compactionDebounceMs ?? 120000
-            if (typeof limit === "number" && limit > 0 && tok >= limit * compactionRatio) {
+            if (limitForRatio > 0 && tok >= limitForRatio * compactionRatio) {
               const last = lastCompactAt.get(sid) ?? 0
               if (now() - last >= debounceMs) {
                 lastCompactAt.set(sid, now())
-                logLine(`event ${sid}: ${Math.round((tok / limit) * 100)}% of ${seat} (${tok}/${limit}) — triggering proactive self-compaction at ${compactionRatio * 100}%`)
+                logLine(`event ${sid}: ${Math.round((tok / limitForRatio) * 100)}% of ${seat} (${tok}/${limitForRatio}) — triggering proactive self-compaction at ${Math.round(compactionRatio * 100)}%`, opts)
                 void Promise.resolve(ctx?.session?.compact?.({ sessionID: sid })).catch((err: any) => {
-                  logLine(`event ${sid}: proactive self-compaction failed: ${String(err)}`)
+                  logLine(`event ${sid}: proactive self-compaction failed: ${String(err)}`, opts)
                 })
               }
             }
@@ -2151,7 +2584,13 @@ async function recover(ctx: any, sid: string): Promise<void> {
 const LOG_DIR = join(homedir(), ".local", "share", "opencode", "log")
 const LOG_FILE = join(LOG_DIR, "fallback.log")
 
-function logLine(msg: string): void {
+let globalConsoleLogging = false
+
+export function setGlobalConsoleLogging(enabled: boolean): void {
+  globalConsoleLogging = enabled
+}
+
+function logLine(msg: string, optsOrBool?: FallbackOptions | boolean): void {
   const clean = redact(msg)
   const line = `${new Date().toISOString()} [subagent-fallback] ${clean}\n`
   try {
@@ -2162,7 +2601,16 @@ function logLine(msg: string): void {
       appendFileSync(LOG_FILE, line, "utf8")
     } catch { /* logging must never break the hook or sweep */ }
   }
-  if (process.env.OPENCODE_FALLBACK_CONSOLE === "1") {
+  // Console output suppression (Silent Resilience):
+  // Suppressed by default (consoleLogging: false) to prevent parent orchestrators from misinterpreting
+  // intermediate failover signals (429, 503, breaker trips) as fatal job failures.
+  // Full diagnostics remain persistently available in fallback.log on disk.
+  const isSilent = process.env.OPENCODE_FALLBACK_SILENT === "1"
+  const consoleConfig = typeof optsOrBool === "boolean"
+    ? optsOrBool
+    : (optsOrBool?.consoleLogging ?? globalConsoleLogging)
+  const allowConsole = !isSilent && (consoleConfig === true || process.env.OPENCODE_FALLBACK_CONSOLE === "1")
+  if (allowConsole) {
     try { console.error(`[subagent-fallback] ${clean}`) } catch { /* best effort */ }
   }
 }
@@ -2193,7 +2641,7 @@ async function runSweep(ctx: any, opts: FallbackOptions): Promise<void> {
     // Recovery: interrupt, then verify via context before re-prompting.
     // (Single recovery path — l.onStall IS the recovery; do not call recover
     // twice for the same stall.)
-    logLine(`watchdog ${sid}: ${seenFirstToken ? "stall" : "first-token"} timeout (${silence}ms >= ${limit}ms) — interrupting`)
+    logLine(`watchdog ${sid}: ${seenFirstToken ? "stall" : "first-token"} timeout (${silence}ms >= ${limit}ms) — interrupting`, opts)
     armOurAbort(sid, t)
     try { await ctx?.session?.interrupt?.({ sessionID: sid }) } catch { /* best effort */ }
     l.startedAt = t
@@ -2208,14 +2656,29 @@ async function loadModelLimits(ctx: any): Promise<Map<string, number>> {
     const res = await ctx?.model?.list?.()
     const data = res?.data ?? res?.models ?? []
     const m = new Map<string, number>()
+    const rawMap = new Map<string, number>()
     for (const info of Array.isArray(data) ? data : []) {
       const full = `${info?.providerID}/${info?.id}`
       const usable = usableContextLimit(info)
+      const raw = rawContextLimit(info)
       if (typeof usable === "number") {
         m.set(full, usable)
         m.set(full.toLowerCase(), usable)
+        if (info.id) {
+          m.set(info.id, usable)
+          m.set(info.id.toLowerCase(), usable)
+        }
+      }
+      if (typeof raw === "number") {
+        rawMap.set(full, raw)
+        rawMap.set(full.toLowerCase(), raw)
+        if (info.id) {
+          rawMap.set(info.id, raw)
+          rawMap.set(info.id.toLowerCase(), raw)
+        }
       }
     }
+    rawModelLimitsCache = rawMap
     return m
   } catch {
     return new Map<string, number>()
@@ -2225,6 +2688,13 @@ async function loadModelLimits(ctx: any): Promise<Map<string, number>> {
 async function getModelLimits(ctx: any): Promise<Map<string, number>> {
   if (!modelLimitsCache) modelLimitsCache = await loadModelLimits(ctx)
   return modelLimitsCache
+}
+
+async function getRawModelLimits(ctx: any): Promise<Map<string, number>> {
+  if (!rawModelLimitsCache) {
+    await getModelLimits(ctx)
+  }
+  return rawModelLimitsCache ?? new Map<string, number>()
 }
 
 // ── Redaction + telemetry helper ─────────────────────────────────────────────

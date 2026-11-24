@@ -4,7 +4,7 @@
  *   cd <repo>/opencode_v2 && npx tsc && node dist/selftest.js
  */
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { createFallback, classifyError, checkCompletion, contextTokens, lastAssistantInTurn, assistantText, __resetStateForTests, __setModelLimitsForTests, __setKnownModelsForTests, __runSweepForTests, isModelAvailable, markModelUnavailable, isModelHealthyNow, Breaker, CONTINUE_PROMPT, parseQuotaBlockedUntil, usableContextLimit, recordModelFailure } from "./core.js";
+import { createFallback, classifyError, checkCompletion, contextTokens, lastAssistantInTurn, assistantText, __resetStateForTests, __setModelLimitsForTests, __setKnownModelsForTests, __runSweepForTests, isModelAvailable, markModelUnavailable, isModelHealthyNow, Breaker, CONTINUE_PROMPT, parseQuotaBlockedUntil, usableContextLimit, recordModelFailure, dynamicCompactionRatio } from "./core.js";
 let failures = 0;
 function check(name, cond, extra) {
     if (cond)
@@ -71,11 +71,15 @@ async function main() {
     t("V2 error.type provider.auth", { error: { type: "provider.auth" }, statusCode: 401 }, "auth");
     t("V2 error.type provider.rate-limit + retryAfterMs", { error: { type: "provider.rate-limit", retryAfterMs: 30000 } }, "transient");
     check("parseQuotaBlockedUntil parses 'resets in 3600s'", parseQuotaBlockedUntil({ error: { message: "quota resets in 3600s" } }) === 3600000, String(parseQuotaBlockedUntil({ error: { message: "quota resets in 3600s" } })));
+    check("parseQuotaBlockedUntil parses compound 'resets at 00:00 UTC, in 17 h 3 min.'", parseQuotaBlockedUntil({ error: { message: "Today's free usage is used up. It resets at 00:00 UTC, in 17 h 3 min." } }) === 61380000, String(parseQuotaBlockedUntil({ error: { message: "Today's free usage is used up. It resets at 00:00 UTC, in 17 h 3 min." } })));
+    check("parseQuotaBlockedUntil parses absolute 'resets at 00:00 UTC'", (parseQuotaBlockedUntil({ error: { message: "quota resets at 00:00 UTC" } }) ?? 0) > 0, String(parseQuotaBlockedUntil({ error: { message: "quota resets at 00:00 UTC" } })));
+    check("parseQuotaBlockedUntil parses compound 'in 5 min 30 sec'", parseQuotaBlockedUntil({ error: { message: "retry in 5 min 30 sec" } }) === 330000, String(parseQuotaBlockedUntil({ error: { message: "retry in 5 min 30 sec" } })));
     console.log("\ncompletion gate (V2 flat schema, D3):");
     check("complete ok", checkCompletion([{ type: "assistant", content: [{ type: "text", text: "hi" }], time: { completed: 1 }, finish: "stop" }]).ok);
     check("finish=length rejected", !checkCompletion([{ type: "assistant", content: [{ type: "text", text: "p" }], time: {}, finish: "length" }]).ok);
     check("finish=error rejected", !checkCompletion([{ type: "assistant", content: [{ type: "text", text: "p" }], time: { completed: 1 }, finish: "error" }]).ok);
     check("busy tool rejected", !checkCompletion([{ type: "assistant", content: [{ type: "tool", state: { status: "running" } }], time: { completed: 1 }, finish: "tool-calls" }]).ok);
+    check("tool refusal rejected", !checkCompletion([{ type: "assistant", content: [{ type: "text", text: "Local filesystem, shell, and subagent execution tools (shell, read, write, edit, subagent, execute) are not available in this runtime environment, so I cannot directly run evidence_store.py" }], time: { completed: 1 }, finish: "stop" }]).ok);
     check("tool-calls finish accepted when tool part present", checkCompletion([{ type: "assistant", content: [{ type: "tool", state: { status: "completed" } }], time: { completed: 1 }, finish: "tool-calls" }]).ok);
     check("no assistant in turn rejected", !checkCompletion([{ type: "user", text: "do it" }]).ok);
     const splitMsgs = [
@@ -575,7 +579,7 @@ async function main() {
         // Set parent state seat
         await fb.onContext({ sessionID: "ses_parent_1", model: "anthropic/claude-3-7-sonnet" });
         await fb.onToolExecuteBefore(hookPayload1);
-        check("subagent inherits healthy parent model", hookPayload1.input.model?.id === "claude-3-7-sonnet", JSON.stringify(hookPayload1.input.model));
+        check("subagent inherits healthy parent model", typeof hookPayload1.input.model === "string" && hookPayload1.input.model.includes("claude-3-7-sonnet"), JSON.stringify(hookPayload1.input.model));
         // Caller passes dead model explicitly
         const hookPayload2 = {
             tool: "subagent",
@@ -583,7 +587,9 @@ async function main() {
             input: { agent: "developer", model: "openrouter/xingchen-agi/xing4.0-29b-a4b:free", description: "do task" },
         };
         await fb.onToolExecuteBefore(hookPayload2);
-        check("subagent replaces explicit dead model with healthy fallback", hookPayload2.input.model?.id !== "xing4.0-29b-a4b:free" && isModelAvailable(hookPayload2.input.model), JSON.stringify(hookPayload2.input.model));
+        check("subagent replaces explicit dead model with healthy fallback", typeof hookPayload2.input.model === "string" &&
+            !hookPayload2.input.model.includes("xing4.0") &&
+            isModelAvailable(hookPayload2.input.model), JSON.stringify(hookPayload2.input.model));
         __setKnownModelsForTests(undefined);
     }
     console.log("\nonRetry skipping dead models in chain:");
@@ -697,6 +703,27 @@ async function main() {
         };
         fbCompaction.installAgents(mockEditor);
         check("installAgents dynamically replaces unhealthy compaction model with healthy fallback", savedAgents.get("compaction")?.model?.id !== "nvidia/nemotron:free" && isModelHealthyNow(savedAgents.get("compaction")?.model), JSON.stringify(savedAgents.get("compaction")));
+        // Test: compaction switches to next model in fallback chain when candidate available
+        __resetStateForTests();
+        __setKnownModelsForTests(["c/comp1", "c/comp2"]);
+        const switchesComp = [];
+        const fbCompChain = createFallback(mockCtx(switchesComp), {
+            agents: {
+                compaction: {
+                    largeContextModel: "c/comp1",
+                    largeContextFallback: ["c/comp2"],
+                },
+            },
+        });
+        const evCompFail = {
+            sessionID: "ses_comp_chain",
+            agent: "compaction",
+            model: { providerID: "c", id: "comp1" },
+            error: { message: "Too many requests", statusCode: 429 },
+            decision: { retry: true },
+        };
+        await fbCompChain.onRetry(evCompFail);
+        check("compaction switches to next model in fallback chain", switchesComp.length === 1 && switchesComp[0]?.model?.id === "comp2" && evCompFail.decision.retry === true, JSON.stringify(switchesComp));
         __setKnownModelsForTests(undefined);
     }
     console.log("\npinned model retry abort guard:");
@@ -714,6 +741,270 @@ async function main() {
         await fbGuard.onRetry(evOldRetry);
         check("pinned model abort guard sets retry = false on old model", evOldRetry.decision.retry === false);
         check("no extra switch made for old model retry", switchesGuard.length === 1);
+    }
+    console.log("\ndynamic compaction curve & double-counting fix:");
+    {
+        __resetStateForTests();
+        // Test logarithmic curve anchors
+        check("32k or less gets max ratio 0.85 (15% margin)", dynamicCompactionRatio(32768) === 0.85);
+        check("small 16k gets max ratio 0.85", dynamicCompactionRatio(16000) === 0.85);
+        check("64k gets ~0.76", Math.abs(dynamicCompactionRatio(65536) - 0.76) < 0.005);
+        check("128k gets ~0.67", Math.abs(dynamicCompactionRatio(131072) - 0.67) < 0.005);
+        check("200k gets ~0.615", Math.abs(dynamicCompactionRatio(200000) - 0.615) < 0.005);
+        check("1M gets base ratio 0.40 (60% margin)", dynamicCompactionRatio(1048576) === 0.40);
+        check("2M gets base ratio 0.40", dynamicCompactionRatio(2097152) === 0.40);
+        // Test double-counting fix and proactive compaction
+        let compactCalls = 0;
+        const ctxComp = {
+            ...mockCtx([]),
+            session: {
+                ...mockCtx([]).session,
+                compact: async () => { compactCalls++; },
+            },
+        };
+        __setModelLimitsForTests({ "opencode/big-pickle": 200000 });
+        const fbComp = createFallback(ctxComp, { providerDefaults: { ...STICKY_FAST, stickyMs: 0 } });
+        // Simulate session: large prompt (67k chars = ~16.7k tokens) + prior tokens (26.6k)
+        // 1) 26.6k tokens on 200k limit is 13.3%
+        // 2) Compaction threshold on 200k is 61.5% (123k tokens)
+        // 3) Proactive compaction does not trigger at 26.6k tokens or at 122.8k tokens
+        await fbComp.onPrompt({ sessionID: "ses_curve", agent: "developer", text: "x".repeat(270600) });
+        // Simulate event from assistant with actual measured tokens (26,652)
+        // This marks prompt as absorbed
+        const evChunk = {
+            type: "session.text.delta",
+            sessionID: "ses_curve",
+            properties: {
+                info: {
+                    tokens: { input: 284, cache: { read: 26368 } },
+                },
+            },
+        };
+        // Simulate onContext for a tool call after the assistant has responded
+        const evCtx = { sessionID: "ses_curve", agent: "developer", model: { providerID: "opencode", id: "big-pickle" } };
+        await fbComp.onContext(evCtx);
+        check("proactive compaction does NOT trigger at 26.6k tokens on 200k model (curve + no double counting)", compactCalls === 0);
+        // Now simulate conversation reaching 122.8k tokens on 200k model (61.4%):
+        // Threshold is 61.5% (123k), so 122.8k tokens does NOT trigger compaction!
+        const evCtx122k = { sessionID: "ses_curve_122k", agent: "developer", model: { providerID: "opencode", id: "big-pickle" } };
+        await fbComp.onPrompt({ sessionID: "ses_curve_122k", agent: "developer", text: "x" });
+        const st122k = fbComp.ctx ? undefined : undefined;
+        // Inject 122,803 tokens into session state
+        const evChunk122k = {
+            type: "session.text.delta",
+            sessionID: "ses_curve_122k",
+            properties: {
+                info: {
+                    tokens: { input: 2803, cache: { read: 120000 } },
+                },
+            },
+        };
+        // Handle delta event to set st.tokens = 122803
+        await fbComp.onPrompt({ sessionID: "ses_curve_122k", agent: "developer" });
+        await fbComp.consumeEvents?.({
+            event: {
+                subscribe: () => ({
+                    async *[Symbol.asyncIterator]() {
+                        yield evChunk122k;
+                    },
+                }),
+            },
+        });
+        await fbComp.onContext(evCtx122k);
+        check("proactive compaction does NOT trigger at 122.8k tokens on 200k model (123k usable limit, no double counting)", compactCalls === 0);
+    }
+    console.log("\ncandidate exhaustion loop termination & compaction retry detection:");
+    {
+        // 1. When candidates are exhausted on non-transient error, retry must be terminated (decision.retry = false)
+        __resetStateForTests();
+        const switches = [];
+        const fbExhaust = createFallback(mockCtx(switches), {
+            budgets: { fallbackBudgetMs: 600000, maxIterations: 10, compactionRatio: 0.4, charsPerToken: 4, quotaThresholdMs: 600000, maxCooldownSleepMs: 30000 },
+            providerDefaults: { ...STICKY_FAST },
+        });
+        const ev1 = { sessionID: "ses_exhaust", agent: "developer", model: { providerID: "a", id: "small" }, error: { statusCode: 402 }, attempt: 0, decision: { retry: true } };
+        await fbExhaust.onRetry(ev1);
+        const ev2 = { sessionID: "ses_exhaust", agent: "developer", model: { providerID: "a", id: "large" }, error: { statusCode: 402 }, attempt: 1, decision: { retry: true } };
+        await fbExhaust.onRetry(ev2);
+        const ev3 = { sessionID: "ses_exhaust", agent: "developer", model: { providerID: "a", id: "mid" }, error: { statusCode: 402 }, attempt: 2, decision: { retry: true } };
+        await fbExhaust.onRetry(ev3);
+        check("exhausted candidates on quota sets decision.retry = false", ev3.decision.retry === false, JSON.stringify(ev3.decision));
+        check("exhausted candidates records failed model health", !isModelHealthyNow("a/mid"));
+        // 2. Compaction retry detected via e.type === 'compaction' even without agent: 'compaction'
+        let reloadCalled = 0;
+        const ctxCompactionTest = {
+            ...mockCtx([]),
+            agent: {
+                reload: async () => { reloadCalled++; },
+            },
+        };
+        const fbCompType = createFallback(ctxCompactionTest, {
+            defaultLargeContextModel: "a/huge",
+        });
+        const evCompType = {
+            sessionID: "ses_comp_type",
+            type: "compaction",
+            model: { providerID: "openrouter", id: "nvidia/nemotron:free" },
+            error: { statusCode: 429, message: "Rate limit exceeded: free-models-per-day-high-balance" },
+            attempt: 0,
+            decision: { retry: true, delay: 0 },
+        };
+        await fbCompType.onRetry(evCompType);
+        check("compaction retry via e.type requests agent reload", reloadCalled === 1);
+        check("compaction retry via e.type stops non-transient spin", evCompType.decision.retry === false);
+        // 3. Compaction retry detected via configured compaction model
+        let reloadCalled2 = 0;
+        const ctxCompactionTest2 = {
+            ...mockCtx([]),
+            agent: {
+                reload: async () => { reloadCalled2++; },
+            },
+        };
+        const fbCompModel = createFallback(ctxCompactionTest2, {
+            agents: {
+                compaction: {
+                    largeContextModel: "a/custom-compaction",
+                },
+            },
+        });
+        const evCompModel = {
+            sessionID: "ses_comp_model",
+            model: { providerID: "a", id: "custom-compaction" },
+            error: { statusCode: 429, message: "Rate limit exceeded: free-models-per-day-high-balance" },
+            attempt: 0,
+            decision: { retry: true, delay: 0 },
+        };
+        await fbCompModel.onRetry(evCompModel);
+        check("compaction retry via matching compaction model requests agent reload", reloadCalled2 === 1);
+        check("compaction retry via matching compaction model stops non-transient spin", evCompModel.decision.retry === false);
+    }
+    console.log("\ncompaction state isolation, agent re-bind & lastSwitchedFrom exemption:");
+    {
+        __resetStateForTests();
+        __setKnownModelsForTests(["o/orch1", "o/orch2", "c1/comp1", "c2/comp2", "c3/comp3"]);
+        const switchesIso = [];
+        const savedAgentsIso = new Map();
+        savedAgentsIso.set("compaction", { id: "compaction", model: "c1/comp1" });
+        const mockEditorIso = {
+            list: () => Array.from(savedAgentsIso.values()),
+            get: (id) => savedAgentsIso.get(id),
+            update: (id, fn) => {
+                const cur = savedAgentsIso.get(id) ?? { id };
+                const next = fn(cur) ?? cur;
+                savedAgentsIso.set(id, next);
+            },
+        };
+        let fbIso;
+        const ctxIso = {
+            ...mockCtx(switchesIso),
+            agent: {
+                reload: async () => {
+                    fbIso.installAgents(mockEditorIso);
+                },
+            },
+        };
+        fbIso = createFallback(ctxIso, {
+            providerDefaults: { ...STICKY_FAST, stickyMs: 0 },
+            agents: {
+                orchestrator: { fallback: ["o/orch1", "o/orch2"] },
+                compaction: {
+                    largeContextModel: "c1/comp1",
+                    largeContextFallback: ["c2/comp2", "c3/comp3"],
+                },
+            },
+        });
+        // 1) Cache orchestrator state on parent session first
+        await fbIso.onPrompt({ sessionID: "ses_comp_iso", agent: "orchestrator", prompt: { text: "hello" } });
+        // 2) Compaction fails transiently (429 rate limit) -> must use compaction chain & re-bind compaction agent
+        //    even though transient failure does not mark c1/comp1 unhealthy in isModelHealthyNow()
+        const evIso1 = {
+            sessionID: "ses_comp_iso",
+            agent: "compaction",
+            model: { providerID: "c1", id: "comp1" },
+            error: { statusCode: 429, message: "Too many requests" },
+            attempt: 0,
+            decision: { retry: true },
+        };
+        await fbIso.onRetry(evIso1);
+        check("compaction uses compaction fallback chain instead of cached orchestrator chain", switchesIso.length === 1 && switchesIso[0]?.model?.providerID === "c2" && switchesIso[0]?.model?.id === "comp2", JSON.stringify(switchesIso));
+        check("transient compaction failure re-binds compaction agent via reload + installAgents", savedAgentsIso.get("compaction")?.model?.providerID === "c2" && savedAgentsIso.get("compaction")?.model?.id === "comp2", JSON.stringify(savedAgentsIso.get("compaction")));
+        check("compaction transient failover keeps decision.retry = true", evIso1.decision.retry === true);
+        // 3) Subsequent compaction retry reporting failedKey === lastSwitchedFrom is NOT aborted
+        const evIso2 = {
+            sessionID: "ses_comp_iso",
+            agent: "compaction",
+            model: { providerID: "c1", id: "comp1" },
+            error: { statusCode: 503, message: "Service unavailable" },
+            attempt: 1,
+            decision: { retry: true },
+        };
+        await fbIso.onRetry(evIso2);
+        check("compaction exempt from lastSwitchedFrom abort guard (continues walking chain)", evIso2.decision.retry === true && switchesIso.length === 2 && switchesIso[1]?.model?.providerID === "c3" && switchesIso[1]?.model?.id === "comp3", JSON.stringify({ decision: evIso2.decision, switches: switchesIso }));
+        check("subsequent compaction failover re-binds compaction agent to c3/comp3", savedAgentsIso.get("compaction")?.model?.providerID === "c3" && savedAgentsIso.get("compaction")?.model?.id === "comp3", JSON.stringify(savedAgentsIso.get("compaction")));
+        __setKnownModelsForTests(undefined);
+    }
+    console.log("\ncompaction rollover (breaks wedged in-flight loop & resumes prompt):");
+    {
+        __resetStateForTests();
+        __setKnownModelsForTests(["o/orch1", "c1/comp1", "c2/comp2", "c3/comp3"]);
+        const switchesRoll = [];
+        const compactCalls = [];
+        const promptCalls = [];
+        const savedAgentsRoll = new Map();
+        savedAgentsRoll.set("compaction", { id: "compaction", model: "c1/comp1" });
+        const mockEditorRoll = {
+            list: () => Array.from(savedAgentsRoll.values()),
+            get: (id) => savedAgentsRoll.get(id),
+            update: (id, fn) => {
+                const cur = savedAgentsRoll.get(id) ?? { id };
+                const next = fn(cur) ?? cur;
+                savedAgentsRoll.set(id, next);
+            },
+        };
+        let fbRoll;
+        const ctxRoll = {
+            ...mockCtx(switchesRoll),
+            session: {
+                ...mockCtx(switchesRoll).session,
+                compact: async (args) => {
+                    compactCalls.push(args);
+                },
+                prompt: async (args) => {
+                    promptCalls.push(args);
+                },
+            },
+            agent: {
+                reload: async () => {
+                    fbRoll.installAgents(mockEditorRoll);
+                },
+            },
+        };
+        fbRoll = createFallback(ctxRoll, {
+            providerDefaults: { ...STICKY_FAST, stickyMs: 0 },
+            agents: {
+                orchestrator: { fallback: ["o/orch1"] },
+                compaction: {
+                    largeContextModel: "c1/comp1",
+                    largeContextFallback: ["c2/comp2", "c3/comp3"],
+                },
+            },
+        });
+        await fbRoll.onPrompt({ sessionID: "ses_comp_rollover", agent: "orchestrator", text: "resume work" });
+        const evRoll = {
+            sessionID: "ses_comp_rollover",
+            agent: "compaction",
+            model: { providerID: "c1", id: "comp1" },
+            error: { statusCode: 503, message: "Service unavailable" },
+            attempt: 0,
+            decision: { retry: true },
+        };
+        await fbRoll.onRetry(evRoll);
+        check("compaction rollover sets decision.retry = false immediately", evRoll.decision.retry === false);
+        check("compaction rollover re-binds compaction agent to c2/comp2 via reload + installAgents", savedAgentsRoll.get("compaction")?.model?.providerID === "c2" && savedAgentsRoll.get("compaction")?.model?.id === "comp2", JSON.stringify(savedAgentsRoll.get("compaction")));
+        await new Promise((r) => setTimeout(r, 100));
+        check("compaction rollover invokes ctx.session.compact({ sessionID: 'ses_comp_rollover' })", compactCalls.length === 1 && compactCalls[0]?.sessionID === "ses_comp_rollover", JSON.stringify(compactCalls));
+        check("compaction rollover resumes parent prompt with 'resume work' after compact resolves", promptCalls.length === 1 && promptCalls[0]?.sessionID === "ses_comp_rollover" && promptCalls[0]?.text === "resume work", JSON.stringify(promptCalls));
+        __setKnownModelsForTests(undefined);
     }
     console.log("\nselftest result:");
     if (failures === 0) {

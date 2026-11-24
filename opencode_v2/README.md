@@ -89,9 +89,17 @@ OpenCode 2.x enforces a hard `MAX_RETRY_ATTEMPTS = 10` ceiling per step. When `e
 1. `scheduleRolloverIfSpent` converts the retry into a clean step stop (`e.decision = { retry: false }`), resets `st.lastAttempt = -1` (so the upcoming `attempt=0` is not misclassified as a brand-new user turn), and defers the watchdog across the sleep.
 2. After the calculated delay, the plugin re-prompts the session (`ctx.session.prompt(...)`) with the captured prompt payload (`resume: true`), giving OpenCode a fresh 10-attempt step while **preserving** `st.tried`, `st.permFailed`, `st.seat`, `st.hops`, and `st.deadline`.
 
-### 5. Context-Overflow Pre-emption & Large-Context Routing
+### 5. Context-Overflow Pre-emption, Dynamic Compaction Curve & Large-Context Routing
 
-- **Pre-flight (`onContext`):** Estimates conversation size (`input + cache.read + prompt estimate`) against the current model's context limit. Once usage exceeds `1 - compactionRatio` (default 60% / `compactionRatio: 0.4`), it preemptively switches to the first fitting model in the large-context chain (`largeContextModel` → `agents[agent].largeContextFallback` → `defaultLargeContextFallback`).
+- **Dynamic Logarithmic Compaction Curve (`dynamicCompactionRatio`):** Rather than using a static trigger percentage across wildly disparate window sizes (which forces premature compaction on small models and risks context rot/cost explosions on large models), proactive compaction follows a dynamic logarithmic curve anchored to `compactionRatio` (default `0.4` = 40%) at the high end and 85% at the low end:
+  $$\text{Ratio}(W) = R_{\min} + (0.85 - R_{\min}) \times \frac{\log_2(1{,}048{,}576) - \log_2(W)}{\log_2(1{,}048{,}576) - \log_2(32{,}768)}$$
+  - **Below 32k ($W \le 32\text{k}$):** Clamped flat at **0.85 (85%)**, reserving a strict 15% safety headroom margin for assistant output and incoming tool results.
+  - **Above 1M ($W \ge 1\text{M}$):** Clamped at `compactionRatio` (e.g. 40% on 1M = 400k tokens, 800k on 2M).
+  - **Above 0.85:** Hard-capped at **0.85**; configuring `compactionRatio >= 0.85` flattens the curve to 0.85 across all models to protect generation headroom.
+  - **Intermediate Models:** Interpolates smoothly (e.g. 64k $\rightarrow$ 76%, 128k $\rightarrow$ 67%, `big-pickle` 136k usable $\rightarrow$ 66.5% / 90.4k tokens, 200k nominal $\rightarrow$ 61.5% / 123k tokens, 500k $\rightarrow$ 50%).
+  - **Dynamic Slope:** Modifying `compactionRatio` in `fallback.json` recalculates the entire slope (e.g. setting `0.30` drops the 1M trigger to 300k tokens while keeping $\le 32\text{k}$ models safely at 85%).
+- **Prompt Double-Counting Protection:** `conversationTokens` tracks `st.promptPending`. Prompt character estimations are only factored into context size on turn 1 or before the assistant's initial token chunk arrives. Once measured context tokens (`input + cache.read`) are received via event stream or hydrated from SQLite, `promptPending` is cleared, ensuring prompts and file attachments are never counted twice during tool calls or retries.
+- **Pre-flight Pre-emption (`onContext`):** Evaluates estimated conversation size against `limit * dynamicCompactionRatio(limit)`. If threshold is met, proactive self-compaction triggers (`ctx.session.compact`) with watchdog debounce. If conversation exceeds the model's usable limit, it preemptively switches to the large-context chain (`largeContextModel` → `agents[agent].largeContextFallback` → `defaultLargeContextFallback`).
 - **Pre-filter (`onRetry`):** Before switching to any fallback candidate, checks `contextFits()`; candidates too small for the current conversation are skipped in favor of the large-context chain.
 
 ### 6. Liveness Watchdog & Completion Gate
