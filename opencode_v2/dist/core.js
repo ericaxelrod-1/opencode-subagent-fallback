@@ -1448,10 +1448,11 @@ export function createFallback(ctx, opts) {
                 }
                 // Breaker & quota enforcement: record failure before selecting candidate
                 recordModelFailure(failedKey, c, fbOpts, st);
-                // P1 #11: auth / forbidden / provider-level failures invalidate the whole
-                // provider for this turn's failover walk (a dead credential or sick gateway
-                // behind provider A invalidates every sibling fallback on A).
-                if (c.cls === "auth" || c.cls === "forbidden" || c.cls === "provider_level") {
+                // P1 #11: auth / forbidden failures invalidate the whole provider for this
+                // turn's failover walk (a dead credential behind provider A invalidates
+                // every sibling fallback on A). provider_level (5xx) stays model-scoped
+                // so healthy sibling models on the same provider remain eligible.
+                if (c.cls === "auth" || c.cls === "forbidden") {
                     st.outProviders = st.outProviders ?? new Set();
                     st.outProviders.add(providerOf(failedKey));
                 }
@@ -1462,6 +1463,7 @@ export function createFallback(ctx, opts) {
                     st.tried.add(next);
                     next = nextCandidate(st);
                 }
+                let cooldownWaitMs = 0;
                 // Multi-pass cycling (V1 parity): if the first pass exhausted all
                 // candidates via transient failures and budget/hops remain, reset
                 // `st.tried` (preserving `st.permFailed`) and start a fresh pass.
@@ -1474,6 +1476,48 @@ export function createFallback(ctx, opts) {
                         next = nextCandidate(st);
                         if (next)
                             log(`retry ${e.sessionID}: starting new pass over fallback chain -> ${next}`);
+                    }
+                }
+                if (!next && st.chain.length > 0 && now() < st.deadline) {
+                    const coolingCandidates = st.chain.filter((m) => {
+                        if (st.permFailed?.has(m))
+                            return false;
+                        if (st.outProviders?.has?.(providerOf(m)))
+                            return false;
+                        if (!isModelAvailable(m))
+                            return false;
+                        const bUntil = blockedUntilByModel.get(m);
+                        if (typeof bUntil === "number" && bUntil > now())
+                            return false;
+                        return true;
+                    });
+                    if (coolingCandidates.length > 0) {
+                        const pool = coolingCandidates.length > 1
+                            ? coolingCandidates.filter((m) => m !== failedKey)
+                            : coolingCandidates;
+                        let earliestCandidate = pool[0];
+                        let earliestUntil = Math.max(breakersByModel.get(earliestCandidate)?.openUntil ?? 0, st.rateLimitMs?.[earliestCandidate] ?? 0);
+                        for (let i = 1; i < pool.length; i++) {
+                            const m = pool[i];
+                            const until = Math.max(breakersByModel.get(m)?.openUntil ?? 0, st.rateLimitMs?.[m] ?? 0);
+                            if (until < earliestUntil) {
+                                earliestUntil = until;
+                                earliestCandidate = m;
+                            }
+                        }
+                        const maxCooldownSleepMs = budget?.maxCooldownSleepMs ?? st.opts?.interceptor?.maxCooldownSleepMs ?? DEFAULTS.budgets.maxCooldownSleepMs;
+                        const cap = Math.min(maxCooldownSleepMs, Math.max(0, st.deadline - now()));
+                        const waitMs = Math.min(cap, Math.max(0, earliestUntil - now()));
+                        next = earliestCandidate;
+                        cooldownWaitMs = waitMs;
+                        if (next === failedKey) {
+                            e.decision = { retry: true, delay: waitMs };
+                            deferLiveness(e.sessionID, waitMs);
+                            scheduleRolloverIfSpent();
+                            log(`retry ${e.sessionID}: all retryable candidates cooling down — waiting ${waitMs}ms on ${next}`);
+                            return;
+                        }
+                        log(`retry ${e.sessionID}: all retryable candidates cooling down — switching to earliest-cooling ${next} (wait ${waitMs}ms)`);
                     }
                 }
                 if (!next) {
@@ -1553,7 +1597,7 @@ export function createFallback(ctx, opts) {
                     now() < st.deadline &&
                     st.hops <= maxIters) {
                     const sid = e.sessionID;
-                    const delay = nextCooldownMs(target, st);
+                    const delay = Math.max(nextCooldownMs(target, st), cooldownWaitMs);
                     e.decision = { retry: false };
                     st.lastAttempt = -1;
                     deferLiveness(sid, Math.max(50, delay) + 500);
@@ -1599,7 +1643,7 @@ export function createFallback(ctx, opts) {
                     // meaningless once we have moved to a different model. Sleep only the
                     // next model's cooldown — 0 when it has no active rate-limit window (O1:
                     // sticky failover writes one durable model-switched artifact).
-                    e.decision = { retry: true, delay: nextCooldownMs(target, st) };
+                    e.decision = { retry: true, delay: Math.max(nextCooldownMs(target, st), cooldownWaitMs) };
                     deferLiveness(e.sessionID, e.decision.delay);
                     scheduleRolloverIfSpent();
                     log(`retry ${e.sessionID}: switched ${failedKey} -> ${target} (${c.cls}, attempt ${e.attempt})`);

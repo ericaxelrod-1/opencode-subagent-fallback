@@ -1199,6 +1199,96 @@ async function main(): Promise<void> {
     __setKnownModelsForTests(undefined)
   }
 
+  console.log("\nprovider_level 5xx isolation & breaker-cooldown wait recovery:")
+  {
+    __resetStateForTests()
+    __setKnownModelsForTests(["p/m1", "p/m2", "q/dead"])
+
+    // 1) provider_level (500) on p/m1 must NOT add provider "p" to outProviders,
+    // so sibling p/m2 on the same provider remains eligible.
+    const switches5xx: any[] = []
+    const fb5xx = createFallback(mockCtx(switches5xx), {
+      providerDefaults: { ...STICKY_FAST, stickyMs: 0, breaker: { threshold: 1, cooldownMs: 200, maxCooldownMs: 200 } },
+      defaultFallback: ["p/m1", "p/m2"],
+    } as any)
+    const ev5xx: any = {
+      sessionID: "ses_5xx_isolation",
+      agent: "developer",
+      model: { providerID: "p", id: "m1" },
+      error: { statusCode: 500, message: "Internal Server Error" },
+      attempt: 0,
+      decision: { retry: true },
+    }
+    await fb5xx.onRetry(ev5xx)
+    check(
+      "500 provider_level on p/m1 switches to sibling p/m2 on same provider",
+      switches5xx.length === 1 &&
+        switches5xx[0]?.model?.providerID === "p" &&
+        switches5xx[0]?.model?.id === "m2" &&
+        ev5xx.decision?.retry === true,
+      JSON.stringify({ switches: switches5xx, decision: ev5xx.decision }),
+    )
+
+    // 2) When p/m1 and p/m2 both have open Breakers (threshold: 1, cooldownMs: 200)
+    // and q/dead is quota-locked (402), onRetry does NOT set decision.retry = false;
+    // it picks the earliest-cooling p/* candidate with decision.retry === true and
+    // decision.delay <= maxCooldownSleepMs.
+    __resetStateForTests()
+    __setKnownModelsForTests(["p/m1", "p/m2", "q/dead"])
+    const maxCooldownSleepMs = 5000
+    const switchesCool: any[] = []
+    const fbCool = createFallback(mockCtx(switchesCool), {
+      budgets: { maxCooldownSleepMs },
+      providerDefaults: { ...STICKY_FAST, stickyMs: 0, breaker: { threshold: 1, cooldownMs: 200, maxCooldownMs: 200 } },
+      defaultFallback: ["p/m1", "p/m2", "q/dead"],
+    } as any)
+
+    // Quota-lock q/dead via 402
+    const evQuota: any = {
+      sessionID: "ses_cooldown_recovery",
+      agent: "developer",
+      model: { providerID: "q", id: "dead" },
+      error: { statusCode: 402, message: "Quota exceeded" },
+      attempt: 0,
+      decision: { retry: true },
+    }
+    await fbCool.onRetry(evQuota)
+
+    // Trip p/m2 breaker (500) -> switches to p/m1
+    const evM2: any = {
+      sessionID: "ses_cooldown_recovery",
+      agent: "developer",
+      model: { providerID: "p", id: "m2" },
+      error: { statusCode: 500, message: "Upstream 500" },
+      attempt: 1,
+      decision: { retry: true },
+    }
+    await fbCool.onRetry(evM2)
+
+    // Trip p/m1 breaker (500) while p/m2 breaker is still open and q/dead is quota-locked
+    const evM1: any = {
+      sessionID: "ses_cooldown_recovery",
+      agent: "developer",
+      model: { providerID: "p", id: "m1" },
+      error: { statusCode: 500, message: "Upstream 500" },
+      attempt: 2,
+      decision: { retry: true },
+    }
+    await fbCool.onRetry(evM1)
+
+    const lastSwitch = switchesCool[switchesCool.length - 1]
+    check(
+      "all retryable candidates cooling down recovers earliest-cooling p/* candidate instead of stopping",
+      evM1.decision?.retry === true &&
+        typeof evM1.decision?.delay === "number" &&
+        evM1.decision.delay <= maxCooldownSleepMs &&
+        lastSwitch?.model?.providerID === "p" &&
+        lastSwitch?.model?.id === "m2",
+      JSON.stringify({ decision: evM1.decision, lastSwitch }),
+    )
+    __setKnownModelsForTests(undefined)
+  }
+
   console.log("\nselftest result:")
   if (failures === 0) { console.log("  all checks passed\n"); return }
   console.log(`  ${failures} check(s) failed\n`)
