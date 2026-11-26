@@ -207,6 +207,11 @@ export function classifyError(err: any): Classified {
     if (m) status = Number(m[1])
   }
 
+  const fullText = errorText(err).toLowerCase()
+  if (fullText.includes("consent_required") || fullText.includes("needs your consent for these providers")) {
+    return { cls: "model_not_found", retryAfterMs, detail: "model consent required" }
+  }
+
   if (type === "provider.auth" || type === "auth" || name === "ProviderAuthError" || status === 401) return { cls: "auth", retryAfterMs, detail: "auth" }
   if (type === "provider.forbidden" || type === "forbidden" || status === 403) return { cls: "forbidden", retryAfterMs, detail: "forbidden" }
   // Blueprint §5.2: cross-provider failover is required on HTTP 402 (quota).

@@ -1289,6 +1289,40 @@ async function main(): Promise<void> {
     __setKnownModelsForTests(undefined)
   }
 
+  console.log("\nconsent_required (403) model-scoped isolation:")
+  {
+    __resetStateForTests()
+    __setKnownModelsForTests(["u/consent-needed", "u/healthy-sibling"])
+    const switchesConsent: any[] = []
+    const fbConsent = createFallback(mockCtx(switchesConsent), {
+      providerDefaults: { ...STICKY_FAST, stickyMs: 0 },
+      defaultFallback: ["u/consent-needed", "u/healthy-sibling"],
+    } as any)
+    const evConsent: any = {
+      sessionID: "ses_consent_403",
+      agent: "developer",
+      model: { providerID: "u", id: "consent-needed" },
+      error: {
+        type: "provider.auth",
+        status: 403,
+        message: "consent-needed needs your consent for these providers: axf (Sweden). Give it once at https://unorouter.com/consents",
+        response: { body: "{\"error\":{\"code\":\"consent_required\",\"type\":\"new_api_error\"}}" },
+      },
+      attempt: 0,
+      decision: { retry: true },
+    }
+    await fbConsent.onRetry(evConsent)
+    check(
+      "403 consent_required switches to sibling u/healthy-sibling instead of blacklisting provider u",
+      evConsent.decision?.retry === true &&
+        switchesConsent.length === 1 &&
+        switchesConsent[0]?.model?.providerID === "u" &&
+        switchesConsent[0]?.model?.id === "healthy-sibling",
+      JSON.stringify({ decision: evConsent.decision, switches: switchesConsent }),
+    )
+    __setKnownModelsForTests(undefined)
+  }
+
   console.log("\nselftest result:")
   if (failures === 0) { console.log("  all checks passed\n"); return }
   console.log(`  ${failures} check(s) failed\n`)
