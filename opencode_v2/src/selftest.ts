@@ -1320,6 +1320,15 @@ async function main(): Promise<void> {
         switchesConsent[0]?.model?.id === "healthy-sibling",
       JSON.stringify({ decision: evConsent.decision, switches: switchesConsent }),
     )
+    const cObj = classifyError({
+      error: {
+        type: "provider.auth",
+        status: 403,
+        message: "Every provider of gpt-6-luna:free does: ctai, ddg. Choose another model or withdraw the objection",
+        response: { body: "{\"error\":{\"code\":\"own_purpose_objected\",\"type\":\"new_api_error\"}}" },
+      },
+    })
+    check("403 own_purpose_objected classified as model_not_found (model-scoped)", cObj.cls === "model_not_found", JSON.stringify(cObj))
     __setKnownModelsForTests(undefined)
   }
 

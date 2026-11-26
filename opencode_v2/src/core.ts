@@ -208,8 +208,13 @@ export function classifyError(err: any): Classified {
   }
 
   const fullText = errorText(err).toLowerCase()
-  if (fullText.includes("consent_required") || fullText.includes("needs your consent for these providers")) {
-    return { cls: "model_not_found", retryAfterMs, detail: "model consent required" }
+  if (
+    fullText.includes("consent_required") ||
+    fullText.includes("needs your consent for these providers") ||
+    fullText.includes("own_purpose_objected") ||
+    fullText.includes("withdraw the objection")
+  ) {
+    return { cls: "model_not_found", retryAfterMs, detail: "model consent/policy required" }
   }
 
   if (type === "provider.auth" || type === "auth" || name === "ProviderAuthError" || status === 401) return { cls: "auth", retryAfterMs, detail: "auth" }
